@@ -1,0 +1,10 @@
+__pycache__
+*.pyc
+*.pyo
+.git
+.env
+*.md
+!requirements.txt
+.pytest_cache
+.coverage
+*.log
