@@ -1,6 +1,6 @@
 {
-  "lockfileVersion": 1,
-  "configVersion": 1,
+  "lockfileVersion": 2,
+  "configVersion": 2,
   "workspaces": {
     "": {
       "name": "encryption-tool",
