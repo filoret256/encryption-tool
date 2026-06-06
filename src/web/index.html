@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Encryption Tool</title>
+  <link rel="stylesheet" href="/public/main.css" />
+</head>
+<body>
+  <div class="header">
+    <div class="tabs">
+      <button class="tab tab-ansible active" data-action="switch" data-tab="ansible">ansible-vault</button>
+      <button class="tab tab-helm" data-action="switch" data-tab="helm">helm-encrypt</button>
+    </div>
+    <div class="header-right">
+      <button class="theme-toggle" data-action="theme" aria-label="Toggle dark / light theme" title="Toggle theme">
+        <span class="theme-ic sun">☀</span>
+        <span class="theme-switch"><span class="theme-knob"></span></span>
+        <span class="theme-ic moon">☾</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- Tabs: generated identically for ansible & helm -->
+  <div id="ansible-tab" class="tab-content active" data-tabid="ansible"></div>
+  <div id="helm-tab" class="tab-content" data-tabid="helm"></div>
+
+  <input type="file" id="file-input" style="display:none" accept=".txt,.yaml,.yml,.json,.env" />
+  <div id="toast" class="toast"></div>
+
+  <template id="tab-template">
+    <div class="toolbar">
+      <span class="t-label">password</span>
+      <div class="pw-wrap">
+        <input type="password" class="t-input js-password" placeholder="password" autocomplete="off" />
+        <button type="button" class="t-eye" data-action="togglePw">👁</button>
+      </div>
+      <div class="toolbar-sep"></div>
+      <button class="t-btn t-btn-primary" data-action="encrypt">↑ encrypt</button>
+      <button class="t-btn t-btn-primary" data-action="decrypt">↓ decrypt</button>
+      <div class="toolbar-sep"></div>
+      <button class="t-btn" data-action="b64encode">b64 encode</button>
+      <button class="t-btn" data-action="b64unix">b64 unix</button>
+      <button class="t-btn" data-action="b64decode">b64 decode</button>
+      <div class="toolbar-sep"></div>
+      <button class="t-btn" data-action="load">↑ load</button>
+      <button class="t-btn" data-action="save">↓ save</button>
+      <button class="t-btn" data-action="find">⌕ find</button>
+      <div class="t-spacer"></div>
+      <button class="t-btn" data-action="copy">copy</button>
+      <button class="t-btn" data-action="clear">clear</button>
+    </div>
+    <div class="toolbar-secondary">
+      <span class="t-label">yaml</span>
+      <button class="t-btn js-lint" data-action="lint" title="Toggle live YAML validity highlighting">lint</button>
+      <button class="t-btn js-beautify" data-action="beautify">beautify</button>
+      <span class="yaml-badge js-badge"></span>
+      <div class="toolbar-sep"></div>
+      <span class="t-label">view</span>
+      <button class="t-btn js-lnum" data-action="lnum">≡ nums</button>
+      <button class="t-btn js-ws" data-action="ws">¶ ws</button>
+      <button class="t-btn js-wrap" data-action="wrap">↵ wrap</button>
+    </div>
+    <div class="editor-wrap"><div class="editor-host js-editor"></div></div>
+    <div class="statusbar">
+      <div class="sb-item">lines&nbsp;<b class="js-lines">0</b></div>
+      <div class="sb-item">chars&nbsp;<b class="js-chars">0</b></div>
+      <div class="sb-item">bytes&nbsp;<b class="js-bytes">0</b></div>
+      <div class="sb-item">sel&nbsp;<b class="js-sel">0</b></div>
+    </div>
+  </template>
+
+  <script type="module" src="/public/main.js"></script>
+</body>
+</html>

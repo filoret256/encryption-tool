@@ -1,0 +1,28 @@
+{
+  "name": "encryption-tool",
+  "version": "1.0.0",
+  "description": "Web app for Helm- and Ansible-Vault-compatible encryption/decryption",
+  "type": "module",
+  "module": "src/server.ts",
+  "scripts": {
+    "dev": "bun --watch src/server.ts",
+    "start": "bun src/server.ts",
+    "build": "bun build src/web/main.ts --outdir public --target browser --minify",
+    "compile": "bun build --compile --minify --sourcemap=none --outfile server src/server.ts"
+  },
+  "dependencies": {
+    "@codemirror/commands": "^6.6.0",
+    "@codemirror/lang-yaml": "^6.1.0",
+    "@codemirror/language": "^6.10.0",
+    "@codemirror/lint": "^6.8.0",
+    "@codemirror/search": "^6.5.0",
+    "@codemirror/state": "^6.4.0",
+    "@codemirror/theme-one-dark": "^6.1.0",
+    "@codemirror/view": "^6.30.0",
+    "yaml": "^2.4.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.0"
+  }
+}
