@@ -5,8 +5,8 @@
  */
 import type { AgentClient } from "./agent.ts";
 import type { Commit, CommitDetail } from "../../agent/protocol.ts";
-import { esc, modalPrompt, showMenu } from "./ui.ts";
-import { computeGraph, continuationSvg, laneSvg, type GraphRow } from "./graph.ts";
+import { esc, modalPrompt, setHtmlKeepingScroll, showMenu } from "./ui.ts";
+import { computeGraph, continuationSvg, laneSvg, LANE_W, type GraphRow } from "./graph.ts";
 
 const PAGE = 100;
 
@@ -78,7 +78,10 @@ export class HistoryPanel {
     this.render();
   }
 
-  private render(): void {
+  /** `anchorOid` is the commit the user just clicked. Expanding it, or
+   *  collapsing whatever was open above it, changes the heights around it — so
+   *  that row is pinned in place instead of the scroll offset. */
+  private render(anchorOid?: string): void {
     const list = this.$(".js-list");
     if (!this.commits.length) {
       list.innerHTML = `<p class="gp-empty">No commits.</p>`;
@@ -89,7 +92,11 @@ export class HistoryPanel {
     // rather than in refresh() — the graph toggle re-renders without refetching.
     const withGraph = this.$<HTMLInputElement>(".js-graph").checked;
     this.graph = withGraph ? computeGraph(this.commits) : [];
-    list.innerHTML = this.commits.map((c, i) => this.commitHtml(c, this.graph[i])).join("");
+    setHtmlKeepingScroll(
+      list,
+      this.commits.map((c, i) => this.commitHtml(c, this.graph[i])).join(""),
+      anchorOid ? `.hist-item[data-oid="${anchorOid}"] .hist-row` : undefined,
+    );
     this.$(".js-more").hidden = this.commits.length < this.limit;
   }
 
@@ -111,7 +118,13 @@ export class HistoryPanel {
   private detailHtml(detail: CommitDetail | undefined, row: GraphRow | undefined): string {
     // The lanes continue alongside the expanded block so the graph is not cut
     // in half by opening a commit.
-    const gutter = row ? `<div class="hist-gutter">${continuationSvg(row)}</div>` : "";
+    // The gutter carries an explicit width and holds the SVG absolutely, so the
+    // lanes stretch to whatever height the file list needs. Left in flow, an
+    // <svg height="100%"> with no definite parent height falls back to its
+    // intrinsic 150px and padded the block out with dead space.
+    const gutter = row
+      ? `<div class="hist-gutter" style="width:${row.columns * LANE_W}px">${continuationSvg(row)}</div>`
+      : "";
     if (!detail) return `<div class="hist-files">${gutter}<div class="hist-files-body"><span class="gp-empty">loading…</span></div></div>`;
 
     const body = detail.body.trim();
@@ -138,15 +151,22 @@ export class HistoryPanel {
     const file = target.closest<HTMLElement>(".hist-file");
     if (file) return this.cb.openDiff(file.dataset.path!, oid);
 
+    // Only the header row toggles. The block below it is content to read, and
+    // treating any click inside it as a toggle meant a click that missed a file
+    // name collapsed the commit — which reads as the panel closing at random.
+    if (!target.closest(".hist-row")) return;
+
     this.expanded = this.expanded === oid ? null : oid;
-    this.render();
+    this.render(oid);
     if (this.expanded && !this.details.has(oid)) {
       try {
         this.details.set(oid, await this.agent.call<CommitDetail>("git.commitDetail", { oid }));
       } catch (err) {
         this.cb.toast(err instanceof Error ? err.message : String(err), true);
       }
-      if (this.expanded === oid) this.render();
+      // The file list replaces "loading…" and the block grows; the commit row
+      // itself must not move while that happens.
+      if (this.expanded === oid) this.render(oid);
     }
   }
 

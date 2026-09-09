@@ -235,10 +235,20 @@ Open http://localhost:5000 / Откройте http://localhost:5000
 Installable and works offline. `bun run icons` regenerates the icon set procedurally.
 
 - `manifest.webmanifest` + 192/512/maskable icons and an `apple-touch-icon` for iOS
-- service worker: network-first for the shell, stale-while-revalidate for assets,
-  cross-origin requests passed straight through (the agent lives on another origin)
+- service worker: network-first for the shell **and for scripts and styles**, with
+  the cache as the offline fallback; icons and the manifest are
+  stale-while-revalidate; cross-origin requests pass straight through (the agent
+  lives on another origin)
+- the cache is keyed by the app version, so a release drops the previous one and
+  the worker itself changes — which is what raises the update bar
 - updates never swap under a running session — a bar offers `reload` when a new
   version is waiting
+
+> Assets have fixed names, since the compiled binary embeds them by path. Serving
+> them stale-while-revalidate therefore meant a returning user could run the new
+> `index.html` against the previous bundle for a load — and because `sw.js` itself
+> had not changed, no new worker installed and no update bar appeared, so the
+> mismatch was silent. Scripts and styles now follow the shell instead.
 - **HTTPS is required** for the service worker; `localhost` counts as secure
 
 **Offline:** оболочка и вкладки шифрования работают полностью без сети (крипто на

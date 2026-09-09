@@ -189,8 +189,9 @@ function switchTab(tab: AnyTab): void {
     document.getElementById(`${t}-tab`)!.classList.toggle("active", t === tab);
     document.querySelector(`.tab-${t}`)!.classList.toggle("active", t === tab);
   }
-  // Nothing but the editor needs a local agent, so the download only appears
-  // where it means something.
+  // Nothing but the editor needs a local agent, so the download button and the
+  // capability badge only appear where they mean something.
+  document.getElementById("code-tools")!.hidden = tab !== "code";
   agentDownload?.setVisible(tab === "code");
   if (tab === "code") {
     void openCodeTab();
@@ -361,7 +362,8 @@ function init(): void {
 
   agentDownload = mountAgentDownload(document.getElementById("agent-dl")!);
 
-  // Capability badge lives in the header so it is visible from every tab.
+  // The badge reports on the local agent, so it sits with the code tab's tools
+  // rather than in the header's right-hand group.
   refreshBadge = mountBadge(
     document.getElementById("cap-badge")!,
     agent,

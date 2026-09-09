@@ -100,11 +100,18 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   const editorHost = $(".code-editor-host");
   const diffHost = $(".code-diff-host");
 
-  // ── open files ──
-  // One EditorState per tab, so each keeps its own cursor, scroll offset and
-  // undo history. `baselines` holds what was last read or written, which is
-  // what makes the dirty marker meaningful rather than "was ever edited".
-  interface OpenTab {
+  // ── open tabs ──
+  // Files and diffs share one strip, the way an editor is expected to work: a
+  // diff is something you leave open and come back to, not a mode that swallows
+  // the window and loses itself the moment a file is opened.
+  //
+  // Files keep one EditorState each, so every tab has its own cursor, scroll
+  // offset and undo history. `baselines` holds what was last read or written,
+  // which is what makes the dirty marker mean "changed" rather than "touched".
+  interface FileTab {
+    kind: "file";
+    /** Tab identity. For a file this is its path. */
+    id: string;
     path: string;
     readOnly: boolean;
     /** The file's own line ending. CodeMirror normalises everything to \n, so
@@ -112,9 +119,24 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
      *  every line and turn each save into a whole-file diff. */
     eol: "\n" | "\r\n";
   }
+  interface DiffTab {
+    kind: "diff";
+    /** Derived from what is being compared, so re-opening the same diff focuses
+     *  the tab it is already in instead of stacking duplicates. */
+    id: string;
+    label: string;
+    title: string;
+    pair: DiffPair;
+  }
+  type OpenTab = FileTab | DiffTab;
+
   const tabs: OpenTab[] = [];
   const states = new Map<string, EditorState>();
   const baselines = new Map<string, string>();
+  /** Which tab is on screen. */
+  let activeId: string | null = null;
+  /** The active tab's path when it is a file, null while a diff is shown — so
+   *  saving, conflict handling and the watcher never act on a diff. */
   let openPath: string | null = null;
   let openReadOnly = false;
   /** When we last wrote the open file ourselves. The watcher echoes that write
@@ -134,7 +156,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   function showDiff(): void {
     editorHost.hidden = true;
     diffHost.hidden = false;
-    $(".js-tabs").hidden = true;
+    // The strip stays: a diff is one of the open tabs, not a takeover.
+    $(".js-tabs").hidden = tabs.length === 0;
     $(".js-conflict").hidden = true;
   }
 
@@ -242,14 +265,19 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   // ── tabs ──
   function renderTabs(): void {
     const bar = $(".js-tabs");
-    bar.hidden = tabs.length === 0 || !diffHost.hidden;
+    bar.hidden = tabs.length === 0;
     bar.innerHTML = tabs
       .map((t) => {
-        const name = t.path.split("/").pop() ?? t.path;
-        const cls = ["code-tab", t.path === openPath ? "active" : "", isDirty(t.path) ? "dirty" : ""].filter(Boolean).join(" ");
-        return `<div class="${cls}" data-path="${attr(t.path)}" title="${esc(t.path)}">
+        const file = t.kind === "file";
+        const name = file ? (t.path.split("/").pop() ?? t.path) : t.label;
+        const dirty = file && isDirty(t.path);
+        const cls = ["code-tab", t.id === activeId ? "active" : "", dirty ? "dirty" : "", file ? "" : "is-diff"]
+          .filter(Boolean)
+          .join(" ");
+        return `<div class="${cls}" data-id="${attr(t.id)}" title="${esc(file ? t.path : t.title)}">
+          ${file ? "" : `<span class="code-tab-icon">⇄</span>`}
           <span class="code-tab-name">${esc(name)}</span>
-          <button class="code-tab-close" type="button" title="Close">${isDirty(t.path) ? "●" : "✕"}</button>
+          <button class="code-tab-close" type="button" title="Close">${dirty ? "●" : "✕"}</button>
         </div>`;
       })
       .join("");
@@ -260,15 +288,30 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     if (openPath) states.set(openPath, editor.state);
   }
 
-  function activate(path: string): void {
-    const tab = tabs.find((t) => t.path === path);
-    const state = states.get(path);
-    if (!tab || !state) return;
+  function activate(id: string): void {
+    const tab = tabs.find((t) => t.id === id);
+    if (!tab) return;
     stashActive();
-    openPath = path;
+    activeId = id;
+
+    if (tab.kind === "diff") {
+      openPath = null;
+      openReadOnly = false;
+      diff.show(tab.pair);
+      pathLabel.textContent = tab.title;
+      dirtyLabel.textContent = "";
+      dirtyLabel.classList.remove("is-dirty");
+      showDiff();
+      renderTabs();
+      return;
+    }
+
+    const state = states.get(tab.path);
+    if (!state) return;
+    openPath = tab.path;
     openReadOnly = tab.readOnly;
     editor.state = state;
-    pathLabel.textContent = path + (tab.readOnly ? "  (read-only)" : "");
+    pathLabel.textContent = tab.path + (tab.readOnly ? "  (read-only)" : "");
     showEditor();
     renderTabs();
     renderConflictBar();
@@ -276,21 +319,27 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     editor.focus();
   }
 
-  function closeTab(path: string): void {
-    if (isDirty(path) && !confirm(`${path} has unsaved changes. Close anyway?`)) return;
-    const i = tabs.findIndex((t) => t.path === path);
+  function closeTab(id: string): void {
+    const i = tabs.findIndex((t) => t.id === id);
     if (i === -1) return;
+    const tab = tabs[i];
+    if (tab.kind === "file") {
+      if (isDirty(tab.path) && !confirm(`${tab.path} has unsaved changes. Close anyway?`)) return;
+      states.delete(tab.path);
+      baselines.delete(tab.path);
+    }
     tabs.splice(i, 1);
-    states.delete(path);
-    baselines.delete(path);
 
-    if (openPath !== path) return renderTabs();
+    if (activeId !== id) return renderTabs();
+    activeId = null;
     openPath = null;
     // Fall back to the neighbour, the way an editor is expected to.
     const next = tabs[Math.min(i, tabs.length - 1)];
-    if (next) return activate(next.path);
+    if (next) return activate(next.id);
+    diff.clear();
     editor.state = editor.newState("", "", false);
     pathLabel.textContent = "no file";
+    showEditor();
     renderTabs();
     renderConflictBar();
     onEditorChange();
@@ -298,27 +347,34 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
   $(".js-tabs").addEventListener("click", (e) => {
     const el = e.target as HTMLElement;
-    const path = el.closest<HTMLElement>(".code-tab")?.dataset.path;
-    if (!path) return;
-    if (el.closest(".code-tab-close")) closeTab(path);
-    else activate(path);
+    const id = el.closest<HTMLElement>(".code-tab")?.dataset.id;
+    if (!id) return;
+    if (el.closest(".code-tab-close")) closeTab(id);
+    else activate(id);
   });
   // Middle-click closes, as everywhere else.
   $(".js-tabs").addEventListener("auxclick", (e) => {
     const ev = e as MouseEvent;
     if (ev.button !== 1) return;
-    const path = (ev.target as HTMLElement).closest<HTMLElement>(".code-tab")?.dataset.path;
-    if (path) {
+    const id = (ev.target as HTMLElement).closest<HTMLElement>(".code-tab")?.dataset.id;
+    if (id) {
       ev.preventDefault();
-      closeTab(path);
+      closeTab(id);
     }
   });
 
   // ── file IO ──
   /** Open a file in a tab, or focus the tab it is already in. `reload` forces a
    *  fresh read for a file that changed underneath us. */
+  /** Each open request gets a number; only the newest may take the screen.
+   *  Reads are round trips, so clicking quickly through the tree can land them
+   *  out of order, and without this the file that answered last would win
+   *  rather than the file clicked last. */
+  let openSeq = 0;
+
   async function open(path: string, reload = false): Promise<void> {
     if (states.has(path) && !reload) return activate(path);
+    const seq = ++openSeq;
     try {
       const file = await agent.call<FileRead>("fs.read", { path });
       const readOnly = file.binary || file.tooLarge;
@@ -327,12 +383,18 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       // Compare against the normalised text, since that is what the editor holds.
       const text = raw.replace(/\r\n/g, "\n");
 
-      stashActive();
-      const existing = tabs.findIndex((t) => t.path === path);
-      if (existing === -1) tabs.push({ path, readOnly, eol });
-      else tabs[existing] = { path, readOnly, eol };
+      const superseded = seq !== openSeq;
+      if (!superseded) stashActive();
+      const tab: FileTab = { kind: "file", id: path, path, readOnly, eol };
+      const existing = tabs.findIndex((t) => t.id === path);
+      if (existing === -1) tabs.push(tab);
+      else tabs[existing] = tab;
       states.set(path, editor.newState(path, text, readOnly));
       baselines.set(path, text);
+
+      // A later click already won the screen. The tab still opens — nothing the
+      // user asked for is dropped — it just does not steal focus.
+      if (superseded) return renderTabs();
       openPath = null; // stashActive already ran; do not stash the old doc twice
       activate(path);
     } catch (e) {
@@ -347,6 +409,19 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   }
 
   // ── comparison ──
+  const base = (path: string): string => path.split("/").pop() ?? path;
+
+  /** Put a diff in the tab strip, or refresh and focus the one already there.
+   *  The pair is kept on the tab, so switching away to a file and back redraws
+   *  it without another round trip. */
+  function showDiffTab(id: string, label: string, title: string, pair: DiffPair): void {
+    const tab: DiffTab = { kind: "diff", id, label, title, pair };
+    const existing = tabs.findIndex((t) => t.id === id);
+    if (existing === -1) tabs.push(tab);
+    else tabs[existing] = tab;
+    activate(id);
+  }
+
   /** Diff two arbitrary files in the workspace — no git involved. */
   async function compare(left: string, right: string): Promise<void> {
     try {
@@ -354,7 +429,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         agent.call<FileRead>("fs.read", { path: left }),
         agent.call<FileRead>("fs.read", { path: right }),
       ]);
-      diff.show({
+      showDiffTab(`cmp:${JSON.stringify([left, right])}`, `${base(left)} ↔ ${base(right)}`, `${left} ↔ ${right}`, {
         path: `${left} ↔ ${right}`,
         before: a.text,
         after: b.text,
@@ -362,8 +437,6 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         afterLabel: right,
         binary: a.binary || b.binary,
       });
-      pathLabel.textContent = `${left} ↔ ${right}`;
-      showDiff();
     } catch (e) {
       ctx.toast(e instanceof Error ? e.message : String(e), true);
     }
@@ -371,9 +444,12 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
   async function openDiff(path: string, kind: string): Promise<void> {
     try {
-      diff.show(await agent.call<DiffPair>("git.diff", { path, kind }));
-      pathLabel.textContent = `${path}  (diff)`;
-      showDiff();
+      const pair = await agent.call<DiffPair>("git.diff", { path, kind });
+      // `kind` is either a named diff or a commit oid, and the label has to say
+      // which — otherwise every commit's diff of the same file reads the same
+      // in the strip. Keyed by kind too, so each gets its own tab.
+      const what = /^[0-9a-f]{7,40}$/.test(kind) ? kind.slice(0, 7) : kind;
+      showDiffTab(`diff:${kind}:${path}`, `${base(path)} (${what})`, `${path}  (diff · ${what})`, pair);
     } catch (e) {
       ctx.toast(e instanceof Error ? e.message : String(e), true);
     }
@@ -383,7 +459,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     if (!openPath || openReadOnly || !isDirty(openPath)) return;
     const path = openPath;
     const text = editor.value;
-    const eol = tabs.find((t) => t.path === path)?.eol ?? "\n";
+    const tab = tabs.find((t): t is FileTab => t.kind === "file" && t.path === path);
+    const eol = tab?.eol ?? "\n";
     try {
       await agent.call("fs.write", { path, text: eol === "\n" ? text : text.replace(/\n/g, "\r\n") });
       lastSelfWrite = Date.now();
@@ -459,6 +536,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     states.clear();
     baselines.clear();
     conflicted.clear();
+    activeId = null;
     openPath = null;
     editor.state = editor.newState("", "", false);
     pathLabel.textContent = "no file";

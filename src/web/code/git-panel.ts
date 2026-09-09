@@ -7,7 +7,7 @@
  */
 import type { AgentClient } from "./agent.ts";
 import type { Branch, GitStatus, StatusEntry } from "../../agent/protocol.ts";
-import { esc, modalPrompt, showMenu } from "./ui.ts";
+import { esc, modalPrompt, setHtmlKeepingScroll, showMenu } from "./ui.ts";
 
 export interface GitPanelCallbacks {
   /** kind: "worktree" (index vs disk), "staged" (HEAD vs index) or a commit oid. */
@@ -138,14 +138,19 @@ export class GitPanel {
 
     const g = this.groups();
     const total = g.conflict.length + g.staged.length + g.changes.length + g.untracked.length;
-    this.$(".js-groups").innerHTML = !st
-      ? `<p class="gp-empty">Not a git repository.</p>`
-      : total === 0
-        ? `<p class="gp-empty">No changes.</p>`
-        : (["conflict", "staged", "changes", "untracked"] as Group[])
-            .filter((k) => g[k].length)
-            .map((k) => this.groupHtml(k, g[k]))
-            .join("");
+    // Refreshed on every watcher event and every save, so rebuilding must not
+    // scroll the list back to the top while someone is reading it.
+    setHtmlKeepingScroll(
+      this.$(".js-groups"),
+      !st
+        ? `<p class="gp-empty">Not a git repository.</p>`
+        : total === 0
+          ? `<p class="gp-empty">No changes.</p>`
+          : (["conflict", "staged", "changes", "untracked"] as Group[])
+              .filter((k) => g[k].length)
+              .map((k) => this.groupHtml(k, g[k]))
+              .join(""),
+    );
   }
 
   private groupHtml(group: Group, entries: StatusEntry[]): string {

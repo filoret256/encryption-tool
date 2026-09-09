@@ -23,14 +23,18 @@
       <button class="tab tab-helm" data-action="switch" data-tab="helm">helm-encrypt</button>
       <button class="tab tab-code" data-action="switch" data-tab="code">code</button>
     </div>
-    <!-- Download point for the prebuilt local agent. Only the code tab needs
-         one, so main.ts reveals this when that tab is opened and hides it
-         again otherwise. -->
-    <div id="agent-dl" hidden></div>
-    <div class="header-right">
+    <!-- Everything here concerns the local agent — where to get one, and what it
+         can currently do — so it belongs beside the tab that uses it. main.ts
+         reveals the group with the code tab and hides it again otherwise. -->
+    <div id="code-tools" class="code-tools" hidden>
+      <!-- Download point for the prebuilt local agent. Hides itself as well when
+           the deployment publishes none. -->
+      <div id="agent-dl" hidden></div>
       <!-- Capability badge: reports whether the local agent, git and ripgrep are
            reachable, and what is unavailable without them. Mounted by main.ts. -->
       <div id="cap-badge"></div>
+    </div>
+    <div class="header-right">
       <button class="theme-toggle" data-action="theme" aria-label="Toggle dark / light theme" title="Toggle theme">
         <span class="theme-ic sun">☀</span>
         <span class="theme-switch"><span class="theme-knob"></span></span>

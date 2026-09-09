@@ -7,6 +7,38 @@ export const esc = (s: string): string =>
 
 export const attr = (s: string): string => esc(s).replace(/"/g, "&quot;");
 
+/** Replace a scrollable container's contents without throwing the reader back
+ *  to the top.
+ *
+ *  Assigning innerHTML resets scrollTop. In a list you click through — commits,
+ *  changed files — that means the row you just clicked jumps off screen, which
+ *  reads as "the click did nothing"; you click again, now on whatever moved
+ *  under the cursor. Panels that rebuild themselves in place must not do that.
+ *
+ *  Pass `anchor` — a selector for the row the user just acted on — when the
+ *  rebuild changes heights above it. Holding that row still is what people
+ *  actually perceive as "nothing moved"; holding scrollTop is not, because
+ *  collapsing a long block higher up shifts everything under the cursor.
+ */
+export function setHtmlKeepingScroll(el: HTMLElement, html: string, anchor?: string): void {
+  const anchorTop = anchor ? el.querySelector(anchor)?.getBoundingClientRect().top : undefined;
+  const { scrollTop, scrollLeft } = el;
+
+  el.innerHTML = html;
+
+  // Reading a layout property first. Straight after an innerHTML assignment the
+  // new content has not been laid out, so scrollHeight is still 0 and any
+  // scrollTop we assign is clamped to 0 — the very jump this exists to prevent.
+  void el.scrollHeight;
+  if (scrollTop) el.scrollTop = scrollTop;
+  if (scrollLeft) el.scrollLeft = scrollLeft;
+
+  if (anchorTop !== undefined) {
+    const movedTo = el.querySelector(anchor!)?.getBoundingClientRect().top;
+    if (movedTo !== undefined) el.scrollTop += movedTo - anchorTop;
+  }
+}
+
 /** One floating menu at a time, reused for every right-click. */
 export function showMenu(x: number, y: number, items: [string, () => void][]): void {
   document.querySelector(".ctx-menu")?.remove();

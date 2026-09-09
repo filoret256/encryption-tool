@@ -7,12 +7,22 @@
  *   - the code tab talks to the local agent on 127.0.0.1, a different origin.
  *     Cross-origin requests are passed straight through — caching or delaying
  *     them would break the editor for no benefit;
- *   - assets have fixed names (no content hashing, so the compiled binary can
- *     embed them), which is why they are served stale-while-revalidate: a user
- *     may run one build behind for a single load, then self-heal.
+ *   - the code tab talks to the local agent on 127.0.0.1, a different origin.
  *
- *  Bump VERSION when the shell changes in a way old clients must not mix with.
+ *  Assets have fixed names — no content hashing, because the compiled binary
+ *  embeds them by path. That used to mean serving them stale-while-revalidate
+ *  and letting a client run one build behind for a load. It is not a workable
+ *  trade: the shell is network-first, so a returning user got the *new*
+ *  index.html driving the *old* bundle, and since sw.js itself had not changed
+ *  there was no new worker and therefore no update prompt either — the mismatch
+ *  was completely silent. Scripts and styles are now network-first like the
+ *  shell, with the cache as the offline fallback, so what runs is never older
+ *  than the page that asked for it.
+ *
+ *  The cache is keyed by the app version, so a release drops the previous one
+ *  and the worker itself changes, which is what raises the update bar.
  */
+import { VERSION } from "../version.ts";
 
 /** The service-worker globals, declared locally: pulling in lib.webworker would
  *  collide with the DOM lib this project compiles against. */
@@ -34,8 +44,7 @@ interface FetchEventLike extends ExtendableEventLike {
 
 const sw = self as unknown as ServiceWorkerScope;
 
-const VERSION = "v1";
-const CACHE = `enc-tool-${VERSION}`;
+const CACHE = `enc-tool-v${VERSION}`;
 
 const SHELL = [
   "/",
@@ -77,20 +86,31 @@ sw.addEventListener("fetch", (event) => {
     event.respondWith(networkFirst(req));
     return;
   }
+  // Code and styles decide how the app behaves, so they follow the shell: fresh
+  // when the network allows, cached only when it does not.
+  if (/\.(js|css)$/.test(url.pathname)) {
+    event.respondWith(networkFirst(req));
+    return;
+  }
+  // Icons and the manifest can lag a load without anyone noticing.
   if (url.pathname.startsWith("/public/") || url.pathname === "/manifest.webmanifest") {
     event.respondWith(staleWhileRevalidate(req));
   }
 });
 
-/** The page itself: fresh when possible, the cached shell when offline. */
+/** Fresh when possible, the cached copy when offline.
+ *
+ *  Navigations are stored under "/" so any route falls back to the one shell we
+ *  keep; everything else is keyed by its own URL. */
 async function networkFirst(req: Request): Promise<Response> {
   const cache = await caches.open(CACHE);
+  const key = req.mode === "navigate" ? "/" : req;
   try {
     const res = await fetch(req);
-    if (res.ok) void cache.put("/", res.clone());
+    if (res.ok) void cache.put(key, res.clone());
     return res;
   } catch {
-    return (await cache.match("/")) ?? new Response("Offline", { status: 503, statusText: "Offline" });
+    return (await cache.match(key)) ?? new Response("Offline", { status: 503, statusText: "Offline" });
   }
 }
 

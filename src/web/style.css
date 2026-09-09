@@ -175,6 +175,9 @@ body {
 .code-tab:hover { background: var(--btn); }
 .code-tab.active { background: var(--panel); color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
 .code-tab.dirty .code-tab-name { font-style: italic; }
+/* A diff is an ordinary tab; the glyph is what tells it apart from a file. */
+.code-tab-icon { font-size: 11px; opacity: .75; margin-right: -2px; }
+.code-tab.is-diff .code-tab-name { letter-spacing: .01em; }
 .code-tab-close {
   border: 0; border-radius: 3px; background: transparent; cursor: pointer;
   color: inherit; font-size: 10px; line-height: 1; padding: 2px 4px;
@@ -328,13 +331,19 @@ body {
 .hist-subject { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hist-meta { flex: 0 0 auto; font-size: 10px; color: var(--text-muted); }
 .hist-oid { flex: 0 0 auto; font-size: 10px; color: var(--text-muted); }
-.hist-refs { display: inline-flex; flex: 0 0 auto; gap: 4px; }
+/* Refs must yield to the subject. A tip commit can carry HEAD, its branch and
+   two remote refs, and at `flex: 0 0 auto` those pushed the commit message out
+   of the row entirely — the newest commit was the one you could not read. */
+.hist-refs { display: inline-flex; flex: 0 1 auto; min-width: 0; max-width: 55%; overflow: hidden; gap: 4px; }
 .hist-ref { font-size: 9px; padding: 1px 5px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-muted); white-space: nowrap; }
 .hist-ref.ref-head { border-color: var(--accent); color: var(--accent); }
 .hist-ref.ref-remote { color: var(--dec-modified); border-color: var(--dec-modified); }
 .hist-ref.ref-tag { color: var(--ok); border-color: var(--ok); }
 .hist-files { display: flex; gap: 6px; padding: 2px 8px 8px; background: var(--bg); }
-.hist-gutter { flex: 0 0 auto; display: flex; }
+/* Width comes from the lane count, set inline; the SVG is taken out of flow so
+   its intrinsic height cannot inflate the block. */
+.hist-gutter { flex: 0 0 auto; position: relative; }
+.hist-gutter .g-cont { position: absolute; inset: 0; }
 .hist-files-body { flex: 1; min-width: 0; }
 .hist-body { margin: 0 0 6px; font-size: 11px; color: var(--text-muted); white-space: pre-wrap; }
 
@@ -425,8 +434,10 @@ body {
 .cap-badge[data-status="blocked"] .cap-dot { color: var(--bad); }
 .cap-badge[data-status="online"] .cap-text { color: var(--text); }
 
+/* Anchored on the left now that the badge sits beside the tabs rather than at
+   the right edge of the header. */
 .cap-pop {
-  position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; width: 320px; padding: 10px;
+  position: absolute; left: 0; top: calc(100% + 6px); z-index: 30; width: 320px; padding: 10px;
   background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, .3);
 }
@@ -445,11 +456,12 @@ body {
 .needs-cap::after { content: "🔌"; font-size: 9px; margin-left: 4px; vertical-align: super; }
 .cap-install { width: 100%; margin-top: 6px; }
 
-/* ── Agent download (code tab only) ───────────────────────────────────────
-   Sits between the tabs and the header's right-hand group. `margin-right:auto`
-   claims the free space of the header's space-between, which keeps the chip
-   next to the tabs instead of centred between the two groups. */
-.agent-dl { position: relative; margin: 0 auto 0 10px; }
+/* ── Code-tab tools: agent download + capability badge ────────────────────
+   Sit between the tabs and the header's right-hand group. `margin-right:auto`
+   claims the free space of the header's space-between, which keeps them next
+   to the tabs instead of centred between the two groups. */
+.code-tools { display: flex; align-items: center; gap: 8px; margin: 0 auto 0 10px; }
+.agent-dl { position: relative; }
 .agent-dl-chip {
   display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
   padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px;

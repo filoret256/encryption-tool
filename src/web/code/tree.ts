@@ -55,6 +55,8 @@ export class FileTree {
   private dropTarget: string | null = null;
   /** A repaint was requested while dragging and still owes the tree a redraw. */
   private paintPending = false;
+  /** Directories whose listing is in flight, so a second press is not a second read. */
+  private expanding = new Set<string>();
   /** First half of a "select for compare" pair, if one has been picked. */
   private compareBase: string | null = null;
   private status = new Map<string, StatusEntry>();
@@ -82,7 +84,11 @@ export class FileTree {
     this.viewport.addEventListener("dragleave", (e) => this.onDragLeave(e));
     this.viewport.addEventListener("drop", (e) => void this.onDrop(e));
     this.viewport.addEventListener("dragend", () => this.endDrag());
-    this.viewport.addEventListener("click", (e) => this.onClick(e));
+    // Acting on the press, not on `click`. Every row is draggable, and a press
+    // that moves even a couple of pixels before release makes the browser start
+    // a drag and swallow the click entirely — which is why clicking quickly
+    // through the tree used to do nothing every other time.
+    this.viewport.addEventListener("pointerdown", (e) => this.onPress(e));
     this.viewport.addEventListener("dblclick", (e) => this.onDblClick(e));
     this.viewport.addEventListener("contextmenu", (e) => this.onContextMenu(e));
     this.viewport.tabIndex = 0;
@@ -230,21 +236,32 @@ export class FileTree {
     return row ? this.find(row.dataset.path ?? "") : null;
   }
 
-  private onClick(e: MouseEvent): void {
+  private onPress(e: PointerEvent): void {
+    // Left button only: the right button opens the context menu, and the
+    // middle one must not expand a folder behind the user's back.
+    if (e.button !== 0) return;
+    // A drag that ended outside the viewport can leave `dragging` set, which
+    // freezes every repaint. A fresh press means no drag is in progress.
+    if (this.dragging) this.endDrag();
+
     const node = this.nodeFromEvent(e);
     if (!node) return;
     this.selected = node.path;
-    if (node.dir) {
-      if (node.expanded) {
-        node.expanded = false;
-        this.rebuild();
-      } else {
-        void this.expand(node);
-      }
-    } else {
+    if (!node.dir) {
       this.cb.onOpen(node.path);
       this.paint();
+      return;
     }
+    if (node.expanded) {
+      node.expanded = false;
+      this.rebuild();
+      return;
+    }
+    // Reading a directory is a round trip; a second press before it lands
+    // would issue the same read again and repaint twice.
+    if (this.expanding.has(node.path)) return;
+    this.expanding.add(node.path);
+    void this.expand(node).finally(() => this.expanding.delete(node.path));
   }
 
   // ── drag & drop ─────────────────────────────────────────────────────────
