@@ -15,6 +15,7 @@ import { SearchPanel } from "./search-panel.ts";
 import { DiffView } from "./diff.ts";
 import { findConflicts } from "./conflicts.ts";
 import { attr, esc, modalPrompt } from "./ui.ts";
+import { iconBranch, iconFiles, iconHistory, iconNewFile, iconNewFolder, iconRefresh, iconSearch } from "./icons.ts";
 
 export interface CodeContext {
   agent: AgentClient;
@@ -39,29 +40,29 @@ const SHELL = `
     <span class="t-label">folder</span>
     <span class="code-root">not connected</span>
     <button class="t-btn js-connect" type="button">connect…</button>
-    <button class="t-btn js-reload" type="button" data-requires="agent" title="Reload">⟳</button>
+    <button class="t-btn js-reload" type="button" data-requires="agent" title="Reload">${iconRefresh}</button>
     <div class="toolbar-sep"></div>
     <span class="t-label">branch</span>
     <span class="code-branch" data-requires="git">—</span>
     <div class="t-spacer"></div>
-    <button class="t-btn t-btn-primary js-save" type="button" data-requires="agent">↓ save</button>
+    <button class="t-btn t-btn-primary js-save" type="button">↓ save</button>
   </div>
   <div class="code-body">
     <nav class="code-rail">
-      <button class="rail-btn active" type="button" data-view="explorer" title="Explorer">🗀</button>
-      <button class="rail-btn" type="button" data-view="search" data-requires="agent" title="Search across the project">⌕</button>
+      <button class="rail-btn active" type="button" data-view="explorer" title="Explorer">${iconFiles}</button>
+      <button class="rail-btn" type="button" data-view="search" data-requires="agent" title="Search across the project">${iconSearch}</button>
       <button class="rail-btn" type="button" data-view="scm" data-requires="git" title="Source control">
-        ⑂<span class="rail-badge js-scm-badge" hidden></span>
+        ${iconBranch}<span class="rail-badge js-scm-badge" hidden></span>
       </button>
-      <button class="rail-btn" type="button" data-view="history" data-requires="git" title="History">⌛</button>
+      <button class="rail-btn" type="button" data-view="history" data-requires="git" title="History">${iconHistory}</button>
     </nav>
     <aside class="code-side" data-view="explorer">
       <div class="side-head">
         <span class="js-side-title">explorer</span>
         <span class="t-spacer"></span>
         <span class="act-explorer">
-          <button class="t-icon js-newfile" type="button" data-requires="agent" title="New file">🗎+</button>
-          <button class="t-icon js-newdir" type="button" data-requires="agent" title="New folder">🗀+</button>
+          <button class="t-icon js-newfile" type="button" data-requires="agent" title="New file">${iconNewFile}</button>
+          <button class="t-icon js-newdir" type="button" data-requires="agent" title="New folder">${iconNewFolder}</button>
         </span>
       </div>
       <div class="side-views">
@@ -135,6 +136,17 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   const baselines = new Map<string, string>();
   /** Which tab is on screen. */
   let activeId: string | null = null;
+  /** The preview tab, if there is one.
+   *
+   *  A single click opens a file "on approval": it takes one reusable slot in
+   *  the strip instead of adding to it, so clicking through twenty files leaves
+   *  one tab rather than twenty. Double-clicking it, or editing it, promotes it
+   *  to an ordinary tab. Editing is what makes replacing the slot safe — a tab
+   *  with unsaved work has already been promoted out of it. */
+  let previewId: string | null = null;
+  /** True while activate() swaps the editor's document, so the change that
+   *  swap produces is not mistaken for the user typing. */
+  let swappingState = false;
   /** The active tab's path when it is a file, null while a diff is shown — so
    *  saving, conflict handling and the watcher never act on a diff. */
   let openPath: string | null = null;
@@ -145,8 +157,38 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   let lastSelfWrite = 0;
 
   // ── editor + diff ──
-  const editor = new CodeEditor(editorHost, ctx.isDark(), () => void save(), () => onEditorChange());
+  // Typing into a previewed file is what makes it worth keeping, so the first
+  // real edit promotes it. `swappingState` keeps a tab switch — which also
+  // replaces the document — from counting as one.
+  const editor = new CodeEditor(editorHost, ctx.isDark(), () => void save(), () => {
+    if (!swappingState) pin(openPath);
+    onEditorChange();
+  });
   const diff = new DiffView(diffHost, ctx.isDark());
+
+  const saveBtn = $<HTMLButtonElement>(".js-save");
+
+  /** Save is off unless there is a writable file on screen and an agent to
+   *  write it with — and the button says which of those is missing. */
+  function updateSaveEnabled(): void {
+    const why =
+      agent.state !== "online" ? "Requires the local agent"
+      : openPath === null ? "No file open"
+      : openReadOnly ? "This file is read-only"
+      : "";
+    saveBtn.disabled = why !== "";
+    saveBtn.title = why || "Save the open file";
+  }
+
+  /** Nothing open: the editor holds only its placeholder, so it is dimmed and
+   *  made read-only. Leaving it editable invited typing into a document that
+   *  belongs to no file and could never be saved. */
+  function showEmptyEditor(): void {
+    editor.state = editor.newState("", "", true);
+    editorHost.classList.add("is-empty");
+    pathLabel.textContent = "no file";
+    updateSaveEnabled();
+  }
 
   function showEditor(): void {
     diffHost.hidden = true;
@@ -217,7 +259,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       remove: (paths) => agent.call("fs.delete", { paths }).then(() => undefined),
     },
     {
-      onOpen: (path) => void open(path),
+      onOpen: (path, preview) => void open(path, false, preview),
       onError: (m) => ctx.toast(m, true),
       confirmDelete: (paths) => confirm(`Delete ${paths.join(", ")}? This cannot be undone.`),
       compare: (left, right) => void compare(left, right),
@@ -271,7 +313,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         const file = t.kind === "file";
         const name = file ? (t.path.split("/").pop() ?? t.path) : t.label;
         const dirty = file && isDirty(t.path);
-        const cls = ["code-tab", t.id === activeId ? "active" : "", dirty ? "dirty" : "", file ? "" : "is-diff"]
+        const cls = ["code-tab", t.id === activeId ? "active" : "", dirty ? "dirty" : "",
+          t.id === previewId ? "preview" : "", file ? "" : "is-diff"]
           .filter(Boolean)
           .join(" ");
         return `<div class="${cls}" data-id="${attr(t.id)}" title="${esc(file ? t.path : t.title)}">
@@ -281,6 +324,38 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         </div>`;
       })
       .join("");
+  }
+
+  function forget(tab: OpenTab): void {
+    if (tab.kind !== "file") return;
+    states.delete(tab.path);
+    baselines.delete(tab.path);
+  }
+
+  /** Put a newly opened tab in the strip. A preview replaces the preview slot
+   *  in place, keeping its position, rather than appending. */
+  function placeTab(tab: OpenTab, preview: boolean): void {
+    const existing = tabs.findIndex((t) => t.id === tab.id);
+    if (existing !== -1) {
+      tabs[existing] = tab;
+    } else {
+      const slot = preview && previewId !== null ? tabs.findIndex((t) => t.id === previewId) : -1;
+      if (slot === -1) {
+        tabs.push(tab);
+      } else {
+        forget(tabs[slot]);
+        tabs[slot] = tab;
+      }
+    }
+    if (preview) previewId = tab.id;
+    else if (previewId === tab.id) previewId = null;
+  }
+
+  /** Promote the preview tab to a permanent one. */
+  function pin(id: string | null): void {
+    if (id === null || previewId !== id) return;
+    previewId = null;
+    renderTabs();
   }
 
   /** Stash the on-screen document against the tab it belongs to. */
@@ -299,6 +374,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       openReadOnly = false;
       diff.show(tab.pair);
       pathLabel.textContent = tab.title;
+      updateSaveEnabled();
       dirtyLabel.textContent = "";
       dirtyLabel.classList.remove("is-dirty");
       showDiff();
@@ -310,8 +386,12 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     if (!state) return;
     openPath = tab.path;
     openReadOnly = tab.readOnly;
+    swappingState = true;
     editor.state = state;
+    swappingState = false;
+    editorHost.classList.remove("is-empty");
     pathLabel.textContent = tab.path + (tab.readOnly ? "  (read-only)" : "");
+    updateSaveEnabled();
     showEditor();
     renderTabs();
     renderConflictBar();
@@ -329,6 +409,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       baselines.delete(tab.path);
     }
     tabs.splice(i, 1);
+    if (previewId === id) previewId = null;
 
     if (activeId !== id) return renderTabs();
     activeId = null;
@@ -337,8 +418,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     const next = tabs[Math.min(i, tabs.length - 1)];
     if (next) return activate(next.id);
     diff.clear();
-    editor.state = editor.newState("", "", false);
-    pathLabel.textContent = "no file";
+    showEmptyEditor();
     showEditor();
     renderTabs();
     renderConflictBar();
@@ -351,6 +431,11 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     if (!id) return;
     if (el.closest(".code-tab-close")) closeTab(id);
     else activate(id);
+  });
+  // Double-clicking a preview tab keeps it, the same gesture as in the tree.
+  $(".js-tabs").addEventListener("dblclick", (e) => {
+    const id = (e.target as HTMLElement).closest<HTMLElement>(".code-tab")?.dataset.id;
+    if (id) pin(id);
   });
   // Middle-click closes, as everywhere else.
   $(".js-tabs").addEventListener("auxclick", (e) => {
@@ -372,8 +457,13 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  rather than the file clicked last. */
   let openSeq = 0;
 
-  async function open(path: string, reload = false): Promise<void> {
-    if (states.has(path) && !reload) return activate(path);
+  async function open(path: string, reload = false, preview = false): Promise<void> {
+    if (states.has(path) && !reload) {
+      // Already open: a deliberate open (double click) pins whatever is there.
+      if (!preview) pin(path);
+      activate(path);
+      return;
+    }
     const seq = ++openSeq;
     try {
       const file = await agent.call<FileRead>("fs.read", { path });
@@ -386,9 +476,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       const superseded = seq !== openSeq;
       if (!superseded) stashActive();
       const tab: FileTab = { kind: "file", id: path, path, readOnly, eol };
-      const existing = tabs.findIndex((t) => t.id === path);
-      if (existing === -1) tabs.push(tab);
-      else tabs[existing] = tab;
+      placeTab(tab, preview && !reload);
       states.set(path, editor.newState(path, text, readOnly));
       baselines.set(path, text);
 
@@ -404,7 +492,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
   /** Open a file and put the cursor on a specific match. */
   async function openAt(path: string, line: number, col: number): Promise<void> {
-    await open(path);
+    // Walking search results should not leave a tab behind for every hit.
+    await open(path, false, true);
     if (openPath === path) editor.revealPosition(line, col);
   }
 
@@ -414,11 +503,10 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   /** Put a diff in the tab strip, or refresh and focus the one already there.
    *  The pair is kept on the tab, so switching away to a file and back redraws
    *  it without another round trip. */
-  function showDiffTab(id: string, label: string, title: string, pair: DiffPair): void {
-    const tab: DiffTab = { kind: "diff", id, label, title, pair };
-    const existing = tabs.findIndex((t) => t.id === id);
-    if (existing === -1) tabs.push(tab);
-    else tabs[existing] = tab;
+  function showDiffTab(id: string, label: string, title: string, pair: DiffPair, preview = true): void {
+    // Diffs pile up the same way files do — a commit with sixty files is sixty
+    // clicks — so they share the preview slot.
+    placeTab({ kind: "diff", id, label, title, pair }, preview);
     activate(id);
   }
 
@@ -537,9 +625,10 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     baselines.clear();
     conflicted.clear();
     activeId = null;
+    previewId = null;
     openPath = null;
-    editor.state = editor.newState("", "", false);
-    pathLabel.textContent = "no file";
+    openReadOnly = false;
+    showEmptyEditor();
     renderTabs();
     renderConflictBar();
     showEditor();
@@ -606,8 +695,11 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       if (online) void onOnline();
       else onOffline();
     }
+    updateSaveEnabled();
     ctx.onCapsChanged();
   };
+  // Start in the empty state rather than an editable blank document.
+  showEmptyEditor();
   onAgentState();
 
   return {

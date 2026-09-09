@@ -110,8 +110,34 @@ export class DiffView {
       return;
     }
 
-    const before = pair.before ?? "";
-    const after = pair.after ?? "";
+    // A file that exists on one side only — added, or deleted — has nothing to
+    // align against. Coercing the missing side to "" and handing that to
+    // MergeView is not merely wasteful: an empty document on one side hangs the
+    // tab outright. Show the content itself, which is also what someone opening
+    // a new file out of a commit actually wants to read.
+    if (pair.before === null || pair.after === null) {
+      const added = pair.before === null;
+      const text = (added ? pair.after : pair.before) ?? "";
+      const lines = text === "" ? 0 : text.split("\n").length;
+      const note = document.createElement("div");
+      note.className = `diff-note diff-note-${added ? "added" : "removed"}`;
+      note.textContent = added
+        ? `New file — ${lines} line${lines === 1 ? "" : "s"} added.`
+        : `File deleted — ${lines} line${lines === 1 ? "" : "s"} removed.`;
+      this.body.append(note);
+
+      const holder = document.createElement("div");
+      holder.className = "diff-single";
+      this.body.append(holder);
+      this.single = new EditorView({
+        parent: holder,
+        state: EditorState.create({ doc: text, extensions: this.base(pair.path) }),
+      });
+      return;
+    }
+
+    const before = pair.before;
+    const after = pair.after;
     if (before === after) {
       this.body.innerHTML = `<div class="diff-note">No changes (${esc(pair.beforeLabel)} and ${esc(pair.afterLabel)} are identical).</div>`;
       return;

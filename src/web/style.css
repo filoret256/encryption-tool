@@ -82,7 +82,11 @@ body {
   padding: 5px 10px; border: 1px solid var(--border); border-radius: 5px;
   background: var(--btn); color: var(--text);
 }
-.t-btn:hover { background: var(--btn-hover); }
+/* Excluding the primary button deliberately: `.t-btn:hover` outranks
+   `.t-btn-primary` on specificity, so it used to repaint the background light
+   while the label kept `--accent-fg` white — white on light grey, unreadable in
+   the light theme. */
+.t-btn:not(.t-btn-primary):hover { background: var(--btn-hover); }
 .t-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .t-btn.is-active { background: var(--active); border-color: var(--accent); }
 .t-btn-primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
@@ -152,7 +156,13 @@ body {
 .tree-row:hover { background: var(--btn); }
 .tree-row.sel { background: var(--active); }
 .tree-caret { width: 10px; color: var(--text-muted); flex: 0 0 auto; }
-.tree-icon { flex: 0 0 auto; opacity: .75; }
+/* File-type icons carry their own colour from the Seti palette, so no opacity
+   dimming here — that would mute exactly the signal they exist to give. */
+.tree-icon { flex: 0 0 auto; display: flex; align-items: center; }
+.tree-icon .fic { display: block; width: 16px; height: 16px; }
+/* Folders take the row's own colour instead of a fixed grey, so they follow the
+   theme and the git decoration on the row. */
+.tree-icon .fic-dir { fill: currentColor; opacity: .65; }
 .tree-name { overflow: hidden; text-overflow: ellipsis; }
 .tree-mark { margin-left: auto; padding-right: 8px; font-size: 11px; flex: 0 0 auto; }
 .tree-row.dec-modified .tree-name, .tree-row.dec-modified .tree-mark { color: var(--dec-modified); }
@@ -174,7 +184,9 @@ body {
 }
 .code-tab:hover { background: var(--btn); }
 .code-tab.active { background: var(--panel); color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
-.code-tab.dirty .code-tab-name { font-style: italic; }
+/* Italic means "preview", not "unsaved" — unsaved is already the dot in place
+   of the close cross, and using one signal for both left them indistinguishable. */
+.code-tab.preview .code-tab-name { font-style: italic; }
 /* A diff is an ordinary tab; the glyph is what tells it apart from a file. */
 .code-tab-icon { font-size: 11px; opacity: .75; margin-right: -2px; }
 .code-tab.is-diff .code-tab-name { letter-spacing: .01em; }
@@ -215,6 +227,21 @@ body {
   border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--text-muted);
 }
 .rail-btn:hover { background: var(--btn-hover); color: var(--text); }
+.rail-btn .ic, .t-icon .ic, .t-btn .ic { display: block; }
+/* The rail keeps a badge overlaid on the source-control icon. */
+.rail-btn { position: relative; }
+
+/* No file open: recessed, dimmed and inert, so an empty editor does not look
+   like a document waiting to be typed into. */
+.code-editor-host.is-empty { background: color-mix(in srgb, var(--text) 5%, var(--bg)); }
+.code-editor-host.is-empty .cm-editor { background: transparent; }
+.code-editor-host.is-empty .cm-gutters { background: transparent; opacity: .5; }
+.code-editor-host.is-empty .cm-cursor { display: none; }
+/* Only the highlight goes: the active line is the element that carries the
+   placeholder, so hiding it hides the hint as well. */
+.code-editor-host.is-empty .cm-activeLine,
+.code-editor-host.is-empty .cm-activeLineGutter { background: transparent; }
+.code-editor-host.is-empty .cm-placeholder { color: var(--text-muted); opacity: .8; }
 .rail-btn.active { background: var(--active); color: var(--text); border-color: var(--border); }
 .rail-badge {
   position: absolute; right: -2px; bottom: -2px; min-width: 15px; padding: 0 3px;
@@ -383,6 +410,15 @@ body {
 .diff-body .cm-mergeView, .diff-body .cm-merge-a, .diff-body .cm-merge-b { height: 100%; }
 .diff-body .cm-editor { height: 100%; }
 .diff-note { padding: 16px; color: var(--text-muted); font-size: 12px; }
+/* One-sided diffs: a banner over the file's own content, tinted by direction. */
+.diff-note-added, .diff-note-removed {
+  padding: 6px 12px; font-family: var(--mono); font-size: 11px;
+  border-bottom: 1px solid var(--border);
+}
+.diff-note-added { color: var(--dec-added); background: color-mix(in srgb, var(--dec-added) 10%, transparent); }
+.diff-note-removed { color: var(--dec-deleted); background: color-mix(in srgb, var(--dec-deleted) 10%, transparent); }
+.diff-body:has(.diff-note-added), .diff-body:has(.diff-note-removed) { display: flex; flex-direction: column; }
+.diff-single { flex: 1; min-height: 0; }
 /* @codemirror/merge ships light-only chunk colours; restate them as tokens so
    the dark theme does not end up with black text on pale green. */
 .diff-body .cm-changedLine { background: color-mix(in srgb, var(--dec-modified) 16%, transparent); }

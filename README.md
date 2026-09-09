@@ -33,7 +33,12 @@ your machine.
 ### Code tab / Вкладка кода
 
 - **Explorer** — виртуализированное дерево (десятки тысяч файлов), контекстное меню,
-  создание/переименование/удаление, **drag & drop**, git-декорации на файлах и папках
+  создание/переименование/удаление, **drag & drop**, git-декорации на файлах и папках,
+  иконки типов файлов из набора Seti UI (MIT)
+- **Preview tabs** — одиночный клик открывает файл «на просмотр»: такая вкладка одна
+  и переиспользуется, поэтому проход по двадцати файлам не оставляет двадцати вкладок.
+  Двойной клик или первая правка закрепляют её (курсив в заголовке снимается).
+  Диффы из source control и истории делят тот же слот
 - **Editor tabs** — вкладки открытых файлов, каждая со своим курсором, прокруткой и
   историей отмены; окончания строк файла сохраняются при записи
 - **Syntax highlighting** — 18 грамматик (TS/JS/JSX, JSON, YAML, CSS, HTML, Markdown,
@@ -365,10 +370,19 @@ bunx tsc --noEmit
 │   ├── build-agents.ts    # cross-compile the agent and pack it for download
 │   ├── archive.ts         # minimal tar.gz and zip writers, no dependencies
 │   ├── make-icons.ts      # procedural PWA icon generator
+│   ├── build-file-icons.ts # regenerate the explorer's file-type icons
 │   └── *-smoke.ts         # the eight test suites
+├── THIRD-PARTY-LICENSES.md
 ├── package.json
 └── Dockerfile             # server binary + cross-compiled agents -> bookworm-slim
 ```
+
+Two icon sets, kept apart on purpose. `src/web/code/icons.ts` is the activity
+rail and the toolbar, drawn for this project. `src/web/code/file-icons.ts` is the
+file-type icons in the explorer, **generated** from [Seti UI](https://github.com/jesseweed/seti-ui)
+(MIT) by `bun run icons:files` — the generator reads that theme's own palette and
+extension mapping, so what you see matches VS Code's "Seti" rather than a guess.
+The licence travels with them in `THIRD-PARTY-LICENSES.md`.
 
 ---
 
@@ -390,4 +404,5 @@ says so explicitly. Вкладки шифрования работают вез�
 
 ## License / Лицензия
 
-MIT
+MIT. Vendored third-party material and its notices are listed in
+[THIRD-PARTY-LICENSES.md](THIRD-PARTY-LICENSES.md).

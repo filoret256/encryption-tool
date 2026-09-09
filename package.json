@@ -19,6 +19,7 @@
     "download:smoke": "bun scripts/download-smoke.ts",
     "build": "bun build src/web/main.ts --outdir public --target browser --minify && bun build src/web/code.ts --outdir public --target browser --minify && bun build src/web/sw.ts --outdir public --target browser --minify",
     "icons": "bun scripts/make-icons.ts",
+    "icons:files": "bun scripts/build-file-icons.ts",
     "compile": "bun build --compile --minify --sourcemap=none --outfile server src/server.ts"
   },
   "dependencies": {

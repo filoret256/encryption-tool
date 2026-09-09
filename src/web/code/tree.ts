@@ -10,6 +10,7 @@
  */
 import type { DirEntry, StatusEntry } from "../../agent/protocol.ts";
 import { attr, esc, modalPrompt, showMenu } from "./ui.ts";
+import { fileIcon } from "./file-icons.ts";
 
 const ROW = 22;
 /** Rows rendered above and below the viewport to hide scroll tearing. */
@@ -34,7 +35,9 @@ export interface TreeOps {
 }
 
 export interface TreeCallbacks {
-  onOpen(path: string): void;
+  /** `preview` is true for a single click — the file opens on approval, in a
+   *  reusable tab. A double click opens it for keeps. */
+  onOpen(path: string, preview: boolean): void;
   onError(message: string): void;
   confirmDelete(paths: string[]): boolean;
   /** Show a diff between two arbitrary files in the workspace. */
@@ -223,7 +226,7 @@ export class FileTree {
 
     return `<div class="${cls.join(" ")}" draggable="true" data-path="${attr(n.path)}" style="padding-left:${4 + n.depth * 12}px">
       <span class="tree-caret">${n.dir ? (n.expanded ? "▾" : "▸") : ""}</span>
-      <span class="tree-icon">${n.dir ? "🗀" : "🗎"}</span>
+      <span class="tree-icon">${fileIcon(n.name, n.dir)}</span>
       <span class="tree-name">${esc(n.name)}</span>
       <span class="tree-mark">${mark}</span>
     </div>`;
@@ -248,7 +251,7 @@ export class FileTree {
     if (!node) return;
     this.selected = node.path;
     if (!node.dir) {
-      this.cb.onOpen(node.path);
+      this.cb.onOpen(node.path, true);
       this.paint();
       return;
     }
@@ -349,9 +352,10 @@ export class FileTree {
     }
   }
 
+  /** Double click keeps the file: the tab stops being a preview. */
   private onDblClick(e: MouseEvent): void {
     const node = this.nodeFromEvent(e);
-    if (node && !node.dir) this.cb.onOpen(node.path);
+    if (node && !node.dir) this.cb.onOpen(node.path, false);
   }
 
   private onKey(e: KeyboardEvent): void {
@@ -385,7 +389,7 @@ export class FileTree {
       }
       case "Enter": {
         const n = this.rows[i];
-        if (n && !n.dir) this.cb.onOpen(n.path);
+        if (n && !n.dir) this.cb.onOpen(n.path, false);
         else if (n) void this.expand(n);
         return;
       }
@@ -459,7 +463,7 @@ export class FileTree {
       else await this.ops.createFile(path);
       await this.expand(parent, true);
       this.selected = path;
-      if (!dir) this.cb.onOpen(path);
+      if (!dir) this.cb.onOpen(path, false);
     } catch (e) {
       this.cb.onError(e instanceof Error ? e.message : String(e));
     }
