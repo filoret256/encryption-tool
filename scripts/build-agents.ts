@@ -16,7 +16,7 @@
  */
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { TARGETS, archiveName, byId, type AgentTarget } from "../src/agent/targets.ts";
 import { VERSION } from "../src/version.ts";
 import { pack } from "./archive.ts";
@@ -108,10 +108,15 @@ const manifest: Manifest = { version: VERSION, generated: new Date().toISOString
  *  no target SDK and no libc on the far side. -trimpath keeps the build machine's
  *  paths out of the binary, and -s -w drop the symbol and DWARF tables the agent
  *  has no use for — about a third of the size.
+ *
+ *  The output path is resolved before the spawn: the build runs in agent-go/, so
+ *  anything relative would land inside the module. Resolving here means --out
+ *  takes a path of either kind — dist/agents from the package script, an
+ *  absolute /agents from the Dockerfile — and both mean what they say.
  */
 async function goBuild(go: string, t: AgentTarget, outfile: string): Promise<void> {
   const proc = Bun.spawn(
-    [go, "build", "-trimpath", "-ldflags", `-s -w -X main.version=${VERSION}`, "-o", join("..", outfile), "."],
+    [go, "build", "-trimpath", "-ldflags", `-s -w -X main.version=${VERSION}`, "-o", resolve(outfile), "."],
     {
       cwd: "agent-go",
       env: { ...process.env, GOOS: t.goos, GOARCH: t.goarch, CGO_ENABLED: "0" },
