@@ -65,6 +65,9 @@ export class FileTree {
   private status = new Map<string, StatusEntry>();
   /** Directories containing a change, so folders can carry a dot like VS Code. */
   private dirtyDirs = new Set<string>();
+  /** Fingerprint of the decorations currently drawn, so an unchanged status
+   *  costs nothing. */
+  private statusKey = "";
 
   private readonly viewport: HTMLElement;
   private readonly spacer: HTMLElement;
@@ -108,6 +111,7 @@ export class FileTree {
   }
 
   reset(): void {
+    this.statusKey = "";
     this.root = { path: "", name: "", dir: true, depth: -1, expanded: true, loaded: false, children: [] };
     this.rows = [];
     this.layer.innerHTML = "";
@@ -115,6 +119,15 @@ export class FileTree {
   }
 
   setStatus(entries: StatusEntry[]): void {
+    // Status arrives far more often than it changes: a build writing files, or
+    // any git process taking .git/index.lock, wakes the watcher several times a
+    // second. Repainting on each one replaces every row, which cancels drags
+    // and makes the browser drop double clicks — both clicks have to land on
+    // the same element for one to be reported. So redraw only on a difference.
+    const key = JSON.stringify(entries.map((e) => [e.path, e.index, e.work, e.untracked, e.conflict, e.ignored]));
+    if (key === this.statusKey) return;
+    this.statusKey = key;
+
     this.status = new Map(entries.map((e) => [e.path, e]));
     this.dirtyDirs.clear();
     for (const e of entries) {
@@ -249,10 +262,9 @@ export class FileTree {
 
     const node = this.nodeFromEvent(e);
     if (!node) return;
-    this.selected = node.path;
+    this.setSelected(node.path);
     if (!node.dir) {
       this.cb.onOpen(node.path, true);
-      this.paint();
       return;
     }
     if (node.expanded) {
@@ -275,6 +287,19 @@ export class FileTree {
     this.dragging = node.path;
     e.dataTransfer?.setData("text/plain", node.path);
     if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+  }
+
+  /** Move the selection highlight without repainting.
+   *
+   *  A repaint replaces every row element, and the browser only reports a
+   *  dblclick when both clicks land on the *same* node — so repainting on the
+   *  first press meant a double click in the tree could never be seen at all.
+   *  Selection is one class; toggle it where it is. */
+  private setSelected(path: string): void {
+    this.selected = path;
+    for (const el of this.layer.querySelectorAll<HTMLElement>(".tree-row")) {
+      el.classList.toggle("sel", el.dataset.path === path);
+    }
   }
 
   /** Where a drop would land: into a directory, or into a file's parent. */

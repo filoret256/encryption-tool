@@ -52,6 +52,9 @@ export class GitPanel {
   private status: GitStatus | null = null;
   private branches: Branch[] = [];
   private busy = false;
+  /** Fingerprint of the rendered file list, so an unchanged status leaves the
+   *  rows — and any click in flight over them — alone. */
+  private renderedKey = "";
 
   private readonly $: <T extends HTMLElement>(sel: string) => T;
 
@@ -77,7 +80,12 @@ export class GitPanel {
         void this.commit(false);
       }
     });
-    this.$(".js-groups").addEventListener("click", (e) => void this.onGroupClick(e as MouseEvent));
+    // Opening a file reacts to the press: this panel rebuilds on every save and
+    // every watcher event, and a rebuild between mousedown and mouseup means no
+    // click event is ever produced. Stage / unstage / discard stay on click, so
+    // dragging off the button still cancels them.
+    this.$(".js-groups").addEventListener("pointerdown", (e) => this.onGroupPress(e as PointerEvent));
+    this.$(".js-groups").addEventListener("click", (e) => void this.onGroupAction(e as MouseEvent));
   }
 
   // ── data ────────────────────────────────────────────────────────────────
@@ -129,15 +137,29 @@ export class GitPanel {
 
   private render(): void {
     const st = this.status;
-    this.$(".js-branch-name").textContent = st?.branch ?? (st ? "(detached)" : "—");
+    // Assigning textContent replaces the text node even when the value is the
+    // same, so only write on a difference.
+    const set = (sel: string, value: string): void => {
+      const el = this.$(sel);
+      if (el.textContent !== value) el.textContent = value;
+    };
+    set(".js-branch-name", st?.branch ?? (st ? "(detached)" : "—"));
 
     const sync: string[] = [];
     if (st?.ahead) sync.push(`↑${st.ahead}`);
     if (st?.behind) sync.push(`↓${st.behind}`);
-    this.$(".js-sync").textContent = sync.join(" ");
+    set(".js-sync", sync.join(" "));
 
     const g = this.groups();
     const total = g.conflict.length + g.staged.length + g.changes.length + g.untracked.length;
+    const key = JSON.stringify([
+      st === null,
+      (["conflict", "staged", "changes", "untracked"] as Group[]).map((k) =>
+        g[k].map((e) => [e.path, e.index, e.work]),
+      ),
+    ]);
+    if (key === this.renderedKey) return;
+    this.renderedKey = key;
     // Refreshed on every watcher event and every save, so rebuilding must not
     // scroll the list back to the top while someone is reading it.
     setHtmlKeepingScroll(
@@ -193,7 +215,8 @@ export class GitPanel {
 
   // ── interaction ─────────────────────────────────────────────────────────
 
-  private async onGroupClick(e: MouseEvent): Promise<void> {
+  /** The action buttons: staging, unstaging, discarding. */
+  private async onGroupAction(e: MouseEvent): Promise<void> {
     const target = e.target as HTMLElement;
 
     const bulkBtn = target.closest<HTMLElement>("[data-bulk]");
@@ -203,16 +226,25 @@ export class GitPanel {
       return this.apply(bulkBtn.dataset.bulk!, group, paths);
     }
 
+    const actBtn = target.closest<HTMLElement>("[data-act]");
+    const row = target.closest<HTMLElement>(".gp-row");
+    if (!actBtn || !row) return;
+    return this.apply(actBtn.dataset.act!, row.dataset.group as Group, [row.dataset.path!]);
+  }
+
+  /** Pressing the row itself shows the file. */
+  private onGroupPress(e: PointerEvent): void {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    // Buttons are handled on click, not here.
+    if (target.closest("[data-act]") || target.closest("[data-bulk]")) return;
+
     const row = target.closest<HTMLElement>(".gp-row");
     if (!row) return;
     const path = row.dataset.path!;
     const group = row.dataset.group as Group;
 
-    const actBtn = target.closest<HTMLElement>("[data-act]");
-    if (actBtn) return this.apply(actBtn.dataset.act!, group, [path]);
-
-    // Plain click opens the diff — untracked files have no "before" side, so
-    // they open in the editor instead.
+    // Untracked files have no "before" side, so they open in the editor.
     if (group === "untracked") this.cb.openFile(path);
     else this.cb.openDiff(path, group === "staged" ? "staged" : "worktree");
   }

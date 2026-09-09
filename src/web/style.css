@@ -288,8 +288,11 @@ body {
 .gp-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
 .gp-dir { flex: 1 1 auto; min-width: 0; font-size: 10px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
 /* Row actions stay hidden until hover, like VS Code, so the list reads cleanly. */
-.gp-actions { display: none; flex: 0 0 auto; }
-.gp-row:hover .gp-actions { display: inline-flex; }
+/* Laid out always, revealed on hover. Toggling `display` instead made the
+   buttons claim their width only while hovered, which squeezed the directory
+   next to them and made every row twitch as the pointer moved down the list. */
+.gp-actions { display: inline-flex; flex: 0 0 auto; visibility: hidden; }
+.gp-row:hover .gp-actions { visibility: visible; }
 .gp-mark { flex: 0 0 auto; width: 12px; text-align: center; font-size: 11px; }
 .gp-mark.dec-staged { color: var(--dec-added); }
 .gp-mark.dec-changes { color: var(--dec-modified); }
@@ -340,9 +343,10 @@ body {
 .sp-lineno { flex: 0 0 auto; width: 34px; padding-left: 14px; text-align: right; font-size: 10px; color: var(--text-muted); }
 .sp-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .sp-text mark { background: color-mix(in srgb, var(--accent) 34%, transparent); color: inherit; border-radius: 2px; }
-/* Row actions appear on hover, as in the source-control list. */
-.sp-acts { display: none; flex: 0 0 auto; }
-.sp-file:hover .sp-acts, .sp-hit:hover .sp-acts { display: inline-flex; }
+/* Row actions appear on hover, as in the source-control list — and, as there,
+   they keep their place in the layout so the result text does not shift. */
+.sp-acts { display: inline-flex; flex: 0 0 auto; visibility: hidden; }
+.sp-file:hover .sp-acts, .sp-hit:hover .sp-acts { visibility: visible; }
 
 /* ── History ──────────────────────────────────────────────────────────── */
 .hist { display: flex; flex-direction: column; min-height: 0; }

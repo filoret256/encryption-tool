@@ -634,14 +634,34 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     showEditor();
   }
 
+  /** `.git` reports changes on the directory itself, not only on the files
+   *  inside it, so no path filter can tell a real commit from any git process
+   *  briefly taking index.lock — and something doing that in a loop had three
+   *  panels rebuilding several times a second. Coalesce to at most once a
+   *  second, with a trailing run so the last burst is never the one missed. */
+  let lastGitRefresh = 0;
+  let gitRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  function refreshGitViews(): void {
+    const waited = Date.now() - lastGitRefresh;
+    if (waited < 1000) {
+      if (!gitRefreshTimer) {
+        gitRefreshTimer = setTimeout(() => {
+          gitRefreshTimer = null;
+          refreshGitViews();
+        }, 1000 - waited);
+      }
+      return;
+    }
+    lastGitRefresh = Date.now();
+    void refreshStatus();
+    void gitPanel.refresh();
+    void history.refresh();
+  }
+
   agent.on("fs.change", (data) => {
     const { paths } = data as FsChange;
     // The watcher collapses everything under .git into one sentinel.
-    if (paths.includes(".git")) {
-      void refreshStatus();
-      void gitPanel.refresh();
-      void history.refresh();
-    }
+    if (paths.includes(".git")) refreshGitViews();
     const fsPaths = paths.filter((p) => p !== ".git");
     if (fsPaths.length) {
       void tree.refresh(fsPaths);

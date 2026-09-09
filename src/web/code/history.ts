@@ -32,6 +32,10 @@ export class HistoryPanel {
   private limit = PAGE;
   private expanded: string | null = null;
   private details = new Map<string, CommitDetail>();
+  /** Fingerprint of what is currently on screen; an unchanged log is not
+   *  redrawn, so a click is never dropped because the row it landed on was
+   *  replaced underneath it. */
+  private renderedKey = "";
 
   private readonly $: <T extends HTMLElement>(sel: string) => T;
 
@@ -51,7 +55,11 @@ export class HistoryPanel {
       this.limit += PAGE;
       void this.refresh();
     });
-    this.$(".js-list").addEventListener("click", (e) => void this.onClick(e as MouseEvent));
+    // Acting on the press. This list rebuilds itself whenever a commit's files
+    // arrive and on every watcher event, and a rebuild between mousedown and
+    // mouseup means the browser never reports a click at all — which is how
+    // clicks here came to feel like they only worked sometimes.
+    this.$(".js-list").addEventListener("pointerdown", (e) => void this.onPress(e as PointerEvent));
     this.$(".js-list").addEventListener("contextmenu", (e) => this.onContextMenu(e as MouseEvent));
   }
 
@@ -91,6 +99,15 @@ export class HistoryPanel {
     // The layout depends only on the commit list, so it is recomputed here
     // rather than in refresh() — the graph toggle re-renders without refetching.
     const withGraph = this.$<HTMLInputElement>(".js-graph").checked;
+    const key = JSON.stringify([
+      this.commits.map((c) => [c.oid, c.refs, c.subject]),
+      this.expanded,
+      this.expanded ? Boolean(this.details.get(this.expanded)) : null,
+      withGraph,
+    ]);
+    if (key === this.renderedKey) return;
+    this.renderedKey = key;
+
     this.graph = withGraph ? computeGraph(this.commits) : [];
     setHtmlKeepingScroll(
       list,
@@ -142,7 +159,9 @@ export class HistoryPanel {
     </div></div>`;
   }
 
-  private async onClick(e: MouseEvent): Promise<void> {
+  private async onPress(e: PointerEvent): Promise<void> {
+    // Left button only; the right one belongs to the context menu.
+    if (e.button !== 0) return;
     const target = e.target as HTMLElement;
     const item = target.closest<HTMLElement>(".hist-item");
     if (!item) return;
