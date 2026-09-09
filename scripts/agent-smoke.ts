@@ -41,7 +41,7 @@ async function buildGoAgent(go: string): Promise<string> {
   const out = join("dist", "agent-go", process.platform === "win32" ? "enc-tool-agent.exe" : "enc-tool-agent");
   await mkdir(join("dist", "agent-go"), { recursive: true });
   // The version is stamped in even here: agent.info is compared field by field
-  // between the two agents, and "dev" against "3.1.0" would be a false alarm.
+  // between the two agents, and "dev" against "3.5.0" would be a false alarm.
   const proc = Bun.spawn([go, "build", "-ldflags", `-X main.version=${VERSION}`, "-o", join("..", out), "."], {
     cwd: "agent-go",
     stdout: "inherit",
@@ -64,9 +64,17 @@ function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical);
   if (value && typeof value === "object") {
     const out: Record<string, unknown> = {};
-    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-      const v = (value as Record<string, unknown>)[key];
-      out[key] = key === "mtime" && typeof v === "number" ? Math.floor(v) : canonical(v);
+    const rec = value as Record<string, unknown>;
+    // git blame attributes uncommitted lines to the all-zero sha and stamps them
+    // with the time of the call, so the two runs differ by a second whenever the
+    // blamed file has unsaved edits. That is the clock again, not the answer.
+    const uncommitted = typeof rec.sha === "string" && /^0+$/.test(rec.sha);
+    for (const key of Object.keys(rec).sort()) {
+      const v = rec[key];
+      out[key] =
+        key === "mtime" && typeof v === "number" ? Math.floor(v)
+        : key === "time" && uncommitted ? 0
+        : canonical(v);
     }
     return out;
   }
