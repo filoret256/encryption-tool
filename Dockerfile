@@ -39,6 +39,12 @@ RUN bun run build \
 # `bun install` or the frontend, so this layer is rebuilt only when the agent's
 # own sources change — not on every frontend edit.
 FROM oven/bun:1 AS agents
+
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && update-ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 COPY --from=golang:1.27 /usr/local/go /usr/local/go
