@@ -8,4 +8,4 @@
  *
  *  Keep in step with package.json.
  */
-export const VERSION = "3.1.0";
+export const VERSION = "3.5.0";
