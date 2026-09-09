@@ -143,13 +143,52 @@ unsigned, so Windows SmartScreen may still warn on first run.
 Build them yourself with:
 
 ```bash
-bun run agents:build                      # all five, ~159 MB, into dist/agents
+bun run agents:build                      # all five, ~14 MB, into dist/agents
 bun run agents:build --targets linux-x64  # or just one
+bun run agents:build --runtime bun        # the TypeScript agent instead (~166 MB)
 ```
+
+The agent that ships is the Go program in `agent-go/` — same protocol, about a
+twelfth of the size, because a Bun binary has to embed the whole runtime. Both
+implementations are kept working and are tested against each other; see
+[Two agents](#two-agents--два-агента).
+
+Агент, который раздаётся, — это Go-программа в `agent-go/`: тот же протокол и
+в двенадцать раз меньше, потому что бинарник Bun несёт в себе весь рантайм.
 
 Agents are versioned and users keep them, so a tab and its agent drift apart on
 their own. The capability badge compares the two and says so, instead of letting
 the mismatch surface later as an unexplained protocol error.
+
+### Two agents / Два агента
+
+There are two implementations of the same agent, and that is deliberate.
+
+`src/agent/` is the TypeScript one — the reference, and what `bun run agent`
+starts while you work on it. `agent-go/` is the Go port, and it is what gets
+built, packed and handed to users, because a compiled Bun binary embeds the
+whole JavaScript runtime: 25–40 MB per platform against roughly 3 MB.
+
+Two implementations of one protocol usually means two subtly different
+protocols. What keeps that from happening here is that neither has its own test
+suite. `bun run agent:smoke` starts both, drives both over a real WebSocket with
+the same requests, and then **compares their replies field for field** — not just
+that both passed, but that both returned the same JSON, down to the wording of a
+"file not found". A drift in a `git status` parser or a missing `null` fails the
+run and names the first differing byte.
+
+That is also how the port paid for itself early: comparing the two turned up a
+crash in the *TypeScript* agent, where a rejected argument (`git.checkout` with a
+ref beginning with `-`) threw synchronously and killed the process — a denial of
+service reachable with exactly the input the validation existed to catch.
+
+Две реализации одного протокола обычно расходятся. Здесь этого не происходит
+потому, что у них нет отдельных тестов: `bun run agent:smoke` поднимает обе,
+гоняет одни и те же запросы и сравнивает ответы побайтно.
+
+The Go agent needs a toolchain only to build; users get a static binary that
+needs nothing. Set `GO_BIN` if your Go is unpacked somewhere off `PATH`. Without
+any Go at all, the smoke suite says so and runs the TypeScript half.
 
 ### Security / Безопасность
 
@@ -196,23 +235,25 @@ bun run agents:build # optional: -> dist/agents, offered by the code tab
 ./server agent       # the local filesystem + git bridge
 ```
 
-The agent archives stay on disk rather than being embedded — folding ~159 MB of
-executables into the executable that serves them helps nobody. Without them the
+The agent archives stay on disk rather than being embedded — folding another
+14 MB of executables into the executable that serves them helps nobody. Without them the
 download button simply does not appear.
 
 ### Docker
 
-Multi-stage build: Bun compiles the server binary, cross-compiles the agents in a
-separate stage, and both land in a minimal `debian:bookworm-slim` image.
+Multi-stage build: Bun compiles the server binary, a second stage borrows the Go
+toolchain from the official image and cross-compiles all five agents from that
+one Linux image (`CGO_ENABLED=0`, so no target SDK is involved), and both land in
+a minimal `debian:bookworm-slim` image.
 
 ```bash
 docker build -t encryption-tool .
 docker run -p 5000:5000 encryption-tool
 ```
 
-The agents add ~159 MB, so which ones ship is a build argument — and they are
-copied in before the server binary, as the large slow-changing layer that should
-stay cached when only the app changes.
+The agents add about 3 MB each, so which ones ship is still a build argument —
+and they are copied in before the server binary, as the slower-changing layer
+that should stay cached when only the app changes.
 
 ```bash
 # only what your users actually run
@@ -323,7 +364,9 @@ throwaway repositories. Ни один не использует моки.
 ```bash
 bun run crypto:smoke      # WebCrypto ports interoperate with the previous node:crypto code
 bun run isolation:smoke   # 60 concurrent users, jail escapes, loopback binding, CSP
-bun run agent:smoke       # agent protocol: fs, git, search streaming, watcher
+bun run agent:smoke       # both agents, same checks, replies diffed against each other
+bun run agent:test        # the Go agent's unit tests (WebSocket codec, RFC 6455 vector)
+bun run protocol:check    # the two protocol definitions still describe the same wire
 bun run git:smoke         # staging, commits, branches, merge/rebase/revert/reset, conflicts
 bun run graph:smoke       # commit-graph lane layout and its SVG output
 bun run search:smoke      # modifiers, globs, cancellation, preserve case, engine parity
@@ -357,7 +400,16 @@ bunx tsc --noEmit
 │   │   ├── search.ts      # ripgrep with a `git ls-files` fallback
 │   │   ├── watch.ts       # debounced recursive fs.watch
 │   │   ├── targets.ts     # the platforms agents are built for; shared naming
-│   │   └── protocol.ts    # wire types, shared with the browser
+│   │   └── protocol.ts    # wire types, shared with the browser — the definition
+│   │                      # both agents and the browser are written against
+├── agent-go/              # the agent that actually ships: same protocol, ~7 MB
+│   ├── main.go            # CLI, startup banner, capability probes
+│   ├── server.go          # HTTP + WebSocket, auth, origin allowlist, op table
+│   ├── ws.go              # RFC 6455 server, hand-written, no dependency
+│   ├── ws_test.go         # frame codec and the handshake known-answer vector
+│   ├── jail.go, fsops.go, git.go, gitwrite.go, search.go, watch.go
+│   └── protocol.go        # the Go side of protocol.ts, kept honest by
+│                          # `bun run protocol:check`
 │   └── web/
 │       ├── main.ts        # crypto tabs, capability badge, service-worker lifecycle
 │       ├── code.ts        # entry for the lazily-loaded code tab bundle
@@ -368,6 +420,9 @@ bunx tsc --noEmit
 │       └── index.html, style.css, editor.ts, yaml-lint.ts
 ├── scripts/
 │   ├── build-agents.ts    # cross-compile the agent and pack it for download
+│   ├── protocol-check.ts  # fails the build if the two protocol files disagree
+│   ├── go-toolchain.ts    # locating Go (GO_BIN), shared by build and test
+│   ├── go.ts              # passthrough: `bun scripts/go.ts test ./...`
 │   ├── archive.ts         # minimal tar.gz and zip writers, no dependencies
 │   ├── make-icons.ts      # procedural PWA icon generator
 │   ├── build-file-icons.ts # regenerate the explorer's file-type icons

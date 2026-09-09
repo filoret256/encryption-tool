@@ -1,4 +1,6 @@
-# Only package.json, bun.lock and src/ are needed by the build stage.
+# The build stages need package.json, bun.lock, src/, scripts/ and agent-go/.
+# Everything below is either rebuilt inside the image or has no business there.
+dist
 .git
 .claude
 node_modules

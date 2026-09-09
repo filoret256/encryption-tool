@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 
-# Which agents to ship. Every target adds 25-40 MB to the image, so a
-# deployment that only serves one platform can trim the list — or pass an empty
-# string to ship none and point AGENT_DOWNLOAD_BASE at a mirror instead.
+# Which agents to ship. Every target adds about 3 MB to the image, so the full
+# set is the default; pass an empty string to ship none and point
+# AGENT_DOWNLOAD_BASE at a mirror instead.
 ARG AGENT_TARGETS="windows-x64,darwin-arm64,darwin-x64,linux-x64,linux-arm64"
 
 # ── Stage 1: bundle the frontend and compile a standalone server binary ──
@@ -25,16 +25,32 @@ RUN bun run build \
 # container would expose the container. So the image carries the binaries and
 # hands them out (see the /agent/downloads route).
 #
-# Deliberately independent of the builder stage: src/agent/cli.ts imports only
-# node built-ins, so no `bun install` is needed and this layer is rebuilt only
-# when the agent's own sources change — not on every frontend edit. Needs
-# network access, as Bun fetches each target's runtime while compiling.
+# The agent is the Go program in agent-go/ — the same protocol as the
+# TypeScript one, about a twelfth of the size, because a Bun binary has to embed
+# the whole runtime. With CGO_ENABLED=0 all five targets cross-compile from this
+# one Linux image: no per-target SDK, no linker for the far side, and nothing
+# downloaded at build time except two Go modules.
+#
+# The toolchain is lifted out of the official Go image rather than driving the
+# build from it, so the target table and the manifest writer stay in one
+# TypeScript file (scripts/build-agents.ts) instead of being restated in shell.
+#
+# Deliberately independent of the builder stage: nothing here needs
+# `bun install` or the frontend, so this layer is rebuilt only when the agent's
+# own sources change — not on every frontend edit.
 FROM oven/bun:1 AS agents
 WORKDIR /app
 
+COPY --from=golang:1.27 /usr/local/go /usr/local/go
+ENV GO_BIN=/usr/local/go/bin/go \
+    GOTOOLCHAIN=local \
+    GOPATH=/tmp/go \
+    GOCACHE=/tmp/go-build
+
 COPY src/version.ts ./src/
-COPY src/agent/ ./src/agent/
-COPY scripts/archive.ts scripts/build-agents.ts ./scripts/
+COPY src/agent/targets.ts ./src/agent/
+COPY agent-go/ ./agent-go/
+COPY scripts/archive.ts scripts/build-agents.ts scripts/go-toolchain.ts ./scripts/
 
 ARG AGENT_TARGETS
 RUN bun scripts/build-agents.ts --targets "$AGENT_TARGETS" --out /agents
@@ -49,8 +65,8 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --no-create-home appuser
 
-# Copied before the server binary on purpose: this is the large, slow-changing
-# layer, so a rebuild of the app alone leaves it cached on the nodes.
+# Copied before the server binary on purpose: this is the slower-changing layer,
+# so a rebuild of the app alone leaves it cached on the nodes.
 COPY --from=agents /agents /usr/local/share/enc-tool/agents
 COPY --from=builder /app/server /usr/local/bin/server
 

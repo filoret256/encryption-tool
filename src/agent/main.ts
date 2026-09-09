@@ -366,7 +366,14 @@ export async function startAgent(argv: string[]): Promise<void> {
         conn.inflight.set(req.id, signal);
         const ctx: Ctx = { jail, cwd: jail.root, info, conn, send, id: req.id, signal };
         // Not awaited: a long search or push must not block other requests.
-        void handler(ctx, req)
+        //
+        // Wrapped rather than called directly because a handler can throw
+        // *synchronously*: the git helpers validate arguments while building
+        // the argv (see safe() in git-write.ts), so `git.checkout` with a ref
+        // starting with "-" threw before any promise existed. That escaped this
+        // callback and killed the process — a crash reachable by exactly the
+        // input the validation was written to reject.
+        void (async () => handler(ctx, req))()
           .then(
             (data) => send({ id: req.id, ok: true, data }),
             (e: unknown) => {
