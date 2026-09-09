@@ -13,6 +13,9 @@
 }
 
 * { box-sizing: border-box; }
+/* Components set display on their own host element, which outranks the user
+   agent stylesheet; without this, toggling el.hidden does nothing. */
+[hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; }
 body {
   display: flex; flex-direction: column;
@@ -99,6 +102,403 @@ body {
   color: var(--text-muted); font-size: 11px;
 }
 .statusbar b { color: var(--text); }
+
+/* ── Code tab ─────────────────────────────────────────────────────────── */
+:root {
+  --dec-modified: #b8860b; --dec-added: #15803d; --dec-deleted: #b91c1c; --dec-conflict: #9333ea;
+  --row: 22px;
+}
+:root[data-theme="dark"] {
+  --dec-modified: #e2c08d; --dec-added: #3fb950; --dec-deleted: #f85149; --dec-conflict: #c084fc;
+}
+
+.code-loading { padding: 24px; color: var(--text-muted); }
+.code-root { color: var(--text-muted); max-width: 34ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.code-branch { color: var(--text); }
+.t-icon {
+  font-family: var(--mono); font-size: 12px; cursor: pointer; line-height: 1;
+  padding: 4px 6px; border: 1px solid transparent; border-radius: 5px;
+  background: transparent; color: var(--text-muted);
+}
+.t-icon:hover { background: var(--btn-hover); color: var(--text); }
+
+.code-body { flex: 1; display: flex; min-height: 0; }
+.code-side {
+  width: 260px; min-width: 150px; max-width: 50%; flex: 0 0 auto;
+  display: flex; flex-direction: column; min-height: 0;
+  background: var(--panel); border-right: 1px solid var(--border); resize: horizontal; overflow: hidden;
+}
+.side-head {
+  display: flex; align-items: center; gap: 4px; padding: 5px 8px;
+  font-size: 11px; text-transform: uppercase; color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+}
+.code-tree { flex: 1; min-height: 0; }
+.code-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.code-editor-host { flex: 1; min-height: 0; }
+.code-editor-host .cm-editor { height: 100%; }
+.code-dirty.is-dirty { color: var(--dec-modified); }
+
+/* Only the visible window of rows is in the DOM; the spacer supplies the
+   scroll height and the layer is translated to the first rendered row. */
+.tree { height: 100%; }
+.tree-viewport { position: relative; height: 100%; overflow: auto; outline: none; }
+.tree-spacer { width: 1px; }
+.tree-layer { position: absolute; top: 0; left: 0; right: 0; will-change: transform; }
+.tree-row {
+  display: flex; align-items: center; gap: 4px; height: var(--row);
+  font-size: 12px; white-space: nowrap; cursor: pointer; user-select: none;
+}
+.tree-row:hover { background: var(--btn); }
+.tree-row.sel { background: var(--active); }
+.tree-caret { width: 10px; color: var(--text-muted); flex: 0 0 auto; }
+.tree-icon { flex: 0 0 auto; opacity: .75; }
+.tree-name { overflow: hidden; text-overflow: ellipsis; }
+.tree-mark { margin-left: auto; padding-right: 8px; font-size: 11px; flex: 0 0 auto; }
+.tree-row.dec-modified .tree-name, .tree-row.dec-modified .tree-mark { color: var(--dec-modified); }
+.tree-row.dec-untracked .tree-name, .tree-row.dec-untracked .tree-mark { color: var(--dec-added); }
+.tree-row.dec-conflict .tree-name, .tree-row.dec-conflict .tree-mark { color: var(--dec-conflict); }
+.tree-row.dec-dirty .tree-mark { color: var(--dec-modified); }
+/* Drag & drop: the row that would receive the drop. */
+.tree-row.drop-into { background: var(--active); outline: 1px solid var(--accent); outline-offset: -1px; }
+
+/* ── Open-file tabs ───────────────────────────────────────────────────── */
+.code-tabs {
+  display: flex; flex: 0 0 auto; overflow-x: auto; overflow-y: hidden;
+  background: var(--bg); border-bottom: 1px solid var(--border);
+}
+.code-tab {
+  display: flex; align-items: center; gap: 6px; flex: 0 0 auto; cursor: pointer;
+  padding: 5px 8px 5px 12px; font-size: 12px; white-space: nowrap;
+  border-right: 1px solid var(--border); color: var(--text-muted);
+}
+.code-tab:hover { background: var(--btn); }
+.code-tab.active { background: var(--panel); color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
+.code-tab.dirty .code-tab-name { font-style: italic; }
+.code-tab-close {
+  border: 0; border-radius: 3px; background: transparent; cursor: pointer;
+  color: inherit; font-size: 10px; line-height: 1; padding: 2px 4px;
+}
+.code-tab-close:hover { background: var(--btn-hover); color: var(--text); }
+.code-tab.dirty .code-tab-close { color: var(--dec-modified); }
+
+/* ── Merge conflicts ──────────────────────────────────────────────────── */
+.conflict-bar {
+  display: flex; align-items: center; gap: 10px; flex: 0 0 auto;
+  padding: 6px 12px; font-size: 12px;
+  background: color-mix(in srgb, var(--dec-conflict) 14%, var(--panel));
+  border-bottom: 1px solid var(--border);
+}
+.conflict-bar.resolved { background: color-mix(in srgb, var(--ok) 14%, var(--panel)); }
+.cm-editor .cf-ours { background: color-mix(in srgb, var(--dec-added) 14%, transparent); }
+.cm-editor .cf-theirs { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.cm-editor .cf-base { background: color-mix(in srgb, var(--text-muted) 12%, transparent); }
+.cm-editor .cf-marker { background: color-mix(in srgb, var(--dec-conflict) 18%, transparent); color: var(--text-muted); }
+.cf-actions { display: flex; gap: 6px; padding: 2px 0 2px 8px; }
+.cf-btn {
+  font-family: var(--mono); font-size: 10px; cursor: pointer; padding: 1px 6px;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: var(--panel); color: var(--accent);
+}
+.cf-btn:hover { background: var(--active); }
+
+/* ── Activity rail & side views ───────────────────────────────────────── */
+.code-rail {
+  flex: 0 0 auto; display: flex; flex-direction: column; gap: 2px; padding: 4px;
+  background: var(--panel); border-right: 1px solid var(--border);
+}
+.rail-btn {
+  position: relative; width: 32px; height: 32px; cursor: pointer; font-size: 15px;
+  border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--text-muted);
+}
+.rail-btn:hover { background: var(--btn-hover); color: var(--text); }
+.rail-btn.active { background: var(--active); color: var(--text); border-color: var(--border); }
+.rail-badge {
+  position: absolute; right: -2px; bottom: -2px; min-width: 15px; padding: 0 3px;
+  font-size: 9px; line-height: 14px; border-radius: 999px;
+  background: var(--accent); color: var(--accent-fg);
+}
+.side-views { flex: 1; min-height: 0; display: flex; }
+.side-view { flex: 1; min-width: 0; min-height: 0; overflow: auto; }
+/* Selected through the parent so these outrank .gp / .sp / .hist, which set
+   display: flex on the very same element. */
+.side-views > .side-view:not(.active) { display: none; }
+.side-views > .side-view.active { display: flex; flex-direction: column; }
+.side-view[data-pane="explorer"] { overflow: hidden; }
+.code-side:not([data-view="explorer"]) .act-explorer { display: none; }
+
+/* ── Source control panel ─────────────────────────────────────────────── */
+.gp { display: flex; flex-direction: column; min-height: 0; }
+.gp-head { display: flex; align-items: center; gap: 4px; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.gp-sync { font-size: 11px; color: var(--text-muted); }
+.gp-commit { display: flex; flex-direction: column; gap: 6px; padding: 8px; border-bottom: 1px solid var(--border); }
+.gp-commit textarea {
+  font-family: var(--mono); font-size: 12px; resize: vertical; padding: 6px 8px;
+  border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--text);
+}
+.gp-commit-row { display: flex; gap: 6px; }
+.gp-commit-row .js-commit { flex: 1; }
+.gp-warn { margin: 0; font-size: 11px; line-height: 1.45; color: var(--bad); }
+.gp-groups { flex: 1; min-height: 0; overflow: auto; }
+.gp-empty { padding: 12px 10px; margin: 0; font-size: 12px; color: var(--text-muted); }
+.gp-group-head {
+  display: flex; align-items: center; gap: 6px; padding: 5px 8px;
+  font-size: 11px; text-transform: uppercase; color: var(--text-muted);
+  background: var(--panel); position: sticky; top: 0; z-index: 1;
+}
+.gp-count {
+  min-width: 16px; padding: 0 4px; text-align: center; border-radius: 999px;
+  background: var(--btn); color: var(--text); font-size: 10px;
+}
+.gp-row {
+  display: flex; align-items: center; gap: 6px; padding: 3px 8px;
+  font-size: 12px; cursor: pointer; white-space: nowrap;
+}
+.gp-row:hover { background: var(--btn); }
+.gp-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
+.gp-dir { flex: 1 1 auto; min-width: 0; font-size: 10px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
+/* Row actions stay hidden until hover, like VS Code, so the list reads cleanly. */
+.gp-actions { display: none; flex: 0 0 auto; }
+.gp-row:hover .gp-actions { display: inline-flex; }
+.gp-mark { flex: 0 0 auto; width: 12px; text-align: center; font-size: 11px; }
+.gp-mark.dec-staged { color: var(--dec-added); }
+.gp-mark.dec-changes { color: var(--dec-modified); }
+.gp-mark.dec-untracked { color: var(--dec-added); }
+.gp-mark.dec-conflict { color: var(--dec-conflict); }
+.gp-progress {
+  padding: 5px 8px; font-size: 11px; color: var(--text-muted);
+  border-top: 1px solid var(--border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* ── Virtual list ─────────────────────────────────────────────────────── */
+.vlist { flex: 1; min-height: 0; }
+.vlist-viewport { position: relative; height: 100%; overflow: auto; }
+.vlist-spacer { width: 1px; }
+.vlist-layer { position: absolute; top: 0; left: 0; right: 0; will-change: transform; }
+.vlist-row { display: flex; align-items: stretch; }
+.vlist-row > * { flex: 1; min-width: 0; }
+
+/* ── Search panel ─────────────────────────────────────────────────────── */
+.sp { display: flex; flex-direction: column; min-height: 0; }
+.sp-form { display: flex; flex-direction: column; gap: 6px; padding: 8px; border-bottom: 1px solid var(--border); }
+.sp-line { display: flex; align-items: center; gap: 4px; }
+.sp-line .t-input { flex: 1; min-width: 0; padding: 5px 8px; }
+.sp-tog {
+  flex: 0 0 auto; width: 24px; height: 24px; cursor: pointer; font-size: 10px; line-height: 1;
+  border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--text-muted);
+}
+.sp-tog:hover { background: var(--btn-hover); color: var(--text); }
+.sp-tog.is-active { background: var(--active); border-color: var(--accent); color: var(--text); }
+.sp-globs { font-size: 11px; color: var(--text-muted); }
+.sp-globs summary { cursor: pointer; padding: 2px 0; }
+.sp-globs .t-input { width: 100%; margin-top: 4px; padding: 4px 8px; }
+.sp-summary { padding: 4px 10px; font-size: 11px; color: var(--text-muted); border-bottom: 1px solid var(--border); }
+.sp-results { flex: 1; min-height: 0; display: flex; }
+
+.sp-file, .sp-hit {
+  display: flex; align-items: center; gap: 5px; height: 22px; padding: 0 8px;
+  font-size: 12px; white-space: nowrap; cursor: pointer;
+}
+.sp-file:hover, .sp-hit:hover { background: var(--btn); }
+.sp-caret { flex: 0 0 auto; width: 10px; color: var(--text-muted); }
+.sp-fname { flex: 0 0 auto; }
+.sp-fdir { flex: 1 1 auto; min-width: 0; font-size: 10px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; }
+.sp-count {
+  flex: 0 0 auto; min-width: 16px; padding: 0 4px; text-align: center; border-radius: 999px;
+  background: var(--btn-hover); color: var(--text); font-size: 10px;
+}
+.sp-lineno { flex: 0 0 auto; width: 34px; padding-left: 14px; text-align: right; font-size: 10px; color: var(--text-muted); }
+.sp-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.sp-text mark { background: color-mix(in srgb, var(--accent) 34%, transparent); color: inherit; border-radius: 2px; }
+/* Row actions appear on hover, as in the source-control list. */
+.sp-acts { display: none; flex: 0 0 auto; }
+.sp-file:hover .sp-acts, .sp-hit:hover .sp-acts { display: inline-flex; }
+
+/* ── History ──────────────────────────────────────────────────────────── */
+.hist { display: flex; flex-direction: column; min-height: 0; }
+.hist-head { display: flex; align-items: center; gap: 6px; padding: 5px 8px; border-bottom: 1px solid var(--border); }
+.hist-toggle { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-muted); cursor: pointer; }
+.hist-list { flex: 1; min-height: 0; overflow: auto; }
+.hist-item { border-bottom: 1px solid var(--border); }
+/* Fixed height: the lane SVG is drawn per row and must match it exactly, or
+   the vertical lines break between rows. */
+.hist-row { display: flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px; font-size: 12px; cursor: pointer; }
+.hist-item:hover > .hist-row, .hist-item.open > .hist-row { background: var(--btn); }
+.hist-dot { color: var(--accent); flex: 0 0 auto; font-size: 10px; }
+.hist-subject { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hist-meta { flex: 0 0 auto; font-size: 10px; color: var(--text-muted); }
+.hist-oid { flex: 0 0 auto; font-size: 10px; color: var(--text-muted); }
+.hist-refs { display: inline-flex; flex: 0 0 auto; gap: 4px; }
+.hist-ref { font-size: 9px; padding: 1px 5px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-muted); white-space: nowrap; }
+.hist-ref.ref-head { border-color: var(--accent); color: var(--accent); }
+.hist-ref.ref-remote { color: var(--dec-modified); border-color: var(--dec-modified); }
+.hist-ref.ref-tag { color: var(--ok); border-color: var(--ok); }
+.hist-files { display: flex; gap: 6px; padding: 2px 8px 8px; background: var(--bg); }
+.hist-gutter { flex: 0 0 auto; display: flex; }
+.hist-files-body { flex: 1; min-width: 0; }
+.hist-body { margin: 0 0 6px; font-size: 11px; color: var(--text-muted); white-space: pre-wrap; }
+
+/* ── Commit graph ─────────────────────────────────────────────────────── */
+:root {
+  --g1: #2563eb; --g2: #15803d; --g3: #b45309; --g4: #9333ea;
+  --g5: #0891b2; --g6: #be123c; --g7: #4d7c0f; --g8: #7c3aed;
+}
+:root[data-theme="dark"] {
+  --g1: #58a6ff; --g2: #3fb950; --g3: #e2c08d; --g4: #c084fc;
+  --g5: #39c5cf; --g6: #f85149; --g7: #a5d6a7; --g8: #bc8cff;
+}
+.g-lane { flex: 0 0 auto; display: block; overflow: visible; }
+.g-lane line, .g-lane path { stroke-width: 1.6; stroke-linecap: round; }
+.g-cont { display: block; }
+.g-cont line { stroke-width: 1.6; }
+.hist-file { display: flex; align-items: center; gap: 6px; padding: 2px 0; font-size: 11px; cursor: pointer; }
+.hist-file:hover .hist-fname { text-decoration: underline; }
+.hist-status { flex: 0 0 auto; width: 12px; text-align: center; }
+.hist-status.st-A { color: var(--dec-added); }
+.hist-status.st-D { color: var(--dec-deleted); }
+.hist-status.st-M, .hist-status.st-T { color: var(--dec-modified); }
+.hist-status.st-R, .hist-status.st-C { color: var(--accent); }
+.hist-fname { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hist-stat { flex: 0 0 auto; color: var(--text-muted); }
+.hist-more { margin: 8px; }
+
+/* ── Diff ─────────────────────────────────────────────────────────────── */
+.code-diff-host { flex: 1; min-height: 0; }
+.diff-view { display: flex; flex-direction: column; height: 100%; }
+.diff-head {
+  display: flex; align-items: center; gap: 10px; padding: 5px 10px;
+  background: var(--panel); border-bottom: 1px solid var(--border); font-size: 12px;
+}
+.diff-labels { color: var(--text-muted); font-size: 11px; }
+.diff-body { flex: 1; min-height: 0; overflow: auto; }
+.diff-body .cm-mergeView, .diff-body .cm-merge-a, .diff-body .cm-merge-b { height: 100%; }
+.diff-body .cm-editor { height: 100%; }
+.diff-note { padding: 16px; color: var(--text-muted); font-size: 12px; }
+/* @codemirror/merge ships light-only chunk colours; restate them as tokens so
+   the dark theme does not end up with black text on pale green. */
+.diff-body .cm-changedLine { background: color-mix(in srgb, var(--dec-modified) 16%, transparent); }
+.diff-body .cm-changedText { background: color-mix(in srgb, var(--dec-modified) 32%, transparent); }
+.diff-body .cm-deletedChunk { background: color-mix(in srgb, var(--dec-deleted) 14%, transparent); }
+.diff-body .cm-insertedLine { background: color-mix(in srgb, var(--dec-added) 16%, transparent); }
+.diff-body .cm-collapsedLines {
+  background: var(--btn); color: var(--text-muted); font-size: 11px; padding: 2px 8px; cursor: pointer;
+}
+.diff-body .cm-changeGutter { background: transparent; }
+
+/* ── Context menu & modal ─────────────────────────────────────────────── */
+.ctx-menu {
+  position: fixed; z-index: 40; min-width: 160px; padding: 4px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .28); display: flex; flex-direction: column;
+}
+.ctx-menu button {
+  font-family: var(--mono); font-size: 12px; text-align: left; cursor: pointer;
+  padding: 5px 10px; border: 0; border-radius: 4px; background: transparent; color: var(--text);
+}
+.ctx-menu button:hover { background: var(--active); }
+
+.modal-back {
+  position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, .45);
+}
+.modal {
+  display: flex; flex-direction: column; gap: 8px; width: min(460px, 92vw); padding: 16px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+}
+.modal label { font-size: 11px; text-transform: uppercase; color: var(--text-muted); }
+.modal .t-input { width: 100%; padding: 6px 8px; }
+.modal-hint { margin: 0; font-size: 11px; line-height: 1.5; color: var(--text-muted); }
+.modal-row { display: flex; justify-content: flex-end; gap: 6px; }
+
+/* ── Capability badge ─────────────────────────────────────────────────── */
+.cap-badge { position: relative; }
+.cap-chip {
+  display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  padding: 3px 8px; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--btn); color: var(--text-muted); font-family: var(--mono); font-size: 11px;
+}
+.cap-chip:hover { background: var(--btn-hover); }
+.cap-dot { line-height: 1; }
+.cap-badge[data-status="online"] .cap-dot { color: var(--ok); }
+.cap-badge[data-status="connecting"] .cap-dot { color: var(--dec-modified); }
+.cap-badge[data-status="error"] .cap-dot,
+.cap-badge[data-status="blocked"] .cap-dot { color: var(--bad); }
+.cap-badge[data-status="online"] .cap-text { color: var(--text); }
+
+.cap-pop {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; width: 320px; padding: 10px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .3);
+}
+.cap-head { font-size: 12px; margin-bottom: 8px; }
+.cap-list { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.cap-list li { display: grid; grid-template-columns: 14px 1fr; gap: 2px 6px; font-size: 11px; }
+.cap-list li.on .cap-mark { color: var(--ok); }
+.cap-list li.off .cap-mark { color: var(--text-muted); }
+.cap-list li.off .cap-label { color: var(--text-muted); }
+.cap-fix { grid-column: 2; color: var(--text-muted); line-height: 1.45; }
+.cap-connect { width: 100%; }
+
+/* Controls whose capability is missing: disabled, plus a small marker so the
+   reason is visible without hovering. */
+.needs-cap { opacity: .55; }
+.needs-cap::after { content: "🔌"; font-size: 9px; margin-left: 4px; vertical-align: super; }
+.cap-install { width: 100%; margin-top: 6px; }
+
+/* ── Agent download (code tab only) ───────────────────────────────────────
+   Sits between the tabs and the header's right-hand group. `margin-right:auto`
+   claims the free space of the header's space-between, which keeps the chip
+   next to the tabs instead of centred between the two groups. */
+.agent-dl { position: relative; margin: 0 auto 0 10px; }
+.agent-dl-chip {
+  display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--btn); color: var(--text-muted); font-family: var(--mono); font-size: 11px;
+}
+.agent-dl-chip:hover { background: var(--btn-hover); color: var(--text); }
+.agent-dl-pop {
+  position: absolute; left: 0; top: calc(100% + 6px); z-index: 30; width: 360px; padding: 12px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .3);
+}
+.agent-dl-head { font-size: 12px; margin-bottom: 6px; }
+.agent-dl-note { margin: 6px 0 0; font-size: 11px; line-height: 1.5; color: var(--text-muted); }
+.agent-dl-note code { font-family: var(--mono); font-size: 10px; }
+.agent-dl-get {
+  display: block; margin-top: 10px; text-align: center; text-decoration: none;
+  font-family: var(--mono); font-size: 12px;
+}
+.agent-dl-others { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.agent-dl-others button {
+  cursor: pointer; padding: 2px 7px; font-family: var(--mono); font-size: 10px;
+  color: var(--text-muted); background: transparent;
+  border: 1px solid var(--border); border-radius: 4px;
+}
+.agent-dl-others button:hover { background: var(--btn-hover); color: var(--text); }
+.agent-dl-steps { margin-top: 10px; }
+.agent-dl-steps-head {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 11px; color: var(--text-muted); margin-bottom: 4px;
+}
+.agent-dl-steps pre {
+  margin: 0; padding: 8px; overflow-x: auto;
+  font-family: var(--mono); font-size: 10px; line-height: 1.6;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+}
+.agent-dl-sum {
+  display: flex; align-items: center; gap: 6px; margin-top: 8px;
+  font-size: 10px; color: var(--text-muted);
+}
+.agent-dl-sum code { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; }
+.agent-dl-sum button, .agent-dl-steps-head button { padding: 1px 6px; font-size: 10px; }
+
+/* ── Service-worker update prompt ─────────────────────────────────────── */
+.update-bar {
+  position: fixed; right: 20px; bottom: 20px; z-index: 60;
+  display: flex; align-items: center; gap: 8px; padding: 10px 14px; font-size: 12px;
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .3);
+}
 
 .toast {
   position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(20px);

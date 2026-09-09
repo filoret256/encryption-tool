@@ -5,14 +5,32 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Encryption Tool</title>
   <link rel="stylesheet" href="/public/main.css" />
+
+  <!-- PWA. Two theme-colour tags so the browser chrome follows the user's
+       scheme; iOS ignores the manifest icons and needs apple-touch-icon. -->
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <meta name="theme-color" content="#f7f8fa" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#0d1117" media="(prefers-color-scheme: dark)" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="enc-tool" />
+  <link rel="apple-touch-icon" href="/public/apple-touch-icon.png" />
+  <link rel="icon" href="/public/icon-192.png" type="image/png" />
 </head>
 <body>
   <div class="header">
     <div class="tabs">
       <button class="tab tab-ansible active" data-action="switch" data-tab="ansible">ansible-vault</button>
       <button class="tab tab-helm" data-action="switch" data-tab="helm">helm-encrypt</button>
+      <button class="tab tab-code" data-action="switch" data-tab="code">code</button>
     </div>
+    <!-- Download point for the prebuilt local agent. Only the code tab needs
+         one, so main.ts reveals this when that tab is opened and hides it
+         again otherwise. -->
+    <div id="agent-dl" hidden></div>
     <div class="header-right">
+      <!-- Capability badge: reports whether the local agent, git and ripgrep are
+           reachable, and what is unavailable without them. Mounted by main.ts. -->
+      <div id="cap-badge"></div>
       <button class="theme-toggle" data-action="theme" aria-label="Toggle dark / light theme" title="Toggle theme">
         <span class="theme-ic sun">☀</span>
         <span class="theme-switch"><span class="theme-knob"></span></span>
@@ -24,9 +42,20 @@
   <!-- Tabs: generated identically for ansible & helm -->
   <div id="ansible-tab" class="tab-content active" data-tabid="ansible"></div>
   <div id="helm-tab" class="tab-content" data-tabid="helm"></div>
+  <!-- No data-tabid: the code tab has its own layout, not the shared crypto
+       toolbar template, and is populated by the lazily-loaded code chunk. -->
+  <div id="code-tab" class="tab-content"></div>
 
   <input type="file" id="file-input" style="display:none" accept=".txt,.yaml,.yml,.json,.env" />
   <div id="toast" class="toast"></div>
+
+  <!-- Shown when a new service worker is waiting; the swap only happens when
+       the user asks, so assets never change mid-session. -->
+  <div id="update-bar" class="update-bar" hidden>
+    <span>A new version is ready.</span>
+    <button class="t-btn t-btn-primary" id="update-reload" type="button">reload</button>
+    <button class="t-btn" id="update-dismiss" type="button">later</button>
+  </div>
 
   <template id="tab-template">
     <div class="toolbar">

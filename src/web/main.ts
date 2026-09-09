@@ -3,10 +3,27 @@ import "./style.css";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { TabEditor, type Tab, type ViewPrefs } from "./editor.ts";
 import { yamlDiagnostics } from "./yaml-lint.ts";
+import { ansible, helm } from "../crypto/index.ts";
+import { AgentClient } from "./code/agent.ts";
+import { mountBadge } from "./code/caps.ts";
+import { mountAgentDownload, type AgentDownload } from "./code/download.ts";
+import type { CodeTab } from "./code.ts";
+
+/** The code tab is not a crypto tab — it has its own layout and no editor in
+ *  `editors`, so anything indexing by Tab must exclude it. */
+type AnyTab = Tab | "code";
+const TABS: AnyTab[] = ["ansible", "helm", "code"];
 
 const editors = {} as Record<Tab, TabEditor>;
-let currentTab: Tab = "ansible";
+let currentTab: AnyTab = "ansible";
 let isDark = false;
+
+// The agent client lives in the main bundle so the capability badge is correct
+// from first paint, before the code chunk is ever fetched.
+const agent = new AgentClient(() => onAgentState());
+let codeTab: CodeTab | null = null;
+let refreshBadge: (() => void) | null = null;
+let agentDownload: AgentDownload | null = null;
 
 // ── Toast ──
 function toast(msg: string, isError = false): void {
@@ -16,17 +33,15 @@ function toast(msg: string, isError = false): void {
   setTimeout(() => (el.className = "toast"), 2200);
 }
 
-// ── API ──
-async function api(endpoint: string, body: unknown): Promise<string> {
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  const data = (await res.json()) as { result?: unknown; error?: string };
-  if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
-  return data.result as string;
-}
+// ── Crypto ──
+// Runs here on WebCrypto rather than over the /helm/* and /ansible/* endpoints.
+// Two reasons: the password never leaves this machine, and the crypto tabs keep
+// working with no network at all, which is what makes the installed app
+// genuinely offline. The endpoints stay for API clients.
+const SCHEMES: Record<Tab, { encrypt(text: string, password: string): Promise<string>; decrypt(text: string, password: string): Promise<string> }> = {
+  ansible,
+  helm,
+};
 
 function pw(tab: Tab): string {
   return (document.getElementById(`${tab}-password`) as HTMLInputElement).value;
@@ -38,7 +53,7 @@ async function cryptoAction(tab: Tab, action: "encrypt" | "decrypt"): Promise<vo
   if (!text.trim()) return toast("Text is required", true);
   if (!password) return toast("Password is required", true);
   try {
-    editors[tab].value = await api(`/${tab}/${action}`, { text, password });
+    editors[tab].value = await SCHEMES[tab][action](text, password);
     toast(`${action}ed`);
   } catch (e) {
     toast(e instanceof Error ? e.message : String(e), true);
@@ -159,6 +174,7 @@ function applyTheme(dark: boolean): void {
   // The toggle visuals (track colour + knob slide) are driven by this attribute.
   document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
   Object.values(editors).forEach((e) => e.setTheme(dark));
+  codeTab?.setTheme(dark);
   try {
     localStorage.setItem("enc-theme", dark ? "dark" : "light");
   } catch {
@@ -167,14 +183,101 @@ function applyTheme(dark: boolean): void {
 }
 
 // ── Tabs ──
-function switchTab(tab: Tab): void {
+function switchTab(tab: AnyTab): void {
   currentTab = tab;
-  for (const t of ["ansible", "helm"] as Tab[]) {
+  for (const t of TABS) {
     document.getElementById(`${t}-tab`)!.classList.toggle("active", t === tab);
     document.querySelector(`.tab-${t}`)!.classList.toggle("active", t === tab);
   }
+  // Nothing but the editor needs a local agent, so the download only appears
+  // where it means something.
+  agentDownload?.setVisible(tab === "code");
+  if (tab === "code") {
+    void openCodeTab();
+    return;
+  }
   editors[tab].refresh();
   editors[tab].focus();
+}
+
+// ── Code tab (lazily loaded chunk) ──
+function onAgentState(): void {
+  refreshBadge?.();
+  codeTab?.onAgentState();
+}
+
+async function openCodeTab(): Promise<void> {
+  const host = document.getElementById("code-tab")!;
+  if (!codeTab) {
+    host.innerHTML = `<div class="code-loading">loading editor…</div>`;
+    try {
+      // The specifier is a variable so the bundler leaves it as a runtime
+      // import instead of inlining the chunk back into main.js.
+      const url = "/public/code.js";
+      const mod = (await import(url)) as typeof import("./code.ts");
+      codeTab = mod.mountCodeTab(host, {
+        agent,
+        isDark: () => isDark,
+        toast,
+        onCapsChanged: () => refreshBadge?.(),
+      });
+      codeTab.setTheme(isDark);
+    } catch (e) {
+      host.innerHTML = `<div class="code-loading">could not load the editor: ${e instanceof Error ? e.message : String(e)}</div>`;
+      return;
+    }
+  }
+  codeTab.focus();
+}
+
+// ── PWA: service worker + install prompt ──
+
+/** Chromium's non-standard install event; absent everywhere else, which is why
+ *  the install button is offered rather than always shown. */
+interface InstallPromptEvent extends Event {
+  prompt(): Promise<void>;
+  userChoice: Promise<{ outcome: string }>;
+}
+
+let installPrompt: InstallPromptEvent | null = null;
+
+async function registerServiceWorker(): Promise<void> {
+  // A service worker needs a secure context; over plain http on a remote host
+  // registration throws, and the capability badge already explains why.
+  if (!("serviceWorker" in navigator) || !window.isSecureContext) return;
+  try {
+    const reg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+
+    const offer = (worker: ServiceWorker | null): void => {
+      // A worker reaching "installed" while another already controls the page
+      // is an update, not a first install.
+      if (!worker || !navigator.serviceWorker.controller) return;
+      const bar = document.getElementById("update-bar")!;
+      bar.hidden = false;
+      document.getElementById("update-reload")!.onclick = () => {
+        worker.postMessage("skip-waiting");
+      };
+      document.getElementById("update-dismiss")!.onclick = () => (bar.hidden = true);
+    };
+
+    if (reg.waiting) offer(reg.waiting);
+    reg.addEventListener("updatefound", () => {
+      const next = reg.installing;
+      next?.addEventListener("statechange", () => {
+        if (next.state === "installed") offer(next);
+      });
+    });
+
+    // The new worker took over — reload once so the page matches its assets.
+    let reloading = false;
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (reloading) return;
+      reloading = true;
+      location.reload();
+    });
+  } catch {
+    /* registration is best-effort; the app works without it */
+  }
 }
 
 // ── Stats ──
@@ -244,11 +347,59 @@ function init(): void {
 
   applyTheme(localStorage.getItem("enc-theme") === "dark");
 
+  // Chromium fires this instead of showing its own install affordance; hold on
+  // to it so the capability popover can offer installation at a sensible moment.
+  window.addEventListener("beforeinstallprompt", (e) => {
+    e.preventDefault();
+    installPrompt = e as InstallPromptEvent;
+    refreshBadge?.();
+  });
+  window.addEventListener("appinstalled", () => {
+    installPrompt = null;
+    refreshBadge?.();
+  });
+
+  agentDownload = mountAgentDownload(document.getElementById("agent-dl")!);
+
+  // Capability badge lives in the header so it is visible from every tab.
+  refreshBadge = mountBadge(
+    document.getElementById("cap-badge")!,
+    agent,
+    async () => {
+      switchTab("code");
+      await openCodeTab();
+      await codeTab?.connect();
+    },
+    {
+      canInstall: () => installPrompt !== null,
+      install: async () => {
+        const prompt = installPrompt;
+        if (!prompt) return;
+        installPrompt = null; // a prompt may only be used once
+        await prompt.prompt();
+        await prompt.userChoice.catch(() => undefined);
+        refreshBadge?.();
+      },
+    },
+  );
+  refreshBadge();
+  void registerServiceWorker();
+
+  // Reconnect to the agent the user last used. Failure is silent — the badge
+  // already reports it, and a crypto-only visitor should see no error.
+  const saved = agent.savedUrl();
+  if (saved) void agent.connect(saved).catch(() => undefined);
+
   // Bind data-action buttons declaratively (index.html uses data-* attrs, no inline JS).
   document.querySelectorAll<HTMLElement>("[data-action]").forEach((el) => {
     el.addEventListener("click", () => {
-      const tab = (el.dataset.tab as Tab) || currentTab;
+      const target = (el.dataset.tab as AnyTab) || currentTab;
       const action = el.dataset.action;
+      if (action === "switch") return switchTab(target);
+      if (action === "theme") return applyTheme(!isDark);
+      // Everything below operates on a crypto editor, which the code tab has none of.
+      if (target === "code") return;
+      const tab: Tab = target;
       switch (action) {
         case "encrypt": case "decrypt": cryptoAction(tab, action); break;
         case "b64encode": b64Encode(tab, false); break;
@@ -264,8 +415,6 @@ function init(): void {
         case "ws": toggleView(tab, "whitespace", `${tab}-ws-btn`); break;
         case "wrap": toggleView(tab, "wrap", `${tab}-wrap-btn`); break;
         case "find": case "replace": editors[tab].openFind(); break;
-        case "theme": applyTheme(!isDark); break;
-        case "switch": switchTab(tab); break;
         case "togglePw": {
           const inp = document.getElementById(`${tab}-password`) as HTMLInputElement;
           inp.type = inp.type === "password" ? "text" : "password";

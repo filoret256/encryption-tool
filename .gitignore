@@ -12,3 +12,5 @@ server.exe
 *.log
 .env
 .claude
+# cross-compiled agent binaries (bun run agents:build)
+dist/
