@@ -11,7 +11,22 @@
 import { Compartment, EditorState, type Extension } from "@codemirror/state";
 import { EditorView, drawSelection, highlightActiveLine, keymap, lineNumbers, placeholder } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-import { bracketMatching, defaultHighlightStyle, indentOnInput, syntaxHighlighting } from "@codemirror/language";
+import {
+  autocompletion,
+  closeBrackets,
+  closeBracketsKeymap,
+  completeAnyWord,
+  completionKeymap,
+} from "@codemirror/autocomplete";
+import {
+  bracketMatching,
+  codeFolding,
+  defaultHighlightStyle,
+  foldGutter,
+  foldKeymap,
+  indentOnInput,
+  syntaxHighlighting,
+} from "@codemirror/language";
 import { highlightSelectionMatches, search, searchKeymap } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import { grammarFor } from "./grammars.ts";
@@ -54,6 +69,16 @@ export class CodeEditor {
       highlightActiveLine(),
       indentOnInput(),
       bracketMatching(),
+      closeBrackets(),
+      codeFolding(),
+      foldGutter(),
+      autocompletion(),
+      // A completion source of last resort. Several of the eighteen grammars
+      // here carry none of their own — Dockerfile, ini, the legacy stream
+      // modes — and in those the popup would never open at all. Words already
+      // in the file are a poor completion set and a much better one than none.
+      // Language-provided sources still take precedence where they exist.
+      EditorState.languageData.of(() => [{ autocomplete: completeAnyWord }]),
       search(),
       highlightSelectionMatches(),
       placeholder("Select a file in the explorer"),
@@ -63,9 +88,15 @@ export class CodeEditor {
       this.cTheme.of(syntaxHighlighting(this.dark ? oneDarkHighlightStyle : defaultHighlightStyle)),
       this.cReadOnly.of(readOnly ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []),
       theme,
+      // Order matters: closeBrackets claims Backspace over an auto-inserted
+      // pair, and completion claims Escape and the arrow keys while its popup
+      // is open — both would otherwise be taken by the default keymap first.
       keymap.of([
         // Ctrl/Cmd+S must not fall through to the browser's save-page dialog.
         { key: "Mod-s", preventDefault: true, run: () => (this.onSave(), true) },
+        ...closeBracketsKeymap,
+        ...completionKeymap,
+        ...foldKeymap,
         ...defaultKeymap,
         ...historyKeymap,
         ...searchKeymap,

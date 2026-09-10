@@ -16,6 +16,37 @@ export class GitError extends Error {
   }
 }
 
+/** Reject option-looking values before they reach an argv.
+ *
+ *  Git reads any argument beginning with "-" as an option, and several of those
+ *  do considerably more than pick a revision: `--output=<file>` is a diff
+ *  option, which means `log` and `show` both accept it, and it writes wherever
+ *  it is pointed — outside the workspace the jail exists to guard. So every
+ *  value that arrives from the client and lands in an argv passes through here,
+ *  in the read operations as much as in the writing ones.
+ */
+export function safe(v: unknown, what: string): string {
+  const s = String(v ?? "");
+  if (s === "" || s.startsWith("-")) throw new GitError(`Invalid ${what}: ${s}`);
+  return s;
+}
+
+/** `safe()` for a value whose absence is meaningful: "" means "not given" and
+ *  is passed through, anything actually present is checked. */
+export function safeOpt(v: unknown, what: string): string {
+  const s = String(v ?? "");
+  return s === "" ? "" : safe(s, what);
+}
+
+/** One of a fixed set. Used where the value is not data but a choice — a reset
+ *  mode, a rebase action — and the legitimate answers are known and few.
+ *  Rejecting a leading "-" is not enough there, because the value is
+ *  concatenated into the flag itself. */
+export function oneOf<T extends string>(v: string, allowed: readonly T[], what: string): T {
+  if ((allowed as readonly string[]).includes(v)) return v as T;
+  throw new GitError(`Invalid ${what}: ${v}`);
+}
+
 /** %x1e between records, %x1f between fields — neither can occur in a ref name,
  *  an author name or a subject line. */
 const REC = "\x1e";
@@ -134,7 +165,7 @@ export async function log(
 ): Promise<Commit[]> {
   const args = ["log", "--date-order", `--format=${LOG_FMT}`, `-n${opts.limit ?? 200}`];
   if (opts.all) args.push("--all");
-  else if (opts.ref) args.push(opts.ref);
+  else if (opts.ref) args.push(safe(opts.ref, "ref"));
   // `--` keeps a path that looks like a flag from being parsed as one.
   if (opts.path) args.push("--", opts.path);
   return parseCommits(await git(cwd, args));
@@ -167,6 +198,7 @@ export async function branches(cwd: string): Promise<Branch[]> {
 }
 
 export async function commitDetail(cwd: string, oid: string): Promise<CommitDetail> {
+  oid = safe(oid, "commit");
   const commit = parseCommits(await git(cwd, ["log", "-1", `--format=${LOG_FMT}`, oid]))[0];
   if (!commit) throw new GitError(`unknown commit ${oid}`);
   // The body is fetched separately rather than appended to LOG_FMT: it is free
@@ -228,6 +260,7 @@ function parseFileList(out: string): CommitFile[] {
 /** Text of `path` at revision `rev`, or null when it does not exist there or
  *  is binary. `rev` is a commit-ish, or "" for the index (":<path>"). */
 export async function blobAt(cwd: string, rev: string, path: string): Promise<{ text: string | null; binary: boolean }> {
+  rev = safeOpt(rev, "revision");
   const spec = rev === "" ? `:${path}` : `${rev}:${path}`;
   const r = await runBytes(["git", "show", spec], cwd);
   if (r.code !== 0) return { text: null, binary: false };
@@ -268,14 +301,17 @@ export async function diffPair(
     const after = await blobAt(cwd, "", path);
     return { path, before: before.text, after: after.text, beforeLabel: "HEAD", afterLabel: "index", binary: before.binary || after.binary };
   }
-  const before = await blobAt(cwd, `${kind}^`, path);
-  const after = await blobAt(cwd, kind, path);
+  // Anything else is a commit-ish, which means it is client data reaching an
+  // argv — the one branch here that has to be checked.
+  const rev = safe(kind, "commit");
+  const before = await blobAt(cwd, `${rev}^`, path);
+  const after = await blobAt(cwd, rev, path);
   return {
     path,
     before: before.text,
     after: after.text,
-    beforeLabel: `${kind.slice(0, 8)}^`,
-    afterLabel: kind.slice(0, 8),
+    beforeLabel: `${rev.slice(0, 8)}^`,
+    afterLabel: rev.slice(0, 8),
     binary: before.binary || after.binary,
   };
 }

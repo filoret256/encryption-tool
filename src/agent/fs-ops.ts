@@ -7,7 +7,7 @@
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { DirEntry, FileRead } from "./protocol.ts";
-import type { Jail } from "./jail.ts";
+import { isGitDirName, type Jail } from "./jail.ts";
 
 /** Above this a file opens as read-only "too large" rather than in the editor.
  *  CodeMirror copes with a few MB, but the round trip over the socket does not. */
@@ -23,6 +23,9 @@ export async function readDir(jail: Jail, path: string): Promise<DirEntry[]> {
   const out: DirEntry[] = [];
 
   for (const d of dirents) {
+    // The jail refuses to open anything under the git directory, so listing it
+    // would only offer the explorer a row that errors when clicked.
+    if (isGitDirName(d.name)) continue;
     const link = d.isSymbolicLink();
     let isDir = d.isDirectory();
     let size: number | undefined;
@@ -65,26 +68,26 @@ export async function readTextFile(jail: Jail, path: string): Promise<FileRead> 
 }
 
 export async function writeTextFile(jail: Jail, path: string, text: string): Promise<{ mtime: number }> {
-  const abs = jail.toAbs(path);
+  const abs = await jail.toAbsForWrite(path);
   await writeFile(abs, text, "utf8");
   const st = await stat(abs);
   return { mtime: st.mtimeMs };
 }
 
 export async function createFile(jail: Jail, path: string): Promise<void> {
-  const abs = jail.toAbs(path);
+  const abs = await jail.toAbsForWrite(path);
   await mkdir(dirname(abs), { recursive: true });
   // "wx" fails if it already exists — never silently truncate someone's file.
   await writeFile(abs, "", { flag: "wx" });
 }
 
 export async function createDir(jail: Jail, path: string): Promise<void> {
-  await mkdir(jail.toAbs(path), { recursive: true });
+  await mkdir(await jail.toAbsForWrite(path), { recursive: true });
 }
 
 export async function movePath(jail: Jail, from: string, to: string): Promise<void> {
   const src = await jail.toAbsExisting(from);
-  const dst = jail.toAbs(to);
+  const dst = await jail.toAbsForWrite(to);
   await mkdir(dirname(dst), { recursive: true });
   await rename(src, dst);
 }

@@ -7,7 +7,7 @@
  */
 import type { AgentClient } from "./agent.ts";
 import type { Branch, GitStatus, StatusEntry } from "../../agent/protocol.ts";
-import { esc, modalPrompt, setHtmlKeepingScroll, showMenu } from "./ui.ts";
+import { esc, modalConfirm, modalPrompt, setHtmlKeepingScroll, showMenu } from "./ui.ts";
 
 export interface GitPanelCallbacks {
   /** kind: "worktree" (index vs disk), "staged" (HEAD vs index) or a commit oid. */
@@ -48,9 +48,30 @@ const SHELL = `
   <div class="gp-groups js-groups"></div>
   <div class="gp-progress js-progress" hidden></div>`;
 
+const COLLAPSED_KEY = "enc-scm-collapsed";
+
+const loadCollapsed = (): Set<Group> => {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(COLLAPSED_KEY) ?? "[]") as Group[]);
+  } catch {
+    return new Set();
+  }
+};
+
+const saveCollapsed = (s: Set<Group>): void => {
+  try {
+    localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...s]));
+  } catch {
+    /* private mode */
+  }
+};
+
 export class GitPanel {
   private status: GitStatus | null = null;
   private branches: Branch[] = [];
+  /** Groups the user has folded away, remembered between sessions: a repo
+   *  where "untracked" is always noise should not need folding on every load. */
+  private collapsed = loadCollapsed();
   private busy = false;
   /** Fingerprint of the rendered file list, so an unchanged status leaves the
    *  rows — and any click in flight over them — alone. */
@@ -176,6 +197,7 @@ export class GitPanel {
   }
 
   private groupHtml(group: Group, entries: StatusEntry[]): string {
+    const open = !this.collapsed.has(group);
     const bulk =
       group === "staged"
         ? `<button class="t-icon" data-bulk="unstage" data-group="${group}" title="Unstage all">−</button>`
@@ -184,12 +206,17 @@ export class GitPanel {
           : `<button class="t-icon" data-bulk="stage" data-group="${group}" title="Stage all">+</button>
              <button class="t-icon" data-bulk="discard" data-group="${group}" title="Discard all">↺</button>`;
 
+    // The caret is its own button rather than the whole header: the header also
+    // carries "stage all" and "discard all", and a bar that both collapses and
+    // discards depending on where you land is a bar nobody trusts.
     return `<section class="gp-group">
       <header class="gp-group-head">
+        <button class="gp-caret" type="button" data-collapse="${group}"
+                aria-expanded="${open}" title="${open ? "Collapse" : "Expand"}">${open ? "▾" : "▸"}</button>
         <span>${GROUP_TITLES[group]}</span><span class="gp-count">${entries.length}</span>
         <span class="t-spacer"></span>${bulk}
       </header>
-      ${entries.map((e) => this.rowHtml(group, e)).join("")}
+      ${open ? entries.map((e) => this.rowHtml(group, e)).join("") : ""}
     </section>`;
   }
 
@@ -205,7 +232,7 @@ export class GitPanel {
           : `<button class="t-icon" data-act="discard" title="Discard">↺</button>
              <button class="t-icon" data-act="stage" title="Stage">+</button>`;
 
-    return `<div class="gp-row" data-path="${esc(e.path).replace(/"/g, "&quot;")}" data-group="${group}" title="${esc(e.path)}">
+    return `<div class="gp-row" data-path="${esc(e.path)}" data-group="${group}" title="${esc(e.path)}">
       <span class="gp-name">${esc(name)}</span>
       <span class="gp-dir">${esc(dir)}</span>
       <span class="gp-actions">${actions}</span>
@@ -218,6 +245,19 @@ export class GitPanel {
   /** The action buttons: staging, unstaging, discarding. */
   private async onGroupAction(e: MouseEvent): Promise<void> {
     const target = e.target as HTMLElement;
+
+    const caret = target.closest<HTMLElement>("[data-collapse]");
+    if (caret) {
+      const group = caret.dataset.collapse as Group;
+      if (this.collapsed.has(group)) this.collapsed.delete(group);
+      else this.collapsed.add(group);
+      saveCollapsed(this.collapsed);
+      // The fingerprint below is what stops an unchanged status from redrawing;
+      // collapsing changes nothing about the status, so it has to be cleared.
+      this.renderedKey = "";
+      this.render();
+      return;
+    }
 
     const bulkBtn = target.closest<HTMLElement>("[data-bulk]");
     if (bulkBtn) {
@@ -256,7 +296,16 @@ export class GitPanel {
       else if (action === "unstage") await this.agent.call("git.unstage", { paths });
       else if (action === "discard") {
         const what = paths.length === 1 ? paths[0] : `${paths.length} files`;
-        if (!confirm(`Discard changes in ${what}? This cannot be undone.`)) return;
+        const ok = await modalConfirm({
+          title: `Discard changes in ${what}?`,
+          detail:
+            group === "untracked"
+              ? "Untracked files are deleted outright — git has no copy to restore."
+              : "The file goes back to its staged content. This cannot be undone.",
+          okLabel: "discard",
+          danger: true,
+        });
+        if (!ok) return;
         // `git checkout --` cannot restore a file git has never seen; deleting
         // it is what "discard" means for an untracked entry.
         if (group === "untracked") await this.agent.call("fs.delete", { paths });
@@ -314,7 +363,13 @@ export class GitPanel {
       await this.agent.call("git.branchDelete", { name });
       this.cb.toast(`deleted ${name}`);
     } catch {
-      if (confirm(`${name} is not fully merged. Delete anyway?`)) {
+      const force = await modalConfirm({
+        title: `${name} is not fully merged. Delete anyway?`,
+        detail: "Commits reachable only from this branch will be left unreferenced.",
+        okLabel: "delete",
+        danger: true,
+      });
+      if (force) {
         await this.run("git.branchDelete", { name, force: true }, `force-deleted ${name}`);
         return;
       }
@@ -358,13 +413,23 @@ export class GitPanel {
   private moreMenu(e: MouseEvent): void {
     showMenu(e.clientX, e.clientY, [
       ["↑ Push and set upstream", () => void this.remote("push", { setUpstream: true, remote: "origin", ref: this.status?.branch ?? undefined })],
-      ["⇡ Force push (with lease)", () => { if (confirm("Force-push with --force-with-lease?")) void this.remote("push", { force: true }); }],
+      ["⇡ Force push (with lease)", () => void this.forcePush()],
       ["⌷ Stash changes", () => void this.stash("push")],
       ["⌷ Pop latest stash", () => void this.stash("pop")],
       ["✕ Abort merge", () => void this.run("git.mergeAbort", {}, "merge aborted")],
       ["▶ Continue rebase", () => void this.run("git.rebase", { action: "continue" }, "rebase continued")],
       ["✕ Abort rebase", () => void this.run("git.rebase", { action: "abort" }, "rebase aborted")],
     ]);
+  }
+
+  private async forcePush(): Promise<void> {
+    const ok = await modalConfirm({
+      title: "Force-push with --force-with-lease?",
+      detail: "It refuses to overwrite commits this clone has not seen, but it will rewrite the remote branch.",
+      okLabel: "force push",
+      danger: true,
+    });
+    if (ok) await this.remote("push", { force: true });
   }
 
   private async push(): Promise<void> {

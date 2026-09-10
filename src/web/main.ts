@@ -224,7 +224,14 @@ async function openCodeTab(): Promise<void> {
       });
       codeTab.setTheme(isDark);
     } catch (e) {
-      host.innerHTML = `<div class="code-loading">could not load the editor: ${e instanceof Error ? e.message : String(e)}</div>`;
+      // textContent rather than a template into innerHTML: the message comes
+      // from a failed dynamic import, so its wording is not ours, and there is
+      // no markup wanted here anyway.
+      host.replaceChildren();
+      const note = document.createElement("div");
+      note.className = "code-loading";
+      note.textContent = `could not load the editor: ${e instanceof Error ? e.message : String(e)}`;
+      host.appendChild(note);
       return;
     }
   }
@@ -314,7 +321,7 @@ function expandTabs(): void {
     const map: Record<string, string> = {
       "js-password": `${tab}-password`, "js-editor": `${tab}-editor`,
       "js-badge": `${tab}-yaml-badge`, "js-beautify": `${tab}-beautify-btn`,
-      "js-lnum": `${tab}-lnum-btn`, "js-ws": `${tab}-ws-btn`, "js-wrap": `${tab}-wrap-btn`,
+      "js-lnum": `${tab}-lnum-btn`, "js-ws": `${tab}-ws-btn`, "js-wrap": `${tab}-wrap-btn`, "js-fold": `${tab}-fold-btn`,
       "js-lines": `${tab}-lines`, "js-chars": `${tab}-chars`,
       "js-bytes": `${tab}-bytes`, "js-sel": `${tab}-sel`,
     };
@@ -339,8 +346,8 @@ function init(): void {
     editors[tab] = ed;
     ed.onChange(() => scheduleStats(tab));
     // reflect persisted view-toggle state on the buttons
-    (["lineNumbers", "whitespace", "wrap"] as (keyof ViewPrefs)[]).forEach((k) => {
-      const id = { lineNumbers: "lnum", whitespace: "ws", wrap: "wrap" }[k];
+    (["lineNumbers", "whitespace", "wrap", "fold"] as (keyof ViewPrefs)[]).forEach((k) => {
+      const id = { lineNumbers: "lnum", whitespace: "ws", wrap: "wrap", fold: "fold" }[k];
       document.getElementById(`${tab}-${id}-btn`)?.classList.toggle("is-active", ed.isOn(k));
     });
     updateStats(tab);
@@ -416,6 +423,7 @@ function init(): void {
         case "lnum": toggleView(tab, "lineNumbers", `${tab}-lnum-btn`); break;
         case "ws": toggleView(tab, "whitespace", `${tab}-ws-btn`); break;
         case "wrap": toggleView(tab, "wrap", `${tab}-wrap-btn`); break;
+        case "fold": toggleView(tab, "fold", `${tab}-fold-btn`); break;
         case "find": case "replace": editors[tab].openFind(); break;
         case "togglePw": {
           const inp = document.getElementById(`${tab}-password`) as HTMLInputElement;

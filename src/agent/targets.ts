@@ -11,6 +11,10 @@ export interface AgentTarget {
   id: string;
   /** `--target` passed to `bun build --compile`. */
   bunTarget: string;
+  /** GOOS/GOARCH for `go build`. The Go agent is what ships; the Bun target
+   *  stays so the original implementation can still be built for comparison. */
+  goos: string;
+  goarch: string;
   os: "windows" | "macos" | "linux";
   arch: "x64" | "arm64";
   label: string;
@@ -23,6 +27,8 @@ export const TARGETS: AgentTarget[] = [
   {
     id: "windows-x64",
     bunTarget: "bun-windows-x64",
+    goos: "windows",
+    goarch: "amd64",
     os: "windows",
     arch: "x64",
     label: "Windows (x64)",
@@ -32,6 +38,8 @@ export const TARGETS: AgentTarget[] = [
   {
     id: "darwin-arm64",
     bunTarget: "bun-darwin-arm64",
+    goos: "darwin",
+    goarch: "arm64",
     os: "macos",
     arch: "arm64",
     label: "macOS (Apple Silicon)",
@@ -41,6 +49,8 @@ export const TARGETS: AgentTarget[] = [
   {
     id: "darwin-x64",
     bunTarget: "bun-darwin-x64",
+    goos: "darwin",
+    goarch: "amd64",
     os: "macos",
     arch: "x64",
     label: "macOS (Intel)",
@@ -50,6 +60,8 @@ export const TARGETS: AgentTarget[] = [
   {
     id: "linux-x64",
     bunTarget: "bun-linux-x64",
+    goos: "linux",
+    goarch: "amd64",
     os: "linux",
     arch: "x64",
     label: "Linux (x64)",
@@ -59,6 +71,8 @@ export const TARGETS: AgentTarget[] = [
   {
     id: "linux-arm64",
     bunTarget: "bun-linux-arm64",
+    goos: "linux",
+    goarch: "arm64",
     os: "linux",
     arch: "arm64",
     label: "Linux (arm64)",
@@ -69,7 +83,7 @@ export const TARGETS: AgentTarget[] = [
 
 export const byId = (id: string): AgentTarget | undefined => TARGETS.find((t) => t.id === id);
 
-/** `enc-tool-agent-3.1.0-darwin-arm64.tar.gz` — the version is in the name so a
+/** `enc-tool-agent-4.0.0-darwin-arm64.tar.gz` — the version is in the name so a
  *  mirror can hold several releases side by side. */
 export const archiveName = (t: AgentTarget, version: string): string =>
   `enc-tool-agent-${version}-${t.id}.${t.kind}`;
