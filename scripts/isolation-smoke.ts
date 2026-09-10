@@ -21,6 +21,7 @@ import { iter } from "../src/agent/proc.ts";
 import { git, startAgent, type Harness } from "./harness.ts";
 import { ansible, helm } from "../src/crypto/index.ts";
 import type { FileRead, SearchSummary } from "../src/agent/protocol.ts";
+import { esc } from "../src/web/code/ui.ts";
 
 const SERVER_PORT = 5091;
 const AGENT_A = 5089;
@@ -137,6 +138,62 @@ try {
   const hardening = ["x-content-type-options", "referrer-policy", "cross-origin-opener-policy", "permissions-policy"];
   const missingHeaders = hardening.filter((h) => shellRes.headers.get(h) === null);
   check("hardening headers are present", missingHeaders.length === 0, missingHeaders.length ? `missing ${missingHeaders.join(", ")}` : hardening.join(", "));
+
+  // ── 2b. the other half of the CSP ──
+  //
+  // The policy above is what stops an injected script from running. This is
+  // what stops one being injected: the panels build their rows with innerHTML,
+  // and the strings in them — file paths, branch names, commit subjects — come
+  // from whatever repository the user opened. A repository can be cloned with a
+  // file named `" onmouseover=… x="`.
+  //
+  // There used to be two escapers, `esc` for text and `attr` for attributes,
+  // and the wrong one was picked in four separate panels. So the rule being
+  // held here is the structural one: exactly one escaper, and it is safe in
+  // both contexts.
+  const HOSTILE = `" onmouseover="alert(1)`;
+  const escaped = esc(HOSTILE);
+  check(
+    "the escaper neutralises every character that can break out",
+    !/[<>"'&](?!\w+;)/.test(escaped) && !escaped.includes('"') && !escaped.includes("'"),
+    escaped,
+  );
+  /** The attribute names a real HTML parser finds on the div — which is the
+   *  only question that matters. A break-out shows up as a name nobody wrote. */
+  const attrsOf = async (value: string): Promise<string[]> => {
+    let names: string[] = [];
+    await new HTMLRewriter()
+      .on("div", { element: (el) => void (names = [...el.attributes].map(([n]) => n)) })
+      .transform(new Response(`<div class="row" title="${value}">x</div>`))
+      .text();
+    return names;
+  };
+
+  // The negative control comes first: a check that cannot observe the failure
+  // it is written to catch would pass just as happily over a broken escaper.
+  const rawAttrs = await attrsOf(HOSTILE);
+  check(
+    "the check can see a break-out when there is one",
+    rawAttrs.includes("onmouseover"),
+    `unescaped, the parser finds: ${rawAttrs.join(", ")}`,
+  );
+  const safeAttrs = await attrsOf(escaped);
+  check(
+    "an attribute built with the escaper cannot be escaped from",
+    safeAttrs.join(",") === "class,title",
+    `escaped, the parser finds: ${safeAttrs.join(", ")}`,
+  );
+
+  // A second escaper is how this went wrong the first time — caps.ts grew its
+  // own, search-panel.ts grew another. Anything defining the entity table
+  // outside ui.ts is one.
+  const webFiles = new Bun.Glob("**/*.ts").scan({ cwd: "src/web", absolute: true });
+  const rogue: string[] = [];
+  for await (const path of webFiles) {
+    if (path.replace(/\\/g, "/").endsWith("src/web/code/ui.ts")) continue;
+    if (/["']&amp;["']/.test(await readFile(path, "utf8"))) rogue.push(path.replace(/.*src[\\/]web[\\/]/, ""));
+  }
+  check("only one module knows how to escape HTML", rogue.length === 0, rogue.length ? `also in ${rogue.join(", ")}` : "src/web/code/ui.ts");
 
   // ── 3. the browser bundle must not post secrets anywhere ──
   // A regression here would silently start sending plaintext and passwords to

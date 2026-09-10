@@ -14,6 +14,7 @@
  *    4. every path is confined to the workspace by Jail (see jail.ts).
  */
 import { randomBytes } from "node:crypto";
+import { copyToClipboard, interactive } from "./clipboard.ts";
 import { Jail } from "./jail.ts";
 import { probe } from "./proc.ts";
 import * as fsops from "./fs-ops.ts";
@@ -31,6 +32,7 @@ interface Options {
   port: number;
   token: string;
   origins: string[];
+  noClipboard: boolean;
 }
 
 /** Comma- or space-separated origins from the environment.
@@ -52,7 +54,7 @@ function fail(message: string): never {
 }
 
 function parseArgs(argv: string[]): Options {
-  const o: Options = { root: "", port: 5001, token: "", origins: envOrigins() };
+  const o: Options = { root: "", port: 5001, token: "", origins: envOrigins(), noClipboard: false };
   let rootFrom = "";
 
   const setRoot = (dir: string, source: string): void => {
@@ -71,6 +73,7 @@ function parseArgs(argv: string[]): Options {
       case "--port": o.port = Number(value()) || o.port; break;
       case "--token": o.token = value(); break;
       case "--allow-origin": o.origins.push(value().replace(/\/$/, "")); break;
+      case "--no-clipboard": o.noClipboard = true; break;
       case "--version":
       case "-v":
         console.log(VERSION);
@@ -107,6 +110,7 @@ and be pointed at a project instead of copied into one:
   --token <str>           fixed access token (default: random, printed below)
   --allow-origin <url>    origin allowed to connect, repeatable
                           (loopback origins are always allowed)
+  --no-clipboard          do not copy the URL to the clipboard on startup
   --version               print the version and exit
 
 Environment:
@@ -394,6 +398,13 @@ export async function startAgent(argv: string[]): Promise<void> {
   });
 
   const url = `ws://127.0.0.1:${server.port}/ws?token=${token}`;
+
+  // Copied for the user rather than left to their mouse: the token is new on
+  // every run, so this is the one line they would otherwise select by hand
+  // every single time. Only when someone is actually watching — see
+  // interactive() — and never when they have asked us not to.
+  const copied = !opts.noClipboard && interactive() && (await copyToClipboard(url));
+
   console.log(`
 enc-tool agent ${VERSION}
   folder    ${jail.root}
@@ -403,6 +414,6 @@ enc-tool agent ${VERSION}
   origins   ${opts.origins.length ? opts.origins.join(", ") : "loopback only (pass --allow-origin for a remote UI)"}
 
   Paste this into the editor tab:
-  ${url}
+  ${url}${copied ? "\n  ✓ copied to your clipboard" : ""}
 `);
 }

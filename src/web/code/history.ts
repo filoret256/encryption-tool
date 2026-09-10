@@ -5,7 +5,7 @@
  */
 import type { AgentClient } from "./agent.ts";
 import type { Commit, CommitDetail } from "../../agent/protocol.ts";
-import { esc, modalPrompt, setHtmlKeepingScroll, showMenu } from "./ui.ts";
+import { esc, modalConfirm, modalPrompt, setHtmlKeepingScroll, showMenu } from "./ui.ts";
 import { computeGraph, continuationSvg, laneSvg, LANE_W, type GraphRow } from "./graph.ts";
 
 const PAGE = 100;
@@ -120,9 +120,13 @@ export class HistoryPanel {
   private commitHtml(c: Commit, row: GraphRow | undefined): string {
     const open = this.expanded === c.oid;
     const detail = this.details.get(c.oid);
-    return `<div class="hist-item${open ? " open" : ""}" data-oid="${c.oid}">
+    return `<div class="hist-item${open ? " open" : ""}" data-oid="${esc(c.oid)}">
       <div class="hist-row">
         ${row ? laneSvg(row) : `<span class="hist-dot">${c.parents.length > 1 ? "◆" : "●"}</span>`}
+        <!-- After the lane, never before it: the graph is drawn against a fixed
+             gutter width that the continuation SVG below has to line up with,
+             and anything inserted ahead of it shifts one and not the other. -->
+        <span class="hist-caret" aria-hidden="true">${open ? "▾" : "▸"}</span>
         ${refsHtml(c.refs)}
         <span class="hist-subject">${esc(c.subject)}</span>
         <span class="hist-meta">${esc(shortName(c.author))} · ${ago(c.time)}</span>
@@ -149,8 +153,8 @@ export class HistoryPanel {
       ${body ? `<pre class="hist-body">${esc(body)}</pre>` : ""}
       ${detail.files
         .map(
-          (f) => `<div class="hist-file" data-path="${esc(f.path).replace(/"/g, "&quot;")}" title="${esc(f.path)}">
-            <span class="hist-status st-${f.status}">${f.status}</span>
+          (f) => `<div class="hist-file" data-path="${esc(f.path)}" title="${esc(f.path)}">
+            <span class="hist-status st-${esc(f.status)}">${f.status}</span>
             <span class="hist-fname">${esc(f.path)}</span>
             <span class="hist-stat">${f.binary ? "bin" : `+${f.added} −${f.deleted}`}</span>
           </div>`,
@@ -214,7 +218,15 @@ export class HistoryPanel {
   }
 
   private async reset(oid: string, mode: "soft" | "mixed" | "hard"): Promise<void> {
-    if (mode === "hard" && !confirm(`Reset --hard to ${oid.slice(0, 7)}? Uncommitted changes will be lost.`)) return;
+    if (mode === "hard") {
+      const ok = await modalConfirm({
+        title: `Reset --hard to ${oid.slice(0, 7)}?`,
+        detail: "Every uncommitted change in the working tree is discarded, staged or not.",
+        okLabel: "reset --hard",
+        danger: true,
+      });
+      if (!ok) return;
+    }
     await this.run("git.reset", { oid, mode }, `reset --${mode} to ${oid.slice(0, 7)}`);
   }
 

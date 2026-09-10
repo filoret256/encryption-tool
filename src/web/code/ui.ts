@@ -2,10 +2,31 @@
  *  prompt. `window.prompt` is unavailable in an installed PWA window, so the
  *  modal is not a stylistic choice. */
 
-export const esc = (s: string): string =>
-  s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[c]!);
+/** Escape a value for HTML — text content and attribute values alike.
+ *
+ *  All five characters, not the three that text nodes strictly need. There used
+ *  to be two functions here, `esc` for text and `attr` for attributes, and the
+ *  wrong one kept getting picked: `title="${esc(path)}"` appeared in four
+ *  separate panels, and a file path is the most attacker-influenceable string
+ *  in this app — a repository can be cloned with a file named
+ *  `" onmouseover=… x="` and the editor will happily list it.
+ *
+ *  Splitting by context was the mistake. An entity decodes identically in both
+ *  places, so escaping quotes in text costs nothing but a few bytes, while a
+ *  single escaper cannot be applied in the wrong place. The apostrophe is here
+ *  for the same reason: single-quoted attributes are legal HTML, and the next
+ *  person to write one should not have to know that this function assumed
+ *  double quotes.
+ */
+const ENTITIES: Record<string, string> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
 
-export const attr = (s: string): string => esc(s).replace(/"/g, "&quot;");
+export const esc = (s: string): string => s.replace(/[&<>"']/g, (c) => ENTITIES[c]!);
 
 /** Replace a scrollable container's contents without throwing the reader back
  *  to the top.
@@ -64,6 +85,64 @@ export function showMenu(x: number, y: number, items: [string, () => void][]): v
   setTimeout(() => document.addEventListener("click", () => menu.remove(), { once: true }));
 }
 
+export interface ConfirmOptions {
+  /** The question. Shown at reading size, not as a field label — it is the one
+   *  thing in the dialog the user has to actually read. */
+  title: string;
+  /** The consequence, spelled out. "This cannot be undone" belongs here, as
+   *  does the count of what is about to go. */
+  detail?: string;
+  okLabel?: string;
+  /** Paints the confirming button as destructive and puts the initial focus on
+   *  cancel, so Enter — on a dialog that appeared under a cursor already
+   *  heading for the primary button — does not throw work away. */
+  danger?: boolean;
+}
+
+/** Themed replacement for `window.confirm`.
+ *
+ *  Not a stylistic choice, for the same reason `modalPrompt` is not: native
+ *  dialogs are unreliable in an installed PWA window. Every caller is an
+ *  irreversible action — discard, delete, reset --hard, replace across a whole
+ *  project — and a confirmation that may never appear is worse than none at
+ *  all, because the code carries on as though the user had agreed to it.
+ */
+export function modalConfirm(opts: ConfirmOptions): Promise<boolean> {
+  return new Promise((resolve) => {
+    const back = document.createElement("div");
+    back.className = "modal-back";
+    back.innerHTML = `<form class="modal">
+      <p class="modal-title">${esc(opts.title)}</p>
+      ${opts.detail ? `<p class="modal-hint">${esc(opts.detail)}</p>` : ""}
+      <div class="modal-row">
+        <button type="button" class="t-btn cancel">cancel</button>
+        <button type="submit" class="t-btn t-btn-primary${opts.danger ? " t-btn-danger" : ""}">${esc(opts.okLabel ?? "ok")}</button>
+      </div></form>`;
+
+    const done = (v: boolean): void => {
+      back.remove();
+      document.removeEventListener("keydown", onKey, true);
+      resolve(v);
+    };
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") done(false);
+    };
+
+    back.querySelector("form")!.addEventListener("submit", (e) => {
+      e.preventDefault();
+      done(true);
+    });
+    back.querySelector(".cancel")!.addEventListener("click", () => done(false));
+    back.addEventListener("click", (e) => {
+      if (e.target === back) done(false);
+    });
+    document.addEventListener("keydown", onKey, true);
+
+    document.body.appendChild(back);
+    back.querySelector<HTMLButtonElement>(opts.danger ? ".cancel" : "[type=submit]")!.focus();
+  });
+}
+
 export interface PromptOptions {
   title: string;
   value?: string;
@@ -78,7 +157,7 @@ export function modalPrompt(opts: PromptOptions): Promise<string | null> {
     back.className = "modal-back";
     back.innerHTML = `<form class="modal">
       <label>${esc(opts.title)}</label>
-      <input class="t-input" value="${attr(opts.value ?? "")}" placeholder="${attr(opts.placeholder ?? "")}"
+      <input class="t-input" value="${esc(opts.value ?? "")}" placeholder="${esc(opts.placeholder ?? "")}"
              autocomplete="off" spellcheck="false" />
       ${opts.hint ? `<p class="modal-hint">${esc(opts.hint)}</p>` : ""}
       <div class="modal-row">

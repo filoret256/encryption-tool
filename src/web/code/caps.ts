@@ -8,6 +8,7 @@
  */
 import type { AgentClient } from "./agent.ts";
 import { VERSION } from "../../version.ts";
+import { esc } from "./ui.ts";
 
 export interface Caps {
   /** https:// or localhost — required for service workers. */
@@ -151,7 +152,7 @@ export function mountBadge(host: HTMLElement, agent: AgentClient, onConnect: () 
           : agent.lastError || "Agent not connected";
 
     pop.innerHTML = `
-      <div class="cap-head">${escapeHtml(headline(status, agent.lastError))}</div>
+      <div class="cap-head">${esc(headline(status, agent.lastError))}</div>
       <ul class="cap-list">${ROWS.filter((r) => !r.needsAgent || caps.agent)
         .map((r) => row(r, caps, agent))
         .join("")}</ul>
@@ -186,11 +187,8 @@ function row(r: Row, caps: Caps, agent: AgentClient): string {
   const fix = typeof r.fix === "function" ? r.fix(agent) : r.fix;
   return `<li class="${on ? "on" : "off"}">
     <span class="cap-mark">${on ? "✓" : "✗"}</span>
-    <span class="cap-label">${escapeHtml(r.label)}</span>
-    ${on ? "" : `<span class="cap-fix">${escapeHtml(fix)}</span>`}
+    <span class="cap-label">${esc(r.label)}</span>
+    ${on ? "" : `<span class="cap-fix">${esc(fix)}</span>`}
   </li>`;
 }
 
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
-}

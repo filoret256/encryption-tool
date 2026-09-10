@@ -5,7 +5,7 @@
  *  the grammar set never lands in the crypto tabs' bundle.
  */
 import type { EditorState } from "@codemirror/state";
-import type { AgentClient } from "./agent.ts";
+import { isAgentUrl, type AgentClient } from "./agent.ts";
 import type { DiffPair, DirEntry, FileRead, FsChange, GitStatus } from "../../agent/protocol.ts";
 import { CodeEditor } from "./editor.ts";
 import { FileTree } from "./tree.ts";
@@ -14,7 +14,7 @@ import { HistoryPanel } from "./history.ts";
 import { SearchPanel } from "./search-panel.ts";
 import { DiffView } from "./diff.ts";
 import { findConflicts } from "./conflicts.ts";
-import { attr, esc, modalPrompt } from "./ui.ts";
+import { esc, modalConfirm, modalPrompt } from "./ui.ts";
 import { iconBranch, iconFiles, iconHistory, iconNewFile, iconNewFolder, iconRefresh, iconSearch } from "./icons.ts";
 
 export interface CodeContext {
@@ -34,6 +34,30 @@ export interface CodeTab {
 }
 
 type View = "explorer" | "search" | "scm" | "history";
+
+/** Side-panel geometry, remembered between sessions. */
+interface SideState {
+  width: number;
+  collapsed: boolean;
+}
+const SIDE_KEY = "enc-code-side";
+
+function loadSide(): SideState {
+  const fallback: SideState = { width: 260, collapsed: false };
+  try {
+    return { ...fallback, ...(JSON.parse(localStorage.getItem(SIDE_KEY) ?? "{}") as Partial<SideState>) };
+  } catch {
+    return fallback;
+  }
+}
+
+function saveSide(s: SideState): void {
+  try {
+    localStorage.setItem(SIDE_KEY, JSON.stringify(s));
+  } catch {
+    /* private mode */
+  }
+}
 
 const SHELL = `
   <div class="toolbar code-toolbar">
@@ -72,6 +96,7 @@ const SHELL = `
         <div class="side-view" data-pane="history"></div>
       </div>
     </aside>
+    <div class="code-splitter" title="Drag to resize · double-click to hide (Ctrl+B)"></div>
     <div class="code-main">
       <div class="code-tabs js-tabs" hidden></div>
       <div class="conflict-bar js-conflict" hidden></div>
@@ -261,7 +286,13 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     {
       onOpen: (path, preview) => void open(path, false, preview),
       onError: (m) => ctx.toast(m, true),
-      confirmDelete: (paths) => confirm(`Delete ${paths.join(", ")}? This cannot be undone.`),
+      confirmDelete: (paths) =>
+        modalConfirm({
+          title: paths.length === 1 ? `Delete ${paths[0]}?` : `Delete ${paths.length} items?`,
+          detail: "Removed from disk, not from git — there is nothing to restore it from unless it was committed.",
+          okLabel: "delete",
+          danger: true,
+        }),
       compare: (left, right) => void compare(left, right),
       compareWithHead: (path) => void openDiff(path, "head"),
     },
@@ -289,8 +320,70 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     },
   });
 
+  // ── the side panel: width, drag, collapse ──
+  //
+  // This was `resize: horizontal` on the panel itself, which gives a grip in
+  // one corner, forgets the width on reload, cannot be driven from the keyboard
+  // and cannot close the panel at all.
+  const sideEl = $(".code-side");
+  const splitter = $(".code-splitter");
+  const side = loadSide();
+
+  function applySide(): void {
+    sideEl.style.width = `${side.width}px`;
+    // Both go: with the panel closed a bare splitter is a handle attached to
+    // nothing. The rail is how it comes back, as is Ctrl+B.
+    sideEl.hidden = side.collapsed;
+    splitter.hidden = side.collapsed;
+  }
+  function setCollapsed(collapsed: boolean): void {
+    side.collapsed = collapsed;
+    saveSide(side);
+    applySide();
+  }
+  applySide();
+
+  splitter.addEventListener("pointerdown", (e) => {
+    const ev = e as PointerEvent;
+    if (ev.button !== 0) return;
+    ev.preventDefault(); // or the drag selects text across the editor
+    splitter.setPointerCapture(ev.pointerId);
+    splitter.classList.add("dragging");
+    const startX = ev.clientX;
+    const startWidth = sideEl.getBoundingClientRect().width;
+
+    const onMove = (m: PointerEvent): void => {
+      // Clamped: dragged to nothing, the panel would be gone with no handle
+      // left to bring it back, and past half the window the editor becomes the
+      // gutter instead.
+      side.width = Math.round(Math.min(Math.max(startWidth + m.clientX - startX, 150), window.innerWidth * 0.6));
+      sideEl.style.width = `${side.width}px`;
+    };
+    const onUp = (): void => {
+      splitter.classList.remove("dragging");
+      splitter.removeEventListener("pointermove", onMove);
+      splitter.removeEventListener("pointerup", onUp);
+      saveSide(side);
+    };
+    splitter.addEventListener("pointermove", onMove);
+    splitter.addEventListener("pointerup", onUp);
+  });
+
+  splitter.addEventListener("dblclick", () => setCollapsed(true));
+
+  document.addEventListener("keydown", (e) => {
+    if (!host.classList.contains("active")) return;
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "b") {
+      e.preventDefault();
+      setCollapsed(!side.collapsed);
+    }
+  });
+
   // ── views ──
   function showView(view: View): void {
+    // Picking a view from the rail while the panel is closed means "show me
+    // this", not "switch the thing I cannot see".
+    if (side.collapsed) setCollapsed(false);
     $(".code-side").dataset.view = view;
     $(".js-side-title").textContent = { explorer: "explorer", search: "search", scm: "source control", history: "history" }[view];
     for (const b of host.querySelectorAll<HTMLElement>(".rail-btn")) {
@@ -317,7 +410,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
           t.id === previewId ? "preview" : "", file ? "" : "is-diff"]
           .filter(Boolean)
           .join(" ");
-        return `<div class="${cls}" data-id="${attr(t.id)}" title="${esc(file ? t.path : t.title)}">
+        return `<div class="${cls}" data-id="${esc(t.id)}" title="${esc(file ? t.path : t.title)}">
           ${file ? "" : `<span class="code-tab-icon">⇄</span>`}
           <span class="code-tab-name">${esc(name)}</span>
           <button class="code-tab-close" type="button" title="Close">${dirty ? "●" : "✕"}</button>
@@ -399,16 +492,27 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     editor.focus();
   }
 
-  function closeTab(id: string): void {
+  async function closeTab(id: string): Promise<void> {
     const i = tabs.findIndex((t) => t.id === id);
     if (i === -1) return;
     const tab = tabs[i];
     if (tab.kind === "file") {
-      if (isDirty(tab.path) && !confirm(`${tab.path} has unsaved changes. Close anyway?`)) return;
+      if (isDirty(tab.path)) {
+        const ok = await modalConfirm({
+          title: `${tab.path} has unsaved changes. Close anyway?`,
+          detail: "The edits are discarded; the file on disk is left as it is.",
+          okLabel: "close without saving",
+          danger: true,
+        });
+        if (!ok) return;
+      }
       states.delete(tab.path);
       baselines.delete(tab.path);
     }
-    tabs.splice(i, 1);
+    // Awaiting the dialog above means the list can have moved under us.
+    const at = tabs.findIndex((t) => t.id === id);
+    if (at === -1) return;
+    tabs.splice(at, 1);
     if (previewId === id) previewId = null;
 
     if (activeId !== id) return renderTabs();
@@ -429,7 +533,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     const el = e.target as HTMLElement;
     const id = el.closest<HTMLElement>(".code-tab")?.dataset.id;
     if (!id) return;
-    if (el.closest(".code-tab-close")) closeTab(id);
+    if (el.closest(".code-tab-close")) void closeTab(id);
     else activate(id);
   });
   // Double-clicking a preview tab keeps it, the same gesture as in the tree.
@@ -444,7 +548,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     const id = (ev.target as HTMLElement).closest<HTMLElement>(".code-tab")?.dataset.id;
     if (id) {
       ev.preventDefault();
-      closeTab(id);
+      void closeTab(id);
     }
   });
 
@@ -674,15 +778,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   });
 
   // ── connect flow ──
-  async function connect(): Promise<void> {
-    const url = await modalPrompt({
-      title: "Local agent URL",
-      value: agent.savedUrl(),
-      placeholder: "ws://127.0.0.1:5001/ws?token=…",
-      hint: "Run `enc-tool agent` in the folder you want to edit, then paste the URL it prints.",
-      okLabel: "connect",
-    });
-    if (!url) return;
+
+  async function connectTo(url: string): Promise<void> {
     try {
       await agent.connect(url);
       ctx.toast("agent connected");
@@ -690,6 +787,58 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       ctx.toast(e instanceof Error ? e.message : String(e), true);
     }
   }
+
+  /** An agent URL sitting on the clipboard, if there is one and if we are
+   *  allowed to look.
+   *
+   *  Strictly an optimisation. Reading the clipboard needs a permission the
+   *  browser may prompt for, and Firefox does not offer it to pages at all, so
+   *  every failure path just leaves the saved URL in the field. It runs inside
+   *  the click that opened the dialog, which is the only moment the browsers
+   *  that do allow it will. */
+  async function clipboardUrl(): Promise<string | null> {
+    try {
+      const text = (await navigator.clipboard.readText()).trim();
+      return isAgentUrl(text) ? text : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function connect(): Promise<void> {
+    const fromClipboard = await clipboardUrl();
+    const url = await modalPrompt({
+      title: "Local agent URL",
+      value: fromClipboard ?? agent.savedUrl(),
+      placeholder: "ws://127.0.0.1:5001/ws?token=…",
+      hint: fromClipboard
+        ? "Taken from your clipboard — the agent put it there when it started."
+        : "Run `enc-tool agent` in the folder you want to edit, then paste the URL it prints.",
+      okLabel: "connect",
+    });
+    if (!url) return;
+    await connectTo(url);
+  }
+
+  // Paste anywhere on the tab to connect.
+  //
+  // The agent copies its URL to the clipboard as it starts, so this is the
+  // other half of that: Ctrl+V, rather than open the dialog, clear the stale
+  // URL, paste, confirm. Listening on the document because a paste fires at
+  // whatever holds focus — usually <body> — and events bubble up, not down.
+  //
+  // Two guards keep it from stealing a paste that meant something else: it does
+  // nothing while an agent is connected, when a pasted URL is far more likely
+  // to be content the user is editing, and nothing when the caret is in a field
+  // or in the editor. Text that is not an agent URL is left alone regardless.
+  document.addEventListener("paste", (e) => {
+    if (!host.classList.contains("active") || agent.state === "online") return;
+    if ((e.target as HTMLElement | null)?.closest("input, textarea, [contenteditable=true]")) return;
+    const text = e.clipboardData?.getData("text")?.trim();
+    if (!text || !isAgentUrl(text)) return;
+    e.preventDefault();
+    void connectTo(text);
+  });
 
   // ── wiring ──
   $(".js-connect").addEventListener("click", () => void connect());

@@ -130,8 +130,20 @@ body {
 .code-side {
   width: 260px; min-width: 150px; max-width: 50%; flex: 0 0 auto;
   display: flex; flex-direction: column; min-height: 0;
-  background: var(--panel); border-right: 1px solid var(--border); resize: horizontal; overflow: hidden;
+  background: var(--panel); overflow: hidden;
 }
+
+/* The drag handle between the panel and the editor. It carries the border the
+   panel used to draw, so the two do not stack into a double rule. */
+.code-splitter {
+  /* Wider than the line it draws. Five pixels is a target you miss, and the
+     panel background fills the difference so the extra width does not read as
+     a gap between two panes. */
+  flex: 0 0 auto; width: 7px; cursor: col-resize;
+  background: var(--panel); border-right: 1px solid var(--border);
+}
+.code-splitter:hover,
+.code-splitter.dragging { background: var(--accent); border-right-color: var(--accent); }
 .side-head {
   display: flex; align-items: center; gap: 4px; padding: 5px 8px;
   font-size: 11px; text-transform: uppercase; color: var(--text-muted);
@@ -559,3 +571,170 @@ body {
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .toast.error { background: var(--bad); color: #fff; }
+
+/* ── Keyboard focus ───────────────────────────────────────────────────────
+   One ring, stated once, for everything that can hold focus.
+
+   There was none at all before: every control here is reachable with Tab,
+   several of them destroy work (discard, delete, reset --hard), and nothing
+   showed where the keyboard was. `:focus-visible` rather than `:focus` so a
+   mouse click leaves no ring behind — deciding when a ring is wanted is
+   exactly what the browser does better than a heuristic here. */
+.tab:focus-visible,
+.t-btn:focus-visible,
+.t-icon:focus-visible,
+.t-eye:focus-visible,
+.theme-toggle:focus-visible,
+.rail-btn:focus-visible,
+.sp-tog:focus-visible,
+.cf-btn:focus-visible,
+.code-tab-close:focus-visible,
+.cap-chip:focus-visible,
+.agent-dl-chip:focus-visible,
+.agent-dl-others button:focus-visible,
+.ctx-menu button:focus-visible,
+.sp-globs summary:focus-visible,
+.hist-toggle input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Fields already carry a border, so the accent moves onto it and the ring sits
+   just outside — a bare outline on top of a border reads as two boxes. */
+.t-input:focus-visible,
+.gp-commit textarea:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  outline-offset: 0;
+  border-color: var(--accent);
+}
+
+/* The tree takes focus itself (tabIndex 0) and moves a selection with the arrow
+   keys, so the ring belongs on the selected row, not around the panel — a
+   rectangle that tall reads as an error state rather than as a cursor. */
+.tree-viewport:focus-visible .tree-row.sel {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* ── Narrow viewports ─────────────────────────────────────────────────────
+   The app installs as a PWA, so it gets opened on tablets and in half-width
+   windows. Until now there were no breakpoints at all: the toolbars are
+   `nowrap` over `overflow-x: auto`, which turned them into horizontal scroll
+   strips that hid `encrypt` and `decrypt` — the two things the page exists
+   for — behind a gesture nobody makes on a toolbar. */
+
+@media (max-width: 860px) {
+  .header { flex-wrap: wrap; gap: 6px; }
+  /* The auto margin pins the tools beside the tabs in a space-between row.
+     Once that row wraps it would instead push them onto a line of their own. */
+  .code-tools { margin: 0; }
+}
+
+@media (max-width: 700px) {
+  .toolbar, .toolbar-secondary { flex-wrap: wrap; overflow-x: visible; }
+  /* Group labels and the rules between groups: wrapping already groups the
+     buttons, and these only take room away from them. The password field keeps
+     its own placeholder, so nothing becomes unlabelled. */
+  .toolbar .t-label, .toolbar-secondary .t-label, .toolbar-sep { display: none; }
+  /* A spacer that pushes to the right edge means nothing once rows wrap. */
+  .toolbar .t-spacer, .toolbar-secondary .t-spacer { display: none; }
+  .code-root { max-width: 100%; }
+  .statusbar { flex-wrap: wrap; gap: 10px 16px; }
+
+  /* The code tab stacks instead of holding three columns: the rail across the
+     top, the panel under it, the editor below. Below about 700px the third
+     column leaves the editor a gutter. */
+  .code-body { flex-direction: column; }
+  .code-rail { flex-direction: row; border-right: 0; border-bottom: 1px solid var(--border); }
+  /* Stacked, the panel grows downward, so the horizontal handle has nothing to
+     drag; the browser's own vertical grip takes over. The inline width the
+     splitter wrote has to be overridden — hence the !important, which is the
+     one place a media query has to outrank an element style. */
+  .code-side {
+    width: auto !important; max-width: none; min-width: 0; max-height: 42vh;
+    border-bottom: 1px solid var(--border);
+    resize: vertical;
+  }
+  .code-splitter { display: none; }
+  .code-main { min-height: 45vh; }
+
+  /* Both were fixed widths that overflow a 360px viewport. */
+  .cap-pop, .agent-dl-pop { width: min(360px, calc(100vw - 24px)); }
+}
+
+/* ── Touch ────────────────────────────────────────────────────────────────
+   The controls here are sized for a cursor. Row heights are deliberately left
+   alone: the tree and the search results are virtualised against a row height
+   stated in TypeScript, and changing it in CSS alone desynchronises the two. */
+@media (pointer: coarse) {
+  .t-btn, .tab { min-height: 34px; }
+  .t-icon, .sp-tog, .code-tab-close { min-width: 30px; min-height: 30px; }
+  .rail-btn { width: 38px; height: 38px; }
+  /* Row actions are revealed on hover, and there is no hover on a touch
+     screen — without this, staging or discarding a file is unreachable. */
+  .gp-actions, .sp-acts { visibility: visible; }
+}
+
+/* ── Confirmation dialogs ─────────────────────────────────────────────────
+   The question carries the dialog, so it is set at reading size rather than
+   reusing `.modal label`, which is the small uppercase treatment for a field
+   name. */
+.modal-title { margin: 0; font-size: 13px; line-height: 1.5; color: var(--text); }
+
+/* Destructive confirmations. `.t-btn-danger` is used *alongside*
+   `.t-btn-primary` on purpose: the grey hover above is written as
+   `:not(.t-btn-primary)` precisely so a coloured button keeps its colour, and
+   dropping the primary class would put this button straight back into the bug
+   that comment describes. Declared after it, so the red wins the background. */
+.t-btn-danger { background: var(--bad); border-color: var(--bad); color: #fff; }
+
+/* ── Collapsible sections ─────────────────────────────────────────────────
+   The explorer and the search results had carets from the start; the source
+   control groups and the history rows did not, so in a repository with a
+   hundred changed files "untracked" was reachable only by scrolling past
+   everything above it, and nothing suggested a commit row could open at all. */
+.gp-caret, .hist-caret {
+  flex: 0 0 auto; width: 12px; text-align: center;
+  font-size: 9px; line-height: 1; color: var(--text-muted);
+}
+.gp-caret {
+  padding: 0; border: 0; border-radius: 3px; cursor: pointer;
+  background: transparent; font-family: var(--mono);
+}
+.gp-caret:hover { color: var(--text); background: var(--btn-hover); }
+.gp-caret:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* The whole history row is the toggle, so the caret is a marker rather than a
+   target — it must not look like a second, separate button. */
+.hist-caret { pointer-events: none; }
+
+/* ── Folding and completion chrome ────────────────────────────────────────
+   CodeMirror ships both light-only, exactly as @codemirror/merge does above,
+   so under the dark theme a fold placeholder and the completion popup arrive
+   as pale boxes with unreadable text. Restated against the theme tokens.
+
+   Scoped through .cm-editor rather than written bare: the library injects its
+   own rules at runtime, and matching its single-class specificity would leave
+   the winner down to insertion order. */
+.cm-editor .cm-foldPlaceholder {
+  padding: 0 5px; margin: 0 2px;
+  background: var(--btn); color: var(--text-muted);
+  border: 1px solid var(--border); border-radius: 3px;
+}
+.cm-editor .cm-foldGutter .cm-gutterElement { cursor: pointer; }
+.cm-editor .cm-foldGutter .cm-gutterElement:hover { color: var(--text); }
+
+.cm-editor .cm-tooltip {
+  background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, .28);
+}
+.cm-editor .cm-tooltip.cm-tooltip-autocomplete > ul {
+  font-family: var(--mono); font-size: 12px; max-height: 220px;
+}
+.cm-editor .cm-tooltip.cm-tooltip-autocomplete > ul > li { padding: 2px 8px; }
+.cm-editor .cm-tooltip.cm-tooltip-autocomplete > ul > li[aria-selected] {
+  background: var(--active); color: var(--text);
+}
+.cm-editor .cm-completionIcon { opacity: .55; }
+/* The matched substring is what tells you why a candidate is in the list. */
+.cm-editor .cm-completionMatchedText { color: var(--accent); text-decoration: none; font-weight: 600; }

@@ -9,7 +9,7 @@
  *  height is constant, which is the only hard part of the general problem.
  */
 import type { DirEntry, StatusEntry } from "../../agent/protocol.ts";
-import { attr, esc, modalPrompt, showMenu } from "./ui.ts";
+import { esc, modalPrompt, showMenu } from "./ui.ts";
 import { fileIcon } from "./file-icons.ts";
 
 const ROW = 22;
@@ -39,7 +39,7 @@ export interface TreeCallbacks {
    *  reusable tab. A double click opens it for keeps. */
   onOpen(path: string, preview: boolean): void;
   onError(message: string): void;
-  confirmDelete(paths: string[]): boolean;
+  confirmDelete(paths: string[]): Promise<boolean>;
   /** Show a diff between two arbitrary files in the workspace. */
   compare(left: string, right: string): void;
   /** Show a file against its committed version. */
@@ -237,7 +237,7 @@ export class FileTree {
     else if (st) cls.push("dec-modified");
     if (n.dir && this.dirtyDirs.has(n.path)) cls.push("dec-dirty");
 
-    return `<div class="${cls.join(" ")}" draggable="true" data-path="${attr(n.path)}" style="padding-left:${4 + n.depth * 12}px">
+    return `<div class="${cls.join(" ")}" draggable="true" data-path="${esc(n.path)}" style="padding-left:${4 + n.depth * 12}px">
       <span class="tree-caret">${n.dir ? (n.expanded ? "▾" : "▸") : ""}</span>
       <span class="tree-icon">${fileIcon(n.name, n.dir)}</span>
       <span class="tree-name">${esc(n.name)}</span>
@@ -508,7 +508,7 @@ export class FileTree {
   }
 
   private async remove(node: TreeNode): Promise<void> {
-    if (node === this.root || !this.cb.confirmDelete([node.path])) return;
+    if (node === this.root || !(await this.cb.confirmDelete([node.path]))) return;
     try {
       await this.ops.remove([node.path]);
       const parent = this.find(dirname(node.path)) ?? this.root;

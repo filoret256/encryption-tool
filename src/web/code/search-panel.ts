@@ -9,7 +9,7 @@
 import type { AgentClient } from "./agent.ts";
 import type { FileRead, SearchHit, SearchSummary } from "../../agent/protocol.ts";
 import { VirtualList } from "./vlist.ts";
-import { esc } from "./ui.ts";
+import { esc, modalConfirm } from "./ui.ts";
 
 export interface SearchCallbacks {
   openAt(path: string, line: number, col: number): void;
@@ -236,7 +236,7 @@ export class SearchPanel {
     if (row.kind === "file") {
       const name = row.path.split("/").pop() ?? row.path;
       const dir = row.path.includes("/") ? row.path.slice(0, row.path.lastIndexOf("/")) : "";
-      return `<div class="sp-file" data-path="${attr(row.path)}" title="${esc(row.path)}">
+      return `<div class="sp-file" data-path="${esc(row.path)}" title="${esc(row.path)}">
         <span class="sp-caret">${this.collapsed.has(row.path) ? "▸" : "▾"}</span>
         <span class="sp-fname">${esc(name)}</span>
         <span class="sp-fdir">${esc(dir)}</span>
@@ -247,7 +247,7 @@ export class SearchPanel {
         </span>
       </div>`;
     }
-    return `<div class="sp-hit" data-path="${attr(row.path)}" data-key="${attr(row.key)}">
+    return `<div class="sp-hit" data-path="${esc(row.path)}" data-key="${esc(row.key)}">
       <span class="sp-lineno">${row.hit.line}</span>
       <span class="sp-text">${hitHtml(row.hit)}</span>
       <span class="sp-acts"><button class="t-icon" data-act="dismiss-hit" title="Dismiss match">✕</button></span>
@@ -285,7 +285,13 @@ export class SearchPanel {
     if (!live.length) return this.cb.toast("nothing to replace", true);
 
     const total = live.reduce((n, [, hits]) => n + hits.reduce((m, h) => m + h.ranges.length, 0), 0);
-    if (!confirm(`Replace ${total} match${total === 1 ? "" : "es"} across ${live.length} file${live.length === 1 ? "" : "s"}?`)) return;
+    const ok = await modalConfirm({
+      title: `Replace ${total} match${total === 1 ? "" : "es"} across ${live.length} file${live.length === 1 ? "" : "s"}?`,
+      detail: "The files are written on disk. Undo works only in files you have open in the editor.",
+      okLabel: "replace all",
+      danger: true,
+    });
+    if (!ok) return;
 
     const single = this.opts.regex ? new RegExp(patternSource(this.$<HTMLInputElement>(".js-query").value, this.opts), this.opts.matchCase ? "" : "i") : null;
     let files = 0;
@@ -338,7 +344,6 @@ export class SearchPanel {
 // ── helpers ───────────────────────────────────────────────────────────────
 
 const hitKey = (path: string, hit: SearchHit): string => `${path}:${hit.line}:${hit.col}`;
-const attr = (s: string): string => esc(s).replace(/"/g, "&quot;");
 
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 

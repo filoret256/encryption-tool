@@ -1,6 +1,6 @@
 /** CodeMirror 6 editor wrapper — one instance per tab. Editor-agnostic API so
  *  main.ts never touches CM internals. Replaces the heavyweight Monaco wrapper. */
-import { Compartment, EditorState, RangeSetBuilder } from "@codemirror/state";
+import { Compartment, EditorState, RangeSetBuilder, type Extension } from "@codemirror/state";
 import {
   Decoration,
   type DecorationSet,
@@ -15,7 +15,16 @@ import {
   WidgetType,
 } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-import { bracketMatching, indentOnInput, syntaxHighlighting, defaultHighlightStyle } from "@codemirror/language";
+import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
+import {
+  bracketMatching,
+  codeFolding,
+  defaultHighlightStyle,
+  foldGutter,
+  foldKeymap,
+  indentOnInput,
+  syntaxHighlighting,
+} from "@codemirror/language";
 import { yaml as yamlLang } from "@codemirror/lang-yaml";
 import { openSearchPanel, search, searchKeymap } from "@codemirror/search";
 import { linter, lintGutter } from "@codemirror/lint";
@@ -27,17 +36,24 @@ export interface ViewPrefs {
   lineNumbers: boolean;
   whitespace: boolean;
   wrap: boolean;
+  fold: boolean;
 }
 
 const PREFS_KEY = "enc-cm-prefs";
 
 function loadPrefs(): Record<Tab, ViewPrefs> {
-  const fallback: Record<Tab, ViewPrefs> = {
-    ansible: { lineNumbers: true, whitespace: false, wrap: false },
-    helm: { lineNumbers: true, whitespace: false, wrap: false },
-  };
+  const defaults: ViewPrefs = { lineNumbers: true, whitespace: false, wrap: false, fold: true };
+  const fallback: Record<Tab, ViewPrefs> = { ansible: { ...defaults }, helm: { ...defaults } };
   try {
-    return { ...fallback, ...JSON.parse(localStorage.getItem(PREFS_KEY) || "{}") };
+    // Merged per tab, not at the top level. A shallow spread replaces each
+    // stored tab object wholesale, so every preference added after someone's
+    // first visit would arrive as undefined for exactly the people who have
+    // been using the app longest.
+    const stored = JSON.parse(localStorage.getItem(PREFS_KEY) || "{}") as Partial<Record<Tab, Partial<ViewPrefs>>>;
+    return {
+      ansible: { ...defaults, ...stored.ansible },
+      helm: { ...defaults, ...stored.helm },
+    };
   } catch {
     return fallback;
   }
@@ -117,6 +133,10 @@ const showEol = ViewPlugin.fromClass(
 // Bundled so the single "ws" toggle reveals spaces, tabs and newlines together.
 const whitespaceView = [highlightWhitespace(), showEol];
 
+// Folding: the gutter arrows, the state field they act on, and the keyboard
+// commands, together — with the toggle off none of the three should be present.
+const foldView = [codeFolding(), foldGutter(), keymap.of(foldKeymap)];
+
 const yamlLinter = linter((view) => yamlDiagnostics(view.state.doc.toString()));
 
 export class TabEditor {
@@ -124,6 +144,7 @@ export class TabEditor {
   private cLine = new Compartment();
   private cWrap = new Compartment();
   private cWs = new Compartment();
+  private cFold = new Compartment();
   private cLint = new Compartment();
   private cHighlight = new Compartment();
   private cDark = new Compartment();
@@ -137,21 +158,25 @@ export class TabEditor {
       state: EditorState.create({
         doc: "",
         extensions: [
-          this.cLine.of(p.lineNumbers ? lineNumbers() : []),
+          this.cLine.of(TabEditor.extensionFor("lineNumbers", p.lineNumbers)),
           history(),
           drawSelection(),
           indentOnInput(),
           bracketMatching(),
+          closeBrackets(),
           yamlLang(),
           this.cHighlight.of(syntaxHighlighting(dark ? oneDarkHighlightStyle : defaultHighlightStyle)),
           this.cDark.of(EditorView.theme({}, { dark })),
           baseTheme,
           cmPlaceholder(placeholderText),
           search(),
-          this.cWs.of(p.whitespace ? whitespaceView : []),
-          this.cWrap.of(p.wrap ? EditorView.lineWrapping : []),
+          this.cWs.of(TabEditor.extensionFor("whitespace", p.whitespace)),
+          this.cWrap.of(TabEditor.extensionFor("wrap", p.wrap)),
+          this.cFold.of(TabEditor.extensionFor("fold", p.fold)),
           this.cLint.of([]),
-          keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
+          // closeBrackets first: it owns Backspace over an auto-inserted pair,
+          // which the default keymap would otherwise take.
+          keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
           EditorView.updateListener.of((u) => {
             if (u.docChanged || u.selectionSet) this.changeCb?.();
           }),
@@ -185,17 +210,33 @@ export class TabEditor {
     this.changeCb = cb;
   }
 
+  /** What a preference switches on. Stated once, so the constructor and the
+   *  toggle cannot drift — which a chain of ternaries in each was inviting. */
+  private static extensionFor(kind: keyof ViewPrefs, on: boolean): Extension {
+    if (!on) return [];
+    switch (kind) {
+      case "lineNumbers":
+        return lineNumbers();
+      case "whitespace":
+        return whitespaceView;
+      case "wrap":
+        return EditorView.lineWrapping;
+      case "fold":
+        return foldView;
+    }
+  }
+
   toggle(kind: keyof ViewPrefs): boolean {
     const p = prefs[this.tab];
     p[kind] = !p[kind];
     savePrefs();
-    const effect =
-      kind === "lineNumbers"
-        ? this.cLine.reconfigure(p.lineNumbers ? lineNumbers() : [])
-        : kind === "whitespace"
-          ? this.cWs.reconfigure(p.whitespace ? whitespaceView : [])
-          : this.cWrap.reconfigure(p.wrap ? EditorView.lineWrapping : []);
-    this.view.dispatch({ effects: effect });
+    const compartment: Record<keyof ViewPrefs, Compartment> = {
+      lineNumbers: this.cLine,
+      whitespace: this.cWs,
+      wrap: this.cWrap,
+      fold: this.cFold,
+    };
+    this.view.dispatch({ effects: compartment[kind].reconfigure(TabEditor.extensionFor(kind, p[kind])) });
     return p[kind];
   }
   isOn(kind: keyof ViewPrefs): boolean {

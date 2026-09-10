@@ -19,12 +19,47 @@ import (
 )
 
 // safeArg rejects option-looking values; everything else git treats as data.
+//
+// Git reads any argument beginning with "-" as an option, and several of those
+// do considerably more than pick a revision: --output=<file> is a diff option,
+// which means `log` and `show` both accept it, and it writes wherever it is
+// pointed — outside the workspace the jail exists to guard. So this is applied
+// in the read operations (git.go) as much as in the writing ones here.
 func safeArg(v, what string) (string, error) {
 	if v == "" || strings.HasPrefix(v, "-") {
 		return "", &gitError{"Invalid " + what + ": " + v}
 	}
 	return v, nil
 }
+
+// safeOptArg is safeArg for a value whose absence is meaningful: "" means "not
+// given" and passes through, anything actually present is checked.
+func safeOptArg(v, what string) (string, error) {
+	if v == "" {
+		return "", nil
+	}
+	return safeArg(v, what)
+}
+
+// oneOfArg accepts one of a fixed set. Used where the value is not data but a
+// choice — a reset mode, a rebase action — and the legitimate answers are known
+// and few. Rejecting a leading "-" is not enough there, because the value is
+// concatenated into the flag itself.
+func oneOfArg(v string, allowed []string, what string) (string, error) {
+	for _, a := range allowed {
+		if a == v {
+			return v, nil
+		}
+	}
+	return "", &gitError{"Invalid " + what + ": " + v}
+}
+
+var (
+	resetModes    = []string{"soft", "mixed", "hard"}
+	rebaseActions = []string{"start", "continue", "abort", "skip"}
+	stashActions  = []string{"push", "pop", "apply", "drop", "list", "clear"}
+	remoteActions = []string{"fetch", "pull", "push"}
+)
 
 func safeArgs(vs []string, what string) ([]string, error) {
 	out := make([]string, 0, len(vs))
@@ -144,12 +179,18 @@ func gitBranchRename(ctx context.Context, cwd, from, to string) (any, error) {
 	return gitOut(ctx, cwd, "branch", "-m", f, t)
 }
 
+// The mode is concatenated into the flag, so it is checked against the list
+// rather than merely screened for a leading "-".
 func gitReset(ctx context.Context, cwd, oid, mode string) (any, error) {
+	m, err := oneOfArg(mode, resetModes, "reset mode")
+	if err != nil {
+		return nil, err
+	}
 	o, err := safeArg(oid, "commit")
 	if err != nil {
 		return nil, err
 	}
-	return gitOut(ctx, cwd, "reset", "--"+mode, o)
+	return gitOut(ctx, cwd, "reset", "--"+m, o)
 }
 
 func gitRevert(ctx context.Context, cwd, oid string) (any, error) {
@@ -211,15 +252,19 @@ func gitMergeAbort(ctx context.Context, cwd string) (any, error) {
 }
 
 func gitRebase(ctx context.Context, cwd, action, ref string) (any, error) {
+	a, err := oneOfArg(action, rebaseActions, "rebase action")
+	if err != nil {
+		return nil, err
+	}
 	var args []string
-	if action == "start" {
+	if a == "start" {
 		r, err := safeArg(ref, "ref")
 		if err != nil {
 			return nil, err
 		}
 		args = []string{"git", "rebase", r}
 	} else {
-		args = []string{"git", "rebase", "--" + action}
+		args = []string{"git", "rebase", "--" + a}
 	}
 
 	res, err := run(ctx, args, cwd)
@@ -239,6 +284,12 @@ func gitRebase(ctx context.Context, cwd, action, ref string) (any, error) {
 // ── stash ─────────────────────────────────────────────────────────────────
 
 func gitStash(ctx context.Context, cwd, action, message, ref string) (any, error) {
+	// The default branch passes the action through as a git subcommand, so this
+	// is a fixed list rather than a type assertion the wire never honoured.
+	action, err := oneOfArg(action, stashActions, "stash action")
+	if err != nil {
+		return nil, err
+	}
 	switch action {
 	case "push":
 		args := []string{"stash", "push", "--include-untracked"}
@@ -275,6 +326,11 @@ type remoteOpts struct {
 // gitRemote streams fetch/pull/push progress, which git writes to stderr, so
 // the UI shows a live log instead of freezing until the transfer ends.
 func gitRemote(ctx context.Context, cwd, action string, o remoteOpts, onProgress func(string)) (any, error) {
+	// The action is the git subcommand itself, so it comes off a list.
+	action, err := oneOfArg(action, remoteActions, "remote action")
+	if err != nil {
+		return nil, err
+	}
 	args := []string{"git", action, "--progress"}
 	if action == "fetch" {
 		args = append(args, "--prune")
@@ -287,7 +343,7 @@ func gitRemote(ctx context.Context, cwd, action string, o remoteOpts, onProgress
 		args = append(args, "--force-with-lease")
 	}
 	if o.remote != "" {
-		r, err := safeArg(o.remote, "remote")
+		r, err := knownRemote(ctx, cwd, o.remote)
 		if err != nil {
 			return nil, err
 		}
@@ -325,19 +381,20 @@ func gitRemote(ctx context.Context, cwd, action string, o remoteOpts, onProgress
 
 var remoteLine = regexp.MustCompile(`^(\S+)\s+(\S+)\s+\(fetch\)$`)
 
-func gitRemotes(ctx context.Context, cwd string) (any, error) {
+type remoteEntry struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+func remoteList(ctx context.Context, cwd string) ([]remoteEntry, error) {
 	out, err := gitOut(ctx, cwd, "remote", "-v")
 	if err != nil {
 		return nil, err
 	}
-	type entry struct {
-		Name string `json:"name"`
-		URL  string `json:"url"`
-	}
 	// Keyed by name, last one wins, insertion order preserved — the same shape
 	// the TypeScript agent gets from a Map.
 	at := map[string]int{}
-	list := []entry{}
+	list := []remoteEntry{}
 	for _, line := range strings.Split(out, "\n") {
 		if m := remoteLine.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
 			if i, ok := at[m[1]]; ok {
@@ -345,10 +402,38 @@ func gitRemotes(ctx context.Context, cwd string) (any, error) {
 				continue
 			}
 			at[m[1]] = len(list)
-			list = append(list, entry{Name: m[1], URL: m[2]})
+			list = append(list, remoteEntry{Name: m[1], URL: m[2]})
 		}
 	}
 	return list, nil
+}
+
+func gitRemotes(ctx context.Context, cwd string) (any, error) {
+	return remoteList(ctx, cwd)
+}
+
+// knownRemote resolves a remote *name*, and only a name.
+//
+// Git reads the <repository> argument as a URL whenever it is not a configured
+// remote, so an unchecked value here is `git push https://…  HEAD` — the user's
+// repository handed to whoever asked for it, and `git fetch` pulling back
+// whatever they choose to serve. Screening for a leading "-" does not catch
+// that; being on the repository's own remote list does.
+func knownRemote(ctx context.Context, cwd, name string) (string, error) {
+	wanted, err := safeArg(name, "remote")
+	if err != nil {
+		return "", err
+	}
+	known, err := remoteList(ctx, cwd)
+	if err != nil {
+		return "", err
+	}
+	for _, r := range known {
+		if r.Name == wanted {
+			return wanted, nil
+		}
+	}
+	return "", &gitError{"Unknown remote: " + wanted}
 }
 
 // gitIdentity surfaces the check the UI runs before showing the commit box —
