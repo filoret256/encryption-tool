@@ -3,6 +3,8 @@ import "./style.css";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { TabEditor, type Tab, type ViewPrefs } from "./editor.ts";
 import { yamlDiagnostics } from "./yaml-lint.ts";
+import { prefersDark, rememberTheme, watchSystemTheme } from "./theme.ts";
+import { mountNotifier, type Notice } from "./notify.ts";
 import { ansible, helm } from "../crypto/index.ts";
 import { AgentClient } from "./code/agent.ts";
 import { mountBadge } from "./code/caps.ts";
@@ -25,12 +27,19 @@ let codeTab: CodeTab | null = null;
 let refreshBadge: (() => void) | null = null;
 let agentDownload: AgentDownload | null = null;
 
-// ── Toast ──
+// ── Notifications ──
+// A stack, not a slot: see notify.ts for why an error may not expire on a
+// timer and why "saved" must not erase what git just said.
+const notifier = mountNotifier(document.getElementById("toasts")!);
+
 function toast(msg: string, isError = false): void {
-  const el = document.getElementById("toast")!;
-  el.textContent = msg;
-  el.className = "toast show" + (isError ? " error" : "");
-  setTimeout(() => (el.className = "toast"), 2200);
+  notifier.show({ message: msg, isError });
+}
+
+/** The richer form, used by the code tab: a one-line summary plus a way into
+ *  the output log for whatever did not fit. */
+function notify(notice: Notice): void {
+  notifier.show(notice);
 }
 
 // ── Crypto ──
@@ -169,17 +178,16 @@ function toggleView(tab: Tab, kind: keyof ViewPrefs, btnId: string): void {
 }
 
 // ── Theme ──
-function applyTheme(dark: boolean): void {
+/** `remember` separates "the user picked this" from "the system moved": only a
+ *  press of the toggle writes a choice down, and only a written choice stops
+ *  the app from following the desktop (see theme.ts). */
+function applyTheme(dark: boolean, remember = true): void {
   isDark = dark;
   // The toggle visuals (track colour + knob slide) are driven by this attribute.
   document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
   Object.values(editors).forEach((e) => e.setTheme(dark));
   codeTab?.setTheme(dark);
-  try {
-    localStorage.setItem("enc-theme", dark ? "dark" : "light");
-  } catch {
-    /* ignore */
-  }
+  if (remember) rememberTheme(dark);
 }
 
 // ── Tabs ──
@@ -219,7 +227,8 @@ async function openCodeTab(): Promise<void> {
       codeTab = mod.mountCodeTab(host, {
         agent,
         isDark: () => isDark,
-        toast,
+        notify,
+        dismissNotices: () => notifier.dismissAll(),
         onCapsChanged: () => refreshBadge?.(),
       });
       codeTab.setTheme(isDark);
@@ -353,7 +362,10 @@ function init(): void {
     updateStats(tab);
   }
 
-  applyTheme(localStorage.getItem("enc-theme") === "dark");
+  applyTheme(prefersDark(), false);
+  // No choice written down yet: the desktop stays in charge for as long as that
+  // is true, so switching the system theme moves an open tab with it.
+  watchSystemTheme((dark) => applyTheme(dark, false));
 
   // Chromium fires this instead of showing its own install affordance; hold on
   // to it so the capability popover can offer installation at a sensible moment.

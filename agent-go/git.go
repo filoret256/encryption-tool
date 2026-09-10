@@ -210,10 +210,19 @@ func gitLog(ctx context.Context, cwd string, o logOpts) ([]commit, error) {
 
 var remoteHead = regexp.MustCompile(`^refs/remotes/[^/]+/HEAD$`)
 
+// %(upstream:track) reads "[ahead 1, behind 2]"; either half may be absent.
+var (
+	aheadRe  = regexp.MustCompile(`ahead (\d+)`)
+	behindRe = regexp.MustCompile(`behind (\d+)`)
+)
+
 func gitBranches(ctx context.Context, cwd string) ([]branch, error) {
+	// upstream:track prints "[ahead 1, behind 2]", "[gone]" or nothing;
+	// creatordate rather than committerdate because it is also defined for
+	// annotated tag objects, which have no committer.
 	out, err := gitOut(ctx, cwd, "for-each-ref",
-		"--format=%(refname)%00%(objectname)%00%(upstream:short)%00%(HEAD)",
-		"refs/heads", "refs/remotes")
+		"--format=%(refname)%00%(objectname)%00%(upstream:short)%00%(HEAD)%00%(upstream:track)%00%(creatordate:unix)",
+		"refs/heads", "refs/remotes", "refs/tags")
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +238,7 @@ func gitBranches(ctx context.Context, cwd string) ([]branch, error) {
 			continue
 		}
 		name := ref
-		for _, prefix := range []string{"refs/heads/", "refs/remotes/"} {
+		for _, prefix := range []string{"refs/heads/", "refs/remotes/", "refs/tags/"} {
 			if strings.HasPrefix(name, prefix) {
 				name = name[len(prefix):]
 				break
@@ -239,6 +248,14 @@ func gitBranches(ctx context.Context, cwd string) ([]branch, error) {
 		if u := field(p, 2); u != "" {
 			up = strPtr(u)
 		}
+		ahead, behind := 0, 0
+		if m := aheadRe.FindStringSubmatch(field(p, 4)); m != nil {
+			ahead, _ = strconv.Atoi(m[1])
+		}
+		if m := behindRe.FindStringSubmatch(field(p, 4)); m != nil {
+			behind, _ = strconv.Atoi(m[1])
+		}
+		when, _ := strconv.ParseInt(field(p, 5), 10, 64)
 		list = append(list, branch{
 			Ref:      ref,
 			Name:     name,
@@ -246,6 +263,10 @@ func gitBranches(ctx context.Context, cwd string) ([]branch, error) {
 			Upstream: up,
 			Remote:   strings.HasPrefix(ref, "refs/remotes/"),
 			Head:     strings.TrimSpace(field(p, 3)) == "*",
+			Tag:      strings.HasPrefix(ref, "refs/tags/"),
+			Ahead:    ahead,
+			Behind:   behind,
+			Time:     when,
 		})
 	}
 	return list, nil

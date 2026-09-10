@@ -46,11 +46,15 @@ const sw = self as unknown as ServiceWorkerScope;
 
 const CACHE = `enc-tool-v${VERSION}`;
 
+// What a visitor needs before they have asked for anything. code.js is not on
+// this list on purpose: it is the largest asset in the app and it belongs to
+// one of three tabs, so precaching it made everyone who came to decrypt a
+// string pay for the editor. It is cached the same way as everything else the
+// moment the code tab is opened — see the fetch handler below.
 const SHELL = [
   "/",
   "/public/main.js",
   "/public/main.css",
-  "/public/code.js",
   "/manifest.webmanifest",
   "/public/icon-192.png",
   "/public/icon-512.png",
@@ -98,6 +102,13 @@ sw.addEventListener("fetch", (event) => {
   }
 });
 
+/** Assets now travel compressed, so they carry `Vary: accept-encoding`, and a
+ *  lookup that honours Vary can miss a body the cache is holding — the stored
+ *  request and the new one would have to agree header for header. Everything
+ *  here is keyed by URL and kept in exactly one copy, so the header plays no
+ *  part in finding it. */
+const MATCH: CacheQueryOptions = { ignoreVary: true };
+
 /** Fresh when possible, the cached copy when offline.
  *
  *  Navigations are stored under "/" so any route falls back to the one shell we
@@ -110,14 +121,14 @@ async function networkFirst(req: Request): Promise<Response> {
     if (res.ok) void cache.put(key, res.clone());
     return res;
   } catch {
-    return (await cache.match(key)) ?? new Response("Offline", { status: 503, statusText: "Offline" });
+    return (await cache.match(key, MATCH)) ?? new Response("Offline", { status: 503, statusText: "Offline" });
   }
 }
 
 /** Assets: serve what we have immediately, refresh it in the background. */
 async function staleWhileRevalidate(req: Request): Promise<Response> {
   const cache = await caches.open(CACHE);
-  const cached = await cache.match(req);
+  const cached = await cache.match(req, MATCH);
   const fresh = fetch(req)
     .then((res) => {
       if (res.ok) void cache.put(req, res.clone());

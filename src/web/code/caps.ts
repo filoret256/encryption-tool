@@ -71,9 +71,14 @@ const ROWS: Row[] = [
     fix: (agent) =>
       `The agent is ${agent.info?.version ?? "an unknown version"}, this app is ${VERSION}. Download the current one from "get agent" on the code tab.`,
   },
-  { key: "git", label: "git", fix: "Install git and restart the agent — version control is unavailable without it." },
-  { key: "ripgrep", label: "ripgrep", fix: "Optional. Without it project search uses a slower built-in scan." },
-  { key: "watch", label: "live file watching", fix: "Unavailable on this platform — refresh the tree manually after external changes." },
+  // These three are properties of the machine the agent runs on, so with no
+  // agent connected the honest answer is "we have not asked yet" — not "✗".
+  // The badge used to tell people to install git on a machine that had it and
+  // declare file watching unavailable on a platform that supports it, purely
+  // because a socket was down.
+  { key: "git", label: "git", needsAgent: true, fix: "Install git and restart the agent — version control is unavailable without it." },
+  { key: "ripgrep", label: "ripgrep", needsAgent: true, fix: "Optional. Without it project search uses a slower built-in scan." },
+  { key: "watch", label: "live file watching", needsAgent: true, fix: "Unavailable on this platform — refresh the tree manually after external changes." },
   { key: "secure", label: "secure context", fix: "Serve the app over HTTPS; without it the service worker cannot install." },
   { key: "installed", label: "installed as an app", fix: "Optional. Install from the browser menu for a standalone window." },
 ];
@@ -153,9 +158,7 @@ export function mountBadge(host: HTMLElement, agent: AgentClient, onConnect: () 
 
     pop.innerHTML = `
       <div class="cap-head">${esc(headline(status, agent.lastError))}</div>
-      <ul class="cap-list">${ROWS.filter((r) => !r.needsAgent || caps.agent)
-        .map((r) => row(r, caps, agent))
-        .join("")}</ul>
+      <ul class="cap-list">${ROWS.map((r) => row(r, caps, agent, !r.needsAgent || caps.agent)).join("")}</ul>
       ${status === "online" ? "" : `<button class="t-btn cap-connect" type="button">connect to agent…</button>`}
       ${pwa?.canInstall() ? `<button class="t-btn cap-install" type="button">install as an app</button>` : ""}`;
 
@@ -182,7 +185,16 @@ function headline(status: string, error: string): string {
   }
 }
 
-function row(r: Row, caps: Caps, agent: AgentClient): string {
+function row(r: Row, caps: Caps, agent: AgentClient, known: boolean): string {
+  // Three states, not two. "?" is not a failure and carries no advice — there
+  // is nothing to advise about a machine nobody has spoken to.
+  if (!known) {
+    return `<li class="unknown">
+      <span class="cap-mark">?</span>
+      <span class="cap-label">${esc(r.label)}</span>
+      <span class="cap-fix">Unknown until an agent is connected.</span>
+    </li>`;
+  }
   const on = Boolean(caps[r.key]);
   const fix = typeof r.fix === "function" ? r.fix(agent) : r.fix;
   return `<li class="${on ? "on" : "off"}">

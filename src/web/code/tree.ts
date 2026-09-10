@@ -9,7 +9,7 @@
  *  height is constant, which is the only hard part of the general problem.
  */
 import type { DirEntry, StatusEntry } from "../../agent/protocol.ts";
-import { esc, modalPrompt, showMenu, ROW_H } from "./ui.ts";
+import { copyToClipboard, esc, modalPrompt, showMenu, ROW_H, type MenuItem } from "./ui.ts";
 import { fileIcon } from "./file-icons.ts";
 
 const ROW = ROW_H;
@@ -39,6 +39,13 @@ export interface TreeCallbacks {
    *  reusable tab. A double click opens it for keeps. */
   onOpen(path: string, preview: boolean): void;
   onError(message: string): void;
+  /** Says an action went through — used where the result is invisible, such as
+   *  a copy to the clipboard. */
+  notify(message: string, isError?: boolean): void;
+  /** Absolute path of the folder the agent is serving, for "copy absolute
+   *  path". Null while nothing is connected, in which case only the
+   *  repository-relative path can be offered. */
+  workspaceRoot(): string | null;
   confirmDelete(paths: string[]): Promise<boolean>;
   /** Show a diff between two arbitrary files in the workspace. */
   compare(left: string, right: string): void;
@@ -53,6 +60,14 @@ export class FileTree {
   private root: TreeNode = { path: "", name: "", dir: true, depth: -1, expanded: true, loaded: false, children: [] };
   private rows: TreeNode[] = [];
   private selected = "";
+  /** Everything selected, including `selected` itself, which is the anchor a
+   *  Shift-click ranges from. Bulk delete and drag act on this. */
+  private marked = new Set<string>();
+  /** Name filter. Rows that do not match are hidden; their parents stay so the
+   *  match keeps its context. */
+  private filter = "";
+  private readonly filterBox: HTMLElement;
+  private readonly filterInput: HTMLInputElement;
   /** Path being dragged, and the directory currently highlighted as its target. */
   private dragging: string | null = null;
   private dropTarget: string | null = null;
@@ -79,7 +94,27 @@ export class FileTree {
     private readonly cb: TreeCallbacks,
   ) {
     host.classList.add("tree");
-    host.innerHTML = `<div class="tree-viewport"><div class="tree-spacer"></div><div class="tree-layer"></div></div>`;
+    host.innerHTML = `<div class="tree-filter" hidden>
+        <input class="t-input js-tree-filter" placeholder="filter by name" autocomplete="off" spellcheck="false"
+               aria-label="Filter the explorer by name" />
+        <button class="t-icon js-tree-filter-clear" type="button" aria-label="Clear the filter">✕</button>
+      </div>
+      <div class="tree-viewport"><div class="tree-spacer"></div><div class="tree-layer"></div></div>`;
+    this.filterBox = host.querySelector(".tree-filter")!;
+    this.filterInput = host.querySelector(".js-tree-filter")!;
+    this.filterInput.addEventListener("input", () => {
+      this.filter = this.filterInput.value.trim().toLowerCase();
+      this.rebuild();
+    });
+    this.filterInput.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") this.clearFilter();
+      // Down arrow hands the keyboard to the list without losing the filter.
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        this.viewport.focus();
+      }
+    });
+    host.querySelector(".js-tree-filter-clear")!.addEventListener("click", () => this.clearFilter());
     this.viewport = host.querySelector(".tree-viewport")!;
     this.spacer = host.querySelector(".tree-spacer")!;
     this.layer = host.querySelector(".tree-layer")!;
@@ -196,14 +231,77 @@ export class FileTree {
 
   private rebuild(): void {
     this.rows = [];
+    const needle = this.filter;
+
+    // With a filter on, a directory earns its place by containing a match —
+    // otherwise filtering a tree either hides the matches (their parents are
+    // gone) or shows everything (the parents match nothing).
+    const keep = (n: TreeNode): boolean => {
+      if (!needle) return true;
+      if (n.name.toLowerCase().includes(needle)) return true;
+      return n.dir && n.children.some(keep);
+    };
+
     const walk = (n: TreeNode): void => {
       for (const c of n.children) {
+        if (!keep(c)) continue;
         this.rows.push(c);
-        if (c.dir && c.expanded) walk(c);
+        // A filter expands what it matches inside: the point is to see the
+        // hits, not to be told a folder somewhere below has one.
+        if (c.dir && (c.expanded || (needle && c.loaded))) walk(c);
       }
     };
     walk(this.root);
     this.spacer.style.height = `${this.rows.length * ROW}px`;
+    this.paint();
+  }
+
+  /** Open the filter field. */
+  focusFilter(): void {
+    this.filterBox.hidden = false;
+    this.filterInput.focus();
+    this.filterInput.select();
+  }
+
+  private clearFilter(): void {
+    this.filter = "";
+    this.filterInput.value = "";
+    this.filterBox.hidden = true;
+    this.rebuild();
+    this.viewport.focus();
+  }
+
+  /** Fold everything shut. The root stays open — it is the tree. */
+  collapseAll(): void {
+    const walk = (n: TreeNode): void => {
+      for (const c of n.children) {
+        if (!c.dir) continue;
+        c.expanded = false;
+        walk(c);
+      }
+    };
+    walk(this.root);
+    this.rebuild();
+  }
+
+  /** Show a path in the tree: expand what it takes to get there, select it,
+   *  and scroll it into view. Used by "reveal the open file", because a file
+   *  opened from search or from the change list was invisible in the explorer
+   *  until someone found it by hand. */
+  async reveal(path: string): Promise<void> {
+    const parts = path.split("/");
+    let node: TreeNode | null = this.root;
+    for (let i = 0; i < parts.length - 1 && node; i++) {
+      const dir: TreeNode | undefined = node.children.find((c) => c.name === parts[i] && c.dir);
+      if (!dir) break;
+      if (!dir.loaded || !dir.expanded) await this.expand(dir);
+      node = dir;
+    }
+    this.rebuild();
+    const at = this.rows.findIndex((n) => n.path === path);
+    if (at === -1) return;
+    this.select(path);
+    this.scrollTo(at);
     this.paint();
   }
 
@@ -235,7 +333,7 @@ export class FileTree {
     const st = this.status.get(n.path);
     const mark = n.dir ? (this.dirtyDirs.has(n.path) ? "•" : "") : statusLetter(st);
     const cls = ["tree-row"];
-    if (n.path === this.selected) cls.push("sel");
+    if (this.marked.has(n.path)) cls.push("sel");
     if (n.path === this.dropTarget) cls.push("drop-into");
     if (st?.conflict) cls.push("dec-conflict");
     else if (st?.untracked) cls.push("dec-untracked");
@@ -267,6 +365,20 @@ export class FileTree {
 
     const node = this.nodeFromEvent(e);
     if (!node) return;
+
+    // Ctrl and Shift extend the selection instead of opening anything: with
+    // several rows marked, the next Delete or drag acts on all of them. Without
+    // this, removing twenty generated files meant twenty confirmations.
+    if (e.ctrlKey || e.metaKey || e.shiftKey) {
+      if (e.shiftKey) this.markRange(node.path);
+      else this.toggleMark(node.path);
+      for (const el of this.layer.querySelectorAll<HTMLElement>(".tree-row")) {
+        el.classList.toggle("sel", this.marked.has(el.dataset.path ?? ""));
+      }
+      this.viewport.focus();
+      return;
+    }
+
     this.setSelected(node.path);
     if (!node.dir) {
       this.cb.onOpen(node.path, true);
@@ -301,10 +413,38 @@ export class FileTree {
    *  first press meant a double click in the tree could never be seen at all.
    *  Selection is one class; toggle it where it is. */
   private setSelected(path: string): void {
-    this.selected = path;
+    this.select(path);
     for (const el of this.layer.querySelectorAll<HTMLElement>(".tree-row")) {
-      el.classList.toggle("sel", el.dataset.path === path);
+      el.classList.toggle("sel", this.marked.has(el.dataset.path ?? ""));
     }
+  }
+
+  /** Replace the selection with one row. */
+  private select(path: string): void {
+    this.selected = path;
+    this.marked = new Set([path]);
+  }
+
+  /** Ctrl-click: add or remove one row without disturbing the rest. */
+  private toggleMark(path: string): void {
+    if (this.marked.has(path) && this.marked.size > 1) this.marked.delete(path);
+    else this.marked.add(path);
+    this.selected = path;
+  }
+
+  /** Shift-click: everything between the anchor and here, as displayed. */
+  private markRange(path: string): void {
+    const from = this.rows.findIndex((n) => n.path === this.selected);
+    const to = this.rows.findIndex((n) => n.path === path);
+    if (from === -1 || to === -1) return this.select(path);
+    const [lo, hi] = from < to ? [from, to] : [to, from];
+    this.marked = new Set(this.rows.slice(lo, hi + 1).map((n) => n.path));
+  }
+
+  /** What a bulk action applies to, in the order the tree shows them. */
+  private selection(): string[] {
+    const order = new Map(this.rows.map((n, i) => [n.path, i]));
+    return [...this.marked].sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0));
   }
 
   /** Where a drop would land: into a directory, or into a file's parent. */
@@ -448,32 +588,59 @@ export class FileTree {
     this.paint();
 
     const target = node.dir ? node : this.find(dirname(node.path)) ?? this.root;
-    const items: [string, () => void][] = [
-      ["New file", () => void this.create(target, false)],
-      ["New folder", () => void this.create(target, true)],
+    const items: MenuItem[] = [
+      { label: "New file", run: () => void this.create(target, false) },
+      { label: "New folder", run: () => void this.create(target, true) },
     ];
 
     if (node !== this.root) {
-      items.push(["Rename", () => void this.rename(node)], ["Delete", () => void this.remove(node)]);
+      // Both keys already work on the focused row; the menu is where people
+      // find that out. Delete is separated and marked, so it cannot be reached
+      // by a hand aiming at Rename.
+      items.push(
+        { label: "Rename", hint: "F2", run: () => void this.rename(node), separated: true },
+        { label: "Delete", hint: "Del", run: () => void this.remove(node), danger: true },
+      );
     }
-    items.push(["Copy path", () => void navigator.clipboard?.writeText(node.path)]);
+    // Two paths, because the two are wanted for different things: the relative
+    // one goes into a commit message, a review comment or a glob; the absolute
+    // one goes into a terminal on this machine. Guessing which was meant is
+    // what made "Copy path" quietly useless half the time.
+    items.push({ label: "Copy path", run: () => void copyToClipboard(node.path, "Path", this.cb.notify), separated: true });
+    const root = this.cb.workspaceRoot();
+    if (root) {
+      const sep = root.includes("\\") ? "\\" : "/";
+      const absolute = root.replace(/[\\/]$/, "") + sep + node.path.split("/").join(sep);
+      items.push({ label: "Copy absolute path", run: () => void copyToClipboard(absolute, "Absolute path", this.cb.notify) });
+    }
 
     // Comparison is a two-step pick, the way VS Code does it: mark one file,
     // then choose the other. Only offered for files.
     if (!node.dir) {
-      items.push(["Compare with HEAD", () => this.cb.compareWithHead(node.path)]);
+      items.push({ label: "Compare with HEAD", run: () => this.cb.compareWithHead(node.path), separated: true });
       if (this.compareBase && this.compareBase !== node.path) {
         const base = this.compareBase;
-        items.push([`Compare with "${base.split("/").pop()}"`, () => this.cb.compare(base, node.path)]);
+        items.push({ label: `Compare with "${base.split("/").pop()}"`, run: () => this.cb.compare(base, node.path) });
       }
-      items.push([
-        this.compareBase === node.path ? "✓ Selected for compare" : "Select for compare",
-        () => {
+      items.push({
+        label: this.compareBase === node.path ? "✓ Selected for compare" : "Select for compare",
+        run: () => {
           this.compareBase = this.compareBase === node.path ? null : node.path;
         },
-      ]);
+      });
     }
-    showMenu(e.clientX, e.clientY, items);
+
+    // Shift+F10 and the Menu key raise a contextmenu event with no useful
+    // coordinates (0,0 in Chromium), so a keyboard user would get the menu in
+    // the corner of the window. Put it on the row instead.
+    const row = (e.target as HTMLElement).closest?.(".tree-row") as HTMLElement | null;
+    const anchor = row?.getBoundingClientRect();
+    const fromKeyboard = e.clientX === 0 && e.clientY === 0;
+    showMenu(
+      fromKeyboard && anchor ? anchor.left + 12 : e.clientX,
+      fromKeyboard && anchor ? anchor.bottom : e.clientY,
+      items,
+    );
   }
 
   /** Toolbar entry point: create inside the selection, or inside its parent
@@ -513,11 +680,21 @@ export class FileTree {
   }
 
   private async remove(node: TreeNode): Promise<void> {
-    if (node === this.root || !(await this.cb.confirmDelete([node.path]))) return;
+    if (node === this.root) return;
+    // Everything marked goes, not just the row under the cursor — but only if
+    // that row is part of the selection. Right-clicking outside a selection
+    // means "this one", the way every file manager behaves.
+    const paths = this.marked.has(node.path) ? this.selection().filter(Boolean) : [node.path];
+    if (!paths.length || !(await this.cb.confirmDelete(paths))) return;
     try {
-      await this.ops.remove([node.path]);
-      const parent = this.find(dirname(node.path)) ?? this.root;
-      await this.expand(parent, true);
+      await this.ops.remove(paths);
+      // One reload per affected directory rather than per file.
+      for (const dir of new Set(paths.map(dirname))) {
+        const parent = this.find(dir) ?? this.root;
+        if (parent.expanded) await this.expand(parent, true);
+      }
+      this.marked = new Set();
+      this.rebuild();
     } catch (e) {
       this.cb.onError(e instanceof Error ? e.message : String(e));
     }

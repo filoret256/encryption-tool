@@ -126,6 +126,14 @@ type branch struct {
 	Upstream *string `json:"upstream"`
 	Remote   bool    `json:"remote"`
 	Head     bool    `json:"head"`
+	// refs/tags/… — a fixed point rather than something you commit onto.
+	Tag bool `json:"tag"`
+	// Commits this branch has that its upstream does not, and the other way
+	// round. Both 0 when there is no upstream to compare against.
+	Ahead  int `json:"ahead"`
+	Behind int `json:"behind"`
+	// When the ref last moved, in unix seconds.
+	Time int64 `json:"time"`
 }
 
 // A pair of texts for @codemirror/merge. Before/After are null when the file

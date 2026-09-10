@@ -64,10 +64,23 @@ const EXTRA: Record<string, Entry> = {
   ".lock": { icon: "lock", colorVar: "grey" },
 };
 
+/** Keys the theme does map, where we deliberately map them elsewhere. Also
+ *  Seti's artwork; only the pairing is ours, and each one needs a reason.
+ *
+ *  .yml/.yaml: Seti draws these as an exclamation mark, and this app puts a
+ *  state letter at the other end of the same row — where "!" means "merge
+ *  conflict". In a directory of nothing but YAML, which is the normal case for
+ *  the people this tool is built for, the explorer read as a list of files in
+ *  trouble. The gear says "configuration", which is what these files are. */
+const OVERRIDE: Record<string, Entry> = {
+  ".yml": { icon: "config", colorVar: "purple" },
+  ".yaml": { icon: "config", colorVar: "purple" },
+};
+
 const missing: string[] = [];
 const chosen = new Map<string, Entry>();
 for (const key of WANTED) {
-  const hit = byKey.get(key.toLowerCase()) ?? EXTRA[key.toLowerCase()];
+  const hit = OVERRIDE[key.toLowerCase()] ?? byKey.get(key.toLowerCase()) ?? EXTRA[key.toLowerCase()];
   if (hit) chosen.set(key, hit);
   else missing.push(key);
 }

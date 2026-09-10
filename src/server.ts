@@ -1,7 +1,8 @@
 /** Bun HTTP server — replaces the Flask app. Stateless crypto endpoints, the
  *  static frontend, and the download point for prebuilt local agents. */
 import { join } from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import { brotliCompressSync, constants as zlibConstants, gzipSync } from "node:zlib";
 import { helm, ansible } from "./crypto/index.ts";
 import { VERSION } from "./version.ts";
 import { AGENT_PORT_RANGE } from "./ports.ts";
@@ -217,6 +218,14 @@ const ROUTES: Record<string, CryptoFn> = {
 
 const IMMUTABLE = "public, max-age=604800";
 
+/** What the bundles say when their name cannot change.
+ *
+ *  main.js and code.js keep fixed names — the compiled binary embeds them by
+ *  path — so they can never be `immutable`. `no-cache` is not "do not cache":
+ *  it stores the response and revalidates it, which with the ETag below turns
+ *  every repeat visit into a 304 with no body instead of a fresh megabyte. */
+const REVALIDATE = "no-cache";
+
 const STATIC: Record<string, { path: string; type: string; cache?: string }> = {
   "/public/main.js": { path: mainJs, type: "text/javascript" },
   "/public/main.css": { path: mainCss, type: "text/css" },
@@ -230,6 +239,127 @@ const STATIC: Record<string, { path: string; type: string; cache?: string }> = {
   "/public/icon-maskable-512.png": { path: iconMaskable, type: "image/png", cache: IMMUTABLE },
   "/public/apple-touch-icon.png": { path: appleIcon, type: "image/png", cache: IMMUTABLE },
 };
+
+// ── static assets: compressed once, then revalidated ──────────────────────
+//
+// The bundles are the whole payload of this app — main.js is half a megabyte
+// and code.js over a megabyte — and they used to go out raw, with no validator
+// and no cache directive, on every single load. Two things fix that, and both
+// belong here rather than in the build: the compressed copies would otherwise
+// have to be produced by `bun run build`, imported by name so `--compile`
+// embeds them, and kept in step with the originals by hand.
+//
+// Compression happens on the first request for an asset and is kept in memory.
+// Measured on this bundle set: brotli q9 turns code.js into 365 KB in 55 ms,
+// gzip -9 into 395 KB in 21 ms — once per process, against ~1.2 MB saved on
+// every request after it. q11 was rejected deliberately: 45 KB better, 1.4 s
+// of blocked event loop.
+//
+// The ETag is what makes `no-cache` cheap: the browser asks, the server answers
+// 304 with no body. It is a hash of the bytes, so a rebuild changes it and a
+// restart does not — which matters because the two are not the same event here.
+const MIN_COMPRESS = 1024;
+const COMPRESSIBLE = /^(?:text\/|application\/(?:javascript|json|manifest\+json))/;
+
+interface Encoded {
+  /** Held as an ArrayBuffer rather than the Uint8Array the compressor returns:
+   *  a view can sit inside a larger pooled buffer, and `new Response(view)` is
+   *  also not typed as a body across TypeScript's DOM libs. Detached once here,
+   *  never per request. */
+  body: ArrayBuffer;
+  etag: string;
+}
+
+const detach = (bytes: Uint8Array): ArrayBuffer =>
+  bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+interface Prepared {
+  /** Identity of the file on disk when this was built, so a dev rebuild of
+   *  public/ is picked up without restarting the server. */
+  stamp: string;
+  identity: Encoded;
+  br?: Encoded;
+  gzip?: Encoded;
+}
+
+const prepared = new Map<string, Promise<Prepared>>();
+
+async function prepareAsset(pathname: string, asset: { path: string; type: string }): Promise<Prepared> {
+  const file = Bun.file(asset.path);
+  const stamp = `${file.size}:${file.lastModified}`;
+  const current = prepared.get(pathname);
+  if (current && (await current).stamp === stamp) return current;
+
+  const build = (async (): Promise<Prepared> => {
+    const raw = await file.arrayBuffer();
+    const bytes = new Uint8Array(raw);
+    const digest = createHash("sha256").update(bytes).digest("base64url").slice(0, 22);
+    const out: Prepared = { stamp, identity: { body: raw, etag: `"${digest}"` } };
+    if (COMPRESSIBLE.test(asset.type) && bytes.length >= MIN_COMPRESS) {
+      out.br = {
+        body: detach(
+          brotliCompressSync(bytes, {
+            params: {
+              [zlibConstants.BROTLI_PARAM_QUALITY]: 9,
+              [zlibConstants.BROTLI_PARAM_SIZE_HINT]: bytes.length,
+            },
+          }),
+        ),
+        etag: `"${digest}-br"`,
+      };
+      out.gzip = { body: detach(gzipSync(bytes, { level: 9 })), etag: `"${digest}-gz"` };
+    }
+    return out;
+  })();
+
+  prepared.set(pathname, build);
+  return build;
+}
+
+/** The best encoding this client actually accepts.
+ *
+ *  `q=0` is a refusal, not a preference, so it is honoured — a client that says
+ *  `gzip;q=0` and gets gzip anyway receives bytes it will not decode. */
+function chooseEncoding(accept: string | null, asset: Prepared): { name: string; body: Encoded } {
+  const accepted = new Set<string>();
+  for (const part of (accept ?? "").toLowerCase().split(",")) {
+    const [token, ...params] = part.trim().split(";");
+    const q = params.map((p) => p.trim()).find((p) => p.startsWith("q="));
+    if (q && Number(q.slice(2)) === 0) continue;
+    if (token) accepted.add(token);
+  }
+  if (asset.br && (accepted.has("br") || accepted.has("*"))) return { name: "br", body: asset.br };
+  if (asset.gzip && (accepted.has("gzip") || accepted.has("*"))) return { name: "gzip", body: asset.gzip };
+  return { name: "identity", body: asset.identity };
+}
+
+/** Does `if-none-match` cover this entity? The header is a list, and a weak
+ *  validator (`W/"…"`) compares equal to its strong twin for revalidation. */
+function etagMatches(header: string | null, etag: string): boolean {
+  if (!header) return false;
+  const want = etag.replace(/^W\//, "");
+  return header.split(",").some((candidate) => candidate.trim().replace(/^W\//, "") === want || candidate.trim() === "*");
+}
+
+async function serveStatic(req: Request, pathname: string, asset: { path: string; type: string; cache?: string }): Promise<Response> {
+  const ready = await prepareAsset(pathname, asset);
+  const chosen = chooseEncoding(req.headers.get("accept-encoding"), ready);
+
+  // Sent on the 304 as well: these are what the client caches alongside the
+  // body, and dropping them on a revalidation would age out the entry it just
+  // confirmed. Vary is not optional — the same URL now has three bodies.
+  const validators: Record<string, string> = {
+    etag: chosen.body.etag,
+    "cache-control": asset.cache ?? REVALIDATE,
+    vary: "accept-encoding",
+  };
+  if (etagMatches(req.headers.get("if-none-match"), chosen.body.etag)) {
+    return new Response(null, { status: 304, headers: validators });
+  }
+
+  const headers: Record<string, string> = { ...validators, "content-type": asset.type };
+  if (chosen.name !== "identity") headers["content-encoding"] = chosen.name;
+  return new Response(chosen.body.body, { headers });
+}
 
 // ── prebuilt agents ───────────────────────────────────────────────────────
 //
@@ -374,10 +504,7 @@ if (process.argv[2] === "agent") {
     }
 
     if (req.method === "GET" && pathname in STATIC) {
-      const asset = STATIC[pathname];
-      const headers: Record<string, string> = { "content-type": asset.type };
-      if (asset.cache) headers["cache-control"] = asset.cache;
-      return new Response(Bun.file(asset.path), { headers });
+      return serveStatic(req, pathname, STATIC[pathname]);
     }
 
     return new Response("Not found", { status: 404 });

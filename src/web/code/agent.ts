@@ -30,6 +30,14 @@ export const isAgentUrl = (text: string): boolean => AGENT_URL.test(text.trim())
 
 const UNREACHABLE = "cannot reach the agent";
 
+/** Attempts before the client stops trying and says why.
+ *
+ *  With the backoff below (1s, 2s, 4s, 8s, 15s…) this is a little over a
+ *  minute of retrying — long enough to ride out an agent restart or a laptop
+ *  waking up, short enough that a URL which will never work stops pretending
+ *  it might. */
+const GIVE_UP_AFTER = 8;
+
 /** The loopback ports this page is allowed to open a connection to.
  *
  *  connect-src pins them (server.ts: AGENT_PORTS), so an agent started on some
@@ -223,6 +231,25 @@ export class AgentClient {
 
   private scheduleRetry(): void {
     if (this.retryTimer) return;
+
+    // Some failures are not going to get better by asking again. A token that
+    // no longer matches, an origin the agent refuses, a port outside the
+    // policy — the agent answers /ping perfectly well and turns the socket
+    // away every time. Retrying those forever left the badge saying
+    // "Connecting to the agent…" indefinitely and the row underneath advising
+    // the user to start an agent that was already running.
+    if (this.retry >= GIVE_UP_AFTER) {
+      this.wantOpen = false;
+      void AgentClient.probe(this.url).then((listening) => {
+        this.fail(
+          listening
+            ? "the agent is running but keeps refusing this connection — the token in the URL is probably stale, or it is serving another tab. Connect again with the URL it printed."
+            : `${this.lastError || UNREACHABLE} — gave up after ${GIVE_UP_AFTER} attempts. Start the agent and connect again.`,
+        );
+      });
+      return;
+    }
+
     // 1s, 2s, 4s … capped at 15s — enough to survive an agent restart without
     // hammering a port nobody is listening on.
     const delay = Math.min(1000 * 2 ** this.retry++, 15000);

@@ -174,24 +174,32 @@ export async function log(
 export async function branches(cwd: string): Promise<Branch[]> {
   const out = await git(cwd, [
     "for-each-ref",
-    "--format=%(refname)%00%(objectname)%00%(upstream:short)%00%(HEAD)",
+    // `upstream:track` prints "[ahead 1, behind 2]", "[gone]" or nothing;
+    // `creatordate` is used rather than committerdate because it is also
+    // defined for annotated tag objects, which have no committer.
+    "--format=%(refname)%00%(objectname)%00%(upstream:short)%00%(HEAD)%00%(upstream:track)%00%(creatordate:unix)",
     "refs/heads",
     "refs/remotes",
+    "refs/tags",
   ]);
   const list: Branch[] = [];
   for (const line of out.split("\n")) {
     if (!line.trim()) continue;
-    const [ref, oid, upstream, head] = line.split("\0");
+    const [ref, oid, upstream, head, track, time] = line.split("\0");
     // refs/remotes/<name>/HEAD is a symbolic pointer, not a branch users pick.
     if (/^refs\/remotes\/[^/]+\/HEAD$/.test(ref)) continue;
     const remote = ref.startsWith("refs/remotes/");
     list.push({
       ref,
-      name: ref.replace(/^refs\/(heads|remotes)\//, ""),
+      name: ref.replace(/^refs\/(heads|remotes|tags)\//, ""),
       oid,
       upstream: upstream || null,
       remote,
       head: head.trim() === "*",
+      tag: ref.startsWith("refs/tags/"),
+      ahead: Number(/ahead (\d+)/.exec(track ?? "")?.[1] ?? 0),
+      behind: Number(/behind (\d+)/.exec(track ?? "")?.[1] ?? 0),
+      time: Number(time ?? 0) || 0,
     });
   }
   return list;

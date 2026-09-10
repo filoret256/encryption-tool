@@ -81,29 +81,165 @@ export function setHtmlKeepingScroll(el: HTMLElement, html: string, anchor?: str
   }
 }
 
+/** Put text on the clipboard and say so.
+ *
+ *  Silence was the whole problem: "Copy path" wrote and reported nothing, so a
+ *  miss — the menu item that did not take the click, a clipboard the browser
+ *  refused in a page without focus — was indistinguishable from a copy that
+ *  worked, and you only found out on paste. `writeText` also rejects rather
+ *  than throwing synchronously, so the failure had nowhere to surface at all.
+ *
+ *  `what` names the thing, not the value: paths and hashes are long, and the
+ *  toast holds one line. */
+export async function copyToClipboard(text: string, what: string, notify: (message: string, isError?: boolean) => void): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+    notify(`${what} copied`);
+  } catch {
+    notify(`could not copy the ${what.toLowerCase()} — the browser refused clipboard access`, true);
+  }
+}
+
 /** One floating menu at a time, reused for every right-click. */
-export function showMenu(x: number, y: number, items: [string, () => void][]): void {
+/** A menu item. `danger` paints it as destructive and separates it from what
+ *  comes before, so "Delete" cannot be reached by muscle memory aimed at
+ *  "Rename"; `hint` shows the key that does the same thing without the menu. */
+export interface MenuItem {
+  label: string;
+  run: () => void;
+  danger?: boolean;
+  hint?: string;
+  /** A rule above this item. Use it to break a long menu into groups. */
+  separated?: boolean;
+}
+
+/** Anything callers may hand to showMenu: the old pair form still works. */
+export type MenuEntry = MenuItem | [string, () => void];
+
+const asItem = (entry: MenuEntry): MenuItem => (Array.isArray(entry) ? { label: entry[0], run: entry[1] } : entry);
+
+export function showMenu(x: number, y: number, entries: MenuEntry[]): void {
   document.querySelector(".ctx-menu")?.remove();
+  const items = entries.map(asItem);
+  // Where focus was, so Escape (or picking something) can put it back rather
+  // than dropping the keyboard user at the top of the document.
+  const opener = document.activeElement as HTMLElement | null;
+
   const menu = document.createElement("div");
   menu.className = "ctx-menu";
+  menu.setAttribute("role", "menu");
   menu.style.left = `${x}px`;
   menu.style.top = `${y}px`;
-  for (const [label, action] of items) {
+
+  const close = (restoreFocus: boolean): void => {
+    menu.remove();
+    document.removeEventListener("keydown", onKey, true);
+    if (restoreFocus) opener?.focus?.();
+  };
+
+  const buttons: HTMLButtonElement[] = [];
+  for (const item of items) {
     const b = document.createElement("button");
     b.type = "button";
-    b.textContent = label;
+    b.setAttribute("role", "menuitem");
+    if (item.danger) b.classList.add("danger");
+    if (item.separated) b.classList.add("separated");
+    const label = document.createElement("span");
+    label.textContent = item.label;
+    b.appendChild(label);
+    if (item.hint) {
+      const hint = document.createElement("span");
+      hint.className = "ctx-hint";
+      hint.textContent = item.hint;
+      b.appendChild(hint);
+    }
     b.addEventListener("click", () => {
-      menu.remove();
-      action();
+      close(false); // the action decides where focus goes next
+      item.run();
     });
+    buttons.push(b);
     menu.appendChild(b);
   }
+
+  const move = (delta: number): void => {
+    const at = buttons.indexOf(document.activeElement as HTMLButtonElement);
+    const next = (at + delta + buttons.length) % buttons.length;
+    buttons[at === -1 ? (delta > 0 ? 0 : buttons.length - 1) : next]?.focus();
+  };
+
+  // Captured, so the tree's own key handling does not act on keys meant for
+  // the menu that is on top of it.
+  function onKey(e: KeyboardEvent): void {
+    switch (e.key) {
+      case "Escape": e.preventDefault(); return close(true);
+      case "ArrowDown": e.preventDefault(); return move(1);
+      case "ArrowUp": e.preventDefault(); return move(-1);
+      case "Home": e.preventDefault(); return buttons[0]?.focus();
+      case "End": e.preventDefault(); return buttons[buttons.length - 1]?.focus();
+      case "Tab": e.preventDefault(); return move(e.shiftKey ? -1 : 1);
+    }
+  }
+  document.addEventListener("keydown", onKey, true);
+
   document.body.appendChild(menu);
   // Keep it on screen when opened near the right or bottom edge.
   const r = menu.getBoundingClientRect();
   if (r.right > innerWidth) menu.style.left = `${innerWidth - r.width - 4}px`;
   if (r.bottom > innerHeight) menu.style.top = `${innerHeight - r.height - 4}px`;
-  setTimeout(() => document.addEventListener("click", () => menu.remove(), { once: true }));
+  buttons[0]?.focus();
+  setTimeout(() => document.addEventListener("click", () => close(false), { once: true }));
+}
+
+/** Hold the keyboard inside a dialog, and give it back when the dialog goes.
+ *
+ *  Without this, Tab walked straight out of the modal and into the page behind
+ *  it — the editor, the tree, the toolbar — while the backdrop still covered
+ *  everything, so the focus ring was somewhere the user could not see and
+ *  Enter did something they could not predict. Every dialog here asks about
+ *  work that cannot be undone, which makes that worse than untidy.
+ *
+ *  Returns the cleanup, which also restores focus to whatever opened it.
+ */
+function trapFocus(container: HTMLElement): () => void {
+  const opener = document.activeElement as HTMLElement | null;
+  const focusable = (): HTMLElement[] =>
+    [...container.querySelectorAll<HTMLElement>("button, input, select, textarea, [tabindex]:not([tabindex='-1'])")].filter(
+      (el) => !el.hasAttribute("disabled"),
+    );
+
+  const onKey = (e: KeyboardEvent): void => {
+    if (e.key !== "Tab") return;
+    const items = focusable();
+    if (!items.length) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    const active = document.activeElement;
+    // Wrap at both ends rather than letting the browser leave the dialog.
+    if (e.shiftKey && (active === first || !container.contains(active))) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && (active === last || !container.contains(active))) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
+
+  document.addEventListener("keydown", onKey, true);
+  return () => {
+    document.removeEventListener("keydown", onKey, true);
+    opener?.focus?.();
+  };
+}
+
+/** Mark a dialog for assistive technology: it is a dialog, it is modal, and
+ *  this is what it is called. */
+function markDialog(form: HTMLElement, labelledBy: HTMLElement | null): void {
+  form.setAttribute("role", "dialog");
+  form.setAttribute("aria-modal", "true");
+  if (labelledBy) {
+    labelledBy.id ||= `dlg-${Math.random().toString(36).slice(2, 8)}`;
+    form.setAttribute("aria-labelledby", labelledBy.id);
+  }
 }
 
 export interface ConfirmOptions {
@@ -140,9 +276,14 @@ export function modalConfirm(opts: ConfirmOptions): Promise<boolean> {
         <button type="submit" class="t-btn t-btn-primary${opts.danger ? " t-btn-danger" : ""}">${esc(opts.okLabel ?? "ok")}</button>
       </div></form>`;
 
+    const form = back.querySelector<HTMLElement>("form")!;
+    markDialog(form, form.querySelector(".modal-title"));
+    const release = trapFocus(form);
+
     const done = (v: boolean): void => {
       back.remove();
       document.removeEventListener("keydown", onKey, true);
+      release();
       resolve(v);
     };
     const onKey = (e: KeyboardEvent): void => {
@@ -187,9 +328,14 @@ export function modalPrompt(opts: PromptOptions): Promise<string | null> {
       </div></form>`;
 
     const input = back.querySelector("input")!;
+    const form = back.querySelector<HTMLElement>("form")!;
+    markDialog(form, form.querySelector("label"));
+    const release = trapFocus(form);
+
     const done = (v: string | null): void => {
       back.remove();
       document.removeEventListener("keydown", onKey, true);
+      release();
       resolve(v);
     };
     const onKey = (e: KeyboardEvent): void => {

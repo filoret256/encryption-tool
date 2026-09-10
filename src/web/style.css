@@ -43,6 +43,28 @@
   --ok: #3fb950; --bad: #f85149;
 }
 
+/* The same palette, for the moment before main.js has said anything.
+ *
+ *  The app now starts in whatever the system asks for and only pins a theme
+ *  once someone works the toggle, so the attribute is absent on a first paint —
+ *  and a first paint can be a while, because it happens before half a megabyte
+ *  of bundle has arrived. Without this the page would show white to everyone
+ *  running a dark desktop and then swap under them.
+ *
+ *  Keyed on the attribute being absent, not on `:not([data-theme="light"])`: as
+ *  soon as the script runs the attribute is always there, so this rule and an
+ *  explicit choice can never disagree. Two copies of the palette is the price;
+ *  the alternative — light-dark() — is newer than the browsers this app still
+ *  supports. Every dark block below carries the same pair. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --bg: #0d1117; --panel: #161b22; --border: #2d333b; --text: #e6edf3;
+    --text-muted: #768390; --accent: #2f81f7; --accent-fg: #fff;
+    --btn: #21262d; --btn-hover: #2d333b; --active: #1f3a5f;
+    --ok: #3fb950; --bad: #f85149;
+  }
+}
+
 * { box-sizing: border-box; }
 /* Components set display on their own host element, which outranks the user
    agent stylesheet; without this, toggling el.hidden does nothing. */
@@ -90,6 +112,17 @@ body {
 /* Dim whichever icon is inactive. */
 :root[data-theme="dark"] .theme-ic.sun { opacity: .4; }
 :root[data-theme="light"] .theme-ic.moon { opacity: .4; }
+/* Before the script has chosen (see the palette note above): the switch shows
+   the state the page is actually painted in, rather than sliding into place a
+   second later. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) .theme-switch { background: var(--accent); }
+  :root:not([data-theme]) .theme-knob { transform: translateX(20px); }
+  :root:not([data-theme]) .theme-ic.sun { opacity: .4; }
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) .theme-ic.moon { opacity: .4; }
+}
 
 .tab-content { display: none; flex: 1; flex-direction: column; min-height: 0; }
 .tab-content.active { display: flex; }
@@ -151,6 +184,11 @@ body {
 :root[data-theme="dark"] {
   --dec-modified: #e2c08d; --dec-added: #3fb950; --dec-deleted: #f85149; --dec-conflict: #c084fc;
 }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --dec-modified: #e2c08d; --dec-added: #3fb950; --dec-deleted: #f85149; --dec-conflict: #c084fc;
+  }
+}
 
 .code-loading { padding: 24px; color: var(--text-muted); }
 .code-root { color: var(--text-muted); max-width: 34ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -188,6 +226,18 @@ body {
      a gap between two panes. */
   flex: 0 0 auto; width: 7px; cursor: col-resize;
   background: var(--panel); border-right: 1px solid var(--border);
+  /* The grab area is wider than the strip itself — see ::before below. */
+  position: relative;
+}
+/* Four pixels of reach on each side, invisible and outside the layout.
+   Seven pixels of drawn strip is still a target you miss: a press one pixel
+   wide of it lands in the editor and starts selecting text instead, which
+   reads as "the divider does not drag". Kept off the element's own width so
+   the divider stays a hairline to look at. */
+.code-splitter::before {
+  content: ""; position: absolute; top: 0; bottom: 0; left: -4px; right: -4px;
+  /* Above the panes it overlaps, or they would take the press first. */
+  z-index: 2;
 }
 .code-splitter:hover,
 .code-splitter.dragging { background: var(--accent); border-right-color: var(--accent); }
@@ -379,10 +429,17 @@ body {
 .gp-mark.dec-changes { color: var(--dec-modified); }
 .gp-mark.dec-untracked { color: var(--dec-added); }
 .gp-mark.dec-conflict { color: var(--dec-conflict); }
+/* The running-operation strip: what git is doing, and a way to stop it. */
 .gp-progress {
+  display: flex; align-items: center; gap: 8px;
   padding: 5px 8px; font-size: var(--fs-xs); color: var(--text-muted);
-  border-top: 1px solid var(--border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  border-top: 1px solid var(--border);
 }
+.js-progress-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gp-progress .t-btn { height: var(--ctl-xs); font-size: var(--fs-xs); }
+/* While a fetch/pull/push runs, the panel says so rather than looking idle and
+   ignoring presses — which is what the old `busy` flag did. */
+.gp.is-busy .gp-head { opacity: .7; }
 
 /* ── Virtual list ─────────────────────────────────────────────────────── */
 .vlist { flex: 1; min-height: 0; }
@@ -503,6 +560,12 @@ body {
 :root[data-theme="dark"] {
   --g1: #58a6ff; --g2: #3fb950; --g3: #e2c08d; --g4: #c084fc;
   --g5: #39c5cf; --g6: #f85149; --g7: #a5d6a7; --g8: #bc8cff;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --g1: #58a6ff; --g2: #3fb950; --g3: #e2c08d; --g4: #c084fc;
+    --g5: #39c5cf; --g6: #f85149; --g7: #a5d6a7; --g8: #bc8cff;
+  }
 }
 .g-lane { flex: 0 0 auto; display: block; overflow: visible; }
 .g-lane line, .g-lane path { stroke-width: 1.6; stroke-linecap: round; }
@@ -681,13 +744,71 @@ body {
   border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .3);
 }
 
-.toast {
-  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(20px);
-  padding: 8px 16px; border-radius: 6px; background: var(--text); color: var(--bg);
-  opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s;
+/* Notifications: a stack, oldest at the top, newest arriving underneath.
+   They take pointer events now — an error has a close button and often a way
+   into the output log, neither of which works through `pointer-events: none`,
+   which is what the single toast used to have. */
+.toasts {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+  z-index: 55; display: flex; flex-direction: column; gap: 6px;
+  align-items: center; max-width: min(720px, calc(100vw - 32px));
 }
-.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.toast {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px 8px 16px; border-radius: 6px;
+  background: var(--text); color: var(--bg);
+  font-size: var(--fs-sm); box-shadow: 0 6px 20px rgba(0, 0, 0, .28);
+  animation: toast-in .18s ease-out;
+}
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 .toast.error { background: var(--bad); color: #fff; }
+/* One line, clipped — the whole message is in the log, and a toast that grows
+   to seven lines is the thing this replaced. */
+.toast-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toast-action, .toast-close {
+  flex: 0 0 auto; cursor: pointer; font-family: var(--mono); font-size: var(--fs-xs);
+  color: inherit; background: rgba(127, 127, 127, .25); border: 0; border-radius: 4px;
+  padding: 3px 8px;
+}
+.toast-close { padding: 3px 6px; background: transparent; opacity: .7; }
+.toast-action:hover, .toast-close:hover { background: rgba(127, 127, 127, .45); opacity: 1; }
+
+/* ── The output log ────────────────────────────────────────────────────────
+   Sits between the editor and the status bar, opened from the status bar or
+   from the "details" button on an error. */
+.output-log {
+  display: flex; flex-direction: column; flex: 0 0 auto;
+  height: 34vh; min-height: 140px;
+  border-top: 1px solid var(--border); background: var(--panel);
+}
+.output-head {
+  display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
+  height: var(--head-h); padding: 0 8px; border-bottom: 1px solid var(--border);
+  font-size: var(--fs-xs); text-transform: uppercase; color: var(--text-muted);
+}
+.output-head .t-btn { height: var(--ctl-xs); font-size: var(--fs-xs); text-transform: none; }
+.output-count { text-transform: none; }
+.output-body { flex: 1; min-height: 0; overflow: auto; padding: 6px 0; }
+.output-empty { margin: 0; padding: 12px; color: var(--text-muted); font-size: var(--fs-sm); }
+.output-entry { padding: 3px 10px; border-left: 2px solid transparent; }
+.output-entry.error { border-left-color: var(--bad); background: color-mix(in srgb, var(--bad) 7%, transparent); }
+.output-line { display: flex; gap: 8px; align-items: baseline; font-size: var(--fs-sm); }
+.output-time { flex: 0 0 auto; color: var(--text-muted); font-size: var(--fs-xs); }
+.output-op { flex: 0 0 auto; color: var(--accent); font-size: var(--fs-xs); }
+.output-summary { min-width: 0; overflow-wrap: anywhere; }
+/* The transcript keeps git's own line breaks — that is the entire point. */
+.output-detail {
+  margin: 4px 0 6px; padding: 6px 8px; white-space: pre-wrap; overflow-wrap: anywhere;
+  font-size: var(--fs-xs); color: var(--text-muted);
+  background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+}
+/* The status-bar entry point, and its unread-error count. */
+.sb-button {
+  font-family: var(--mono); font-size: var(--fs-xs); cursor: pointer;
+  color: var(--text-muted); background: transparent; border: 0; padding: 0 4px;
+}
+.sb-button:hover, .sb-button.is-active { color: var(--text); }
+.sb-button.has-errors { color: var(--bad); }
 
 /* ── Keyboard focus ───────────────────────────────────────────────────────
    One ring, stated once, for everything that can hold focus.
@@ -855,3 +976,152 @@ body {
 .cm-editor .cm-completionIcon { opacity: .55; }
 /* The matched substring is what tells you why a candidate is in the list. */
 .cm-editor .cm-completionMatchedText { color: var(--accent); text-decoration: none; font-weight: 600; }
+
+/* ── Reduced motion ───────────────────────────────────────────────────────
+   Everything that moves here is decoration: the theme knob sliding, the toast
+   rising into place, hover fades. None of it carries meaning that the still
+   frame does not, so under `prefers-reduced-motion` it simply stops — kept as
+   a near-zero duration rather than `none`, because transitionend listeners
+   still have to fire for anything that waits on one.
+
+   Scoped to the app's own elements plus CodeMirror's, rather than `*`, so a
+   future animation that genuinely conveys state can opt out of this by living
+   outside it and saying why. */
+@media (prefers-reduced-motion: reduce) {
+  body *, body *::before, body *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ── Offline and out-of-date buffers ──────────────────────────────────────
+   The strip that appears above the editor when the agent is gone. It says the
+   one thing that matters at that moment: the work is still here. Muted rather
+   than alarming — a dropped agent is a normal event (a restart, a sleeping
+   laptop), and the state it leaves behind is safe. */
+.offline-bar {
+  display: flex; align-items: center; gap: 10px; flex: 0 0 auto;
+  padding: 6px 12px; font-size: var(--fs-sm);
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--dec-modified) 10%, var(--panel));
+  border-bottom: 1px solid var(--border);
+}
+/* A tab whose file is gone from disk. The name is struck through, not hidden:
+   the buffer is still open and still saveable, it just has nowhere it came
+   from any more. */
+.code-tab.missing .code-tab-name { text-decoration: line-through; opacity: .75; }
+
+/* A panel that could not load says so, in place, with what it was told and a
+   way to try again. The alternative — and what these panels used to do — was
+   to render their empty state, which claims something false about the
+   repository every time git refuses to answer. */
+.panel-error { padding: 10px; font-size: var(--fs-sm); }
+.panel-error-title { margin: 0 0 6px; color: var(--bad); }
+.panel-error pre {
+  margin: 0 0 8px; padding: 6px 8px; max-height: 40vh; overflow: auto;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+  font-size: var(--fs-xs); color: var(--text-muted);
+  background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+}
+/* "×3" on a notice that arrived three times — see notify.ts for why one
+   failure reaches the stack from three different panels. */
+.toast-count {
+  flex: 0 0 auto; font-size: var(--fs-xs); opacity: .75;
+  padding: 1px 5px; border-radius: 999px; background: rgba(127, 127, 127, .3);
+}
+.output-repeat {
+  flex: 0 0 auto; font-size: var(--fs-badge); color: var(--text-muted);
+  padding: 0 5px; border-radius: 999px; background: var(--btn);
+}
+
+/* Context menu: groups, keys and the one item that destroys something. */
+.ctx-menu button { display: flex; align-items: center; gap: 16px; justify-content: space-between; }
+.ctx-menu button.separated { margin-top: 4px; border-top: 1px solid var(--border); padding-top: 6px; }
+.ctx-menu button.danger { color: var(--bad); }
+.ctx-menu button.danger:hover { background: color-mix(in srgb, var(--bad) 15%, transparent); }
+/* The key that does the same thing without opening this menu. */
+.ctx-hint { color: var(--text-muted); font-size: var(--fs-xs); }
+
+/* ── Ref picker ────────────────────────────────────────────────────────────
+   The list that replaced a text field with every branch name crammed into its
+   hint line. Sized so a repository with fifty branches is scrolled, not
+   truncated. */
+.ref-picker { width: min(560px, 94vw); }
+.ref-list {
+  max-height: min(48vh, 420px); overflow: auto;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--bg);
+}
+.ref-section {
+  position: sticky; top: 0; z-index: 1;
+  padding: 4px 10px; font-size: var(--fs-xs); text-transform: uppercase;
+  color: var(--text-muted); background: var(--panel); border-bottom: 1px solid var(--border);
+}
+.ref-row {
+  display: flex; align-items: center; gap: 8px; cursor: pointer;
+  padding: 4px 10px; font-size: var(--fs-sm);
+}
+.ref-row:hover { background: var(--btn); }
+.ref-row.active { background: var(--active); }
+.ref-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ref-row.current .ref-name { font-weight: 600; }
+.ref-badge {
+  flex: 0 0 auto; font-size: var(--fs-badge); padding: 0 5px; border-radius: 999px;
+  color: var(--accent); border: 1px solid var(--accent);
+}
+.ref-track { flex: 0 0 auto; font-size: var(--fs-xs); color: var(--dec-modified); }
+.ref-when { flex: 0 0 auto; font-size: var(--fs-xs); color: var(--text-muted); }
+.ref-empty { margin: 0; padding: 10px; font-size: var(--fs-sm); color: var(--text-muted); }
+/* The sync button: it carries the divergence and does something about it. */
+.gp-sync { font-size: var(--fs-xs); height: var(--ctl-sm); padding: 0 8px; }
+/* The header carries one more control now, and 260px is the default panel
+   width. The branch name gives way first; past that the row wraps rather than
+   pushing the overflow menu off the edge, which is what hiding it did. */
+.gp-head { flex-wrap: wrap; height: auto; min-height: var(--head-h); padding: 3px 8px; }
+.gp-head .js-branch { flex: 1 1 auto; min-width: 72px; padding: 0 6px; }
+.js-branch-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gp-sync { flex: 0 0 auto; padding: 0 6px; }
+.gp-head .t-icon { flex: 0 0 auto; }
+
+/* ── Quick pick: palette, go-to-file, ref picker ──────────────────────────── */
+.quick-pick { width: min(620px, 94vw); }
+.pick-list {
+  max-height: min(48vh, 420px); overflow: auto;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--bg);
+}
+.pick-section {
+  position: sticky; top: 0; z-index: 1;
+  padding: 4px 10px; font-size: var(--fs-xs); text-transform: uppercase;
+  color: var(--text-muted); background: var(--panel); border-bottom: 1px solid var(--border);
+}
+.pick-row {
+  display: flex; align-items: center; gap: 8px; cursor: pointer;
+  padding: 4px 10px; font-size: var(--fs-sm);
+}
+.pick-row:hover { background: var(--btn); }
+.pick-row.active { background: var(--active); }
+.pick-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 0 1 auto; }
+.pick-detail {
+  flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  direction: rtl; text-align: right;
+  font-size: var(--fs-xs); color: var(--text-muted);
+}
+.pick-badge {
+  flex: 0 0 auto; font-size: var(--fs-badge); padding: 0 5px; border-radius: 999px;
+  color: var(--accent); border: 1px solid var(--accent);
+}
+.pick-track { flex: 0 0 auto; font-size: var(--fs-xs); color: var(--dec-modified); }
+.pick-empty { margin: 0; padding: 10px; font-size: var(--fs-sm); color: var(--text-muted); }
+
+/* The explorer's name filter, opened from the palette or Ctrl+Shift+E. */
+.tree-filter {
+  display: flex; align-items: center; gap: 4px; flex: 0 0 auto;
+  padding: 4px 6px; border-bottom: 1px solid var(--border);
+}
+.tree-filter .t-input { flex: 1; min-width: 0; height: var(--ctl-sm); padding: 0 8px; }
+.tree { display: flex; flex-direction: column; }
+/* Diff header: how many changes there are, and the pair that walks them. */
+.diff-count { font-size: var(--fs-xs); color: var(--text-muted); white-space: nowrap; }
+.diff-head .t-icon { flex: 0 0 auto; }
+.diff-head .t-icon:disabled { opacity: .4; cursor: default; }

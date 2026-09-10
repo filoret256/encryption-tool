@@ -1,5 +1,9 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light">
+<!-- No data-theme here on purpose: absent means "follow the system", which is
+     what the app does until someone works the toggle. main.ts sets the
+     attribute as soon as it runs; the stylesheet covers the moment before that.
+     Hard-coding "light" made every dark-desktop visitor start on a white page. -->
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -59,8 +63,13 @@
        toolbar template, and is populated by the lazily-loaded code chunk. -->
   <div id="code-tab" class="tab-content"></div>
 
-  <input type="file" id="file-input" hidden accept=".txt,.yaml,.yml,.json,.env" />
-  <div id="toast" class="toast"></div>
+  <!-- No accept filter: the files people bring here are secrets and vars, and
+       plenty of them have no extension at all (`vault`, `Dockerfile`, a
+       key file). The list hid exactly those behind a "show all files" switch
+       nobody looks for, and the editor reads whatever it is given anyway. -->
+  <input type="file" id="file-input" hidden />
+  <!-- Notifications stack here; notify.ts owns what goes in it. -->
+  <div id="toasts" class="toasts"></div>
 
   <!-- Shown when a new service worker is waiting; the swap only happens when
        the user asks, so assets never change mid-session. -->

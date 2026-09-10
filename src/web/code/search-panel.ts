@@ -249,7 +249,11 @@ export class SearchPanel {
         </span>
       </div>`;
     }
-    return `<div class="sp-hit" data-path="${esc(row.path)}" data-key="${esc(row.key)}">
+    // The rendered line is trimmed twice over — indentation dropped, a window
+    // taken around the first match, a hard cap at 200 characters — so on a long
+    // line what is on screen can be a fragment with the context cut off both
+    // ends. The title carries the line as it actually is.
+    return `<div class="sp-hit" data-path="${esc(row.path)}" data-key="${esc(row.key)}" title="${esc(hitTitle(row.path, row.hit))}">
       <span class="sp-lineno">${row.hit.line}</span>
       <span class="sp-text">${hitHtml(row.hit)}</span>
       <span class="sp-acts"><button class="t-icon" data-act="dismiss-hit" title="Dismiss match">${iconClose}</button></span>
@@ -407,6 +411,16 @@ export function preserveCase(found: string, replacement: string): string {
     return replacement[0].toUpperCase() + replacement.slice(1).toLowerCase();
   }
   return replacement; // mixed / camelCase — leave the replacement as typed
+}
+
+/** What hovering a result says: where it is, and the whole line.
+ *
+ *  Capped, because a minified bundle is one line of half a megabyte and a
+ *  tooltip that long is worse than none. */
+function hitTitle(path: string, hit: SearchHit): string {
+  const MAX = 600;
+  const line = hit.text.trim();
+  return `${path}:${hit.line}\n${line.length > MAX ? `${line.slice(0, MAX)}…` : line}`;
 }
 
 /** One result line, with the matches marked and long lines trimmed around the

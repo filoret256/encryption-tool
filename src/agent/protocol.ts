@@ -120,6 +120,18 @@ export interface Branch {
   upstream: string | null;
   remote: boolean;
   head: boolean;
+  /** refs/tags/… — a fixed point rather than something you commit onto. Listed
+   *  alongside branches because everything that takes a ref (compare, create a
+   *  branch from, check out) takes a tag just as happily, and a picker that
+   *  hides them sends people to the terminal for a release. */
+  tag: boolean;
+  /** Commits this branch has that its upstream does not, and the other way
+   *  round. Both 0 when there is no upstream to compare against. */
+  ahead: number;
+  behind: number;
+  /** When the ref last moved, in unix seconds — "3 days ago" beside a branch
+   *  name is most of what tells stale from current in a long list. */
+  time: number;
 }
 
 /** A pair of texts for @codemirror/merge. `before`/`after` are null when the

@@ -31,6 +31,7 @@ import { linter, lintGutter } from "@codemirror/lint";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import { yamlDiagnostics } from "./yaml-lint.ts";
 import { cspNonce } from "./csp.ts";
+import { prefersDark } from "./theme.ts";
 
 export type Tab = "ansible" | "helm";
 export interface ViewPrefs {
@@ -153,7 +154,10 @@ export class TabEditor {
 
   constructor(private readonly tab: Tab, parent: HTMLElement, placeholderText: string) {
     const p = prefs[tab];
-    const dark = localStorage.getItem("enc-theme") === "dark";
+    // Same answer main.ts starts from, including "no choice yet — ask the
+    // system"; reading the key directly meant this editor built itself light
+    // and was corrected a moment later by the first applyTheme().
+    const dark = prefersDark();
     this.view = new EditorView({
       parent,
       state: EditorState.create({

@@ -5,7 +5,7 @@
  */
 import type { AgentClient } from "./agent.ts";
 import type { Commit, CommitDetail } from "../../agent/protocol.ts";
-import { esc, modalConfirm, modalPrompt, setHtmlKeepingScroll, showMenu } from "./ui.ts";
+import { copyToClipboard, esc, modalConfirm, modalPrompt, setHtmlKeepingScroll, showMenu } from "./ui.ts";
 import { computeGraph, continuationSvg, laneSvg, LANE_W, type GraphRow } from "./graph.ts";
 import { iconRefresh } from "./icons.ts";
 
@@ -37,6 +37,10 @@ export class HistoryPanel {
    *  redrawn, so a click is never dropped because the row it landed on was
    *  replaced underneath it. */
   private renderedKey = "";
+  /** Why the log is not on screen, when the answer is not simply "there is
+   *  none". Kept apart from `commits` because the two used to be conflated:
+   *  any failure emptied the list, and an empty list says "No commits." */
+  private failure: string | null = null;
 
   private readonly $: <T extends HTMLElement>(sel: string) => T;
 
@@ -74,15 +78,20 @@ export class HistoryPanel {
         limit: this.limit,
         all: this.$<HTMLInputElement>(".js-all").checked,
       });
+      this.failure = null;
       // A commit's diff is immutable, but a rebase rewrites oids, so a stale
       // entry can only ever be unreachable — drop what is no longer listed.
       const live = new Set(this.commits.map((c) => c.oid));
       for (const oid of [...this.details.keys()]) if (!live.has(oid)) this.details.delete(oid);
     } catch (e) {
       this.commits = [];
-      if (!/not a git repository|does not have any commits/i.test(String(e))) {
-        this.cb.toast(e instanceof Error ? e.message : String(e), true);
-      }
+      const message = e instanceof Error ? e.message : String(e);
+      // A repository with no commits yet is not a failure. Anything else is —
+      // and reporting it as "No commits." is how one broken entry under
+      // refs/remotes made a repository with a hundred commits read as empty.
+      const empty = /not a git repository|does not have any commits/i.test(message);
+      this.failure = empty ? null : message;
+      if (!empty) this.cb.toast(message, true);
     }
     this.render();
   }
@@ -93,8 +102,18 @@ export class HistoryPanel {
   private render(anchorOid?: string): void {
     const list = this.$(".js-list");
     if (!this.commits.length) {
-      list.innerHTML = `<p class="gp-empty">No commits.</p>`;
+      list.innerHTML = this.failure
+        ? `<div class="panel-error">
+             <p class="panel-error-title">The history could not be loaded.</p>
+             <pre>${esc(this.failure)}</pre>
+             <button class="t-btn js-retry" type="button">try again</button>
+           </div>`
+        : `<p class="gp-empty">No commits.</p>`;
+      list.querySelector(".js-retry")?.addEventListener("click", () => void this.refresh());
       this.$(".js-more").hidden = true;
+      // The fingerprint below suppresses an identical redraw; an error state
+      // has to be able to redraw itself once the cause is gone.
+      this.renderedKey = "";
       return;
     }
     // The layout depends only on the commit list, so it is recomputed here
@@ -208,7 +227,11 @@ export class HistoryPanel {
     const short = oid.slice(0, 7);
 
     showMenu(e.clientX, e.clientY, [
-      ["Copy SHA", () => void navigator.clipboard?.writeText(oid)],
+      // Both lengths, both confirmed. The short one is what goes in a message
+      // or a chat, the full one is what a script or a `git show` wants, and
+      // trimming the long one by hand is the kind of thing people get wrong.
+      [`Copy SHA (${short})`, () => void copyToClipboard(short, "SHA", this.cb.toast)],
+      ["Copy full SHA", () => void copyToClipboard(oid, "Full SHA", this.cb.toast)],
       ["Checkout this commit", () => void this.run("git.checkout", { ref: oid }, `checked out ${short} (detached)`)],
       ["Create branch here…", () => void this.branchHere(oid)],
       ["Revert this commit", () => void this.run("git.revert", { oid }, `reverted ${short}`)],
