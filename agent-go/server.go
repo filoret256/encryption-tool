@@ -4,8 +4,10 @@
 // Security posture (all four are load-bearing):
 //  1. binds 127.0.0.1 only — never reachable from the network;
 //  2. a token, printed at startup, is required on every connection;
-//  3. the Origin header is checked against an allowlist, because a token in
-//     localStorage is only as good as the origins that can read it;
+//  3. the Origin header is checked against an allowlist — a token in
+//     localStorage is only as good as the origins that can read it — and the
+//     Host header against this agent's own name, which is what stops a rebound
+//     DNS name from reaching it under someone else's;
 //  4. every path is confined to the workspace by the jail.
 package main
 
@@ -13,9 +15,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
-	"regexp"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -103,8 +106,27 @@ func (r *req) number(key string, fallback int) int {
 
 // ── connections ───────────────────────────────────────────────────────────
 
+// How many child processes one connection may have running at once.
+//
+// search and every git op spawn one. Search-as-you-type issues a request per
+// keystroke, and nothing bounded how many of those could be running: the cap
+// turns a burst into a queue instead of a fork bomb. Four is enough that no
+// single slow scan blocks the panel a user is looking at.
+const maxConcurrentProcs = 4
+
+// spawnsProcess reports whether an op starts a child process, and so is worth
+// counting against the cap.
+func spawnsProcess(op string) bool {
+	return op == "search" || strings.HasPrefix(op, "git.")
+}
+
 type connection struct {
 	ws *wsConn
+
+	// The queue behind maxConcurrentProcs: a send takes a slot, a receive gives
+	// it back. Blocking on a full buffer is the wait, and it always ends —
+	// closing the connection cancels every running op, which frees the slots.
+	slots chan struct{}
 
 	mu       sync.Mutex
 	watcher  *watcher
@@ -335,28 +357,151 @@ func errCodeOf(err error) string {
 
 // ── HTTP ──────────────────────────────────────────────────────────────────
 
-var loopbackOrigin = regexp.MustCompile(`^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$`)
+// Origins trusted without being named on the command line: the port the web app
+// is served from by default (src/server.ts PORT), and nothing else.
+//
+// What this replaced was a pattern matching any loopback origin on any port,
+// which meant every other dev server on the machine — and script injected into
+// any of them — spoke to this agent with the same authority as the app itself.
+// A user serving the app elsewhere names it with --allow-origin: one flag,
+// against a whole class of silent access.
+var defaultOrigins = []string{"http://localhost:5000", "http://127.0.0.1:5000", "http://[::1]:5000"}
+
+// Names this agent answers to. net.SplitHostPort strips the brackets from an
+// IPv6 literal, so ::1 is stored without them.
+var loopbackHosts = map[string]bool{"127.0.0.1": true, "localhost": true, "::1": true}
 
 type server struct {
 	jail    *jail
 	info    *agentInfo
 	token   string
 	origins []string
+	// The port actually bound: the same as the one asked for today, but the name
+	// this agent answers to should be the one it actually got.
+	port          int
+	allowNoOrigin bool
+	allowMultiple bool
 	// Whether the workspace is a git repository; git ops are refused when not.
 	isRepo bool
+
+	// Connections held right now. The lock in the /ws branch reads it, and the
+	// startup banner promises what it will do.
+	mu      sync.Mutex
+	clients int
+	// Whether the current lock has already been reported. Reset when it lifts:
+	// a refused tab keeps reconnecting on a backoff, and a line every few
+	// seconds would bury the one event worth seeing.
+	refusalLogged bool
+}
+
+// take reserves a connection slot, or reports that the agent is already held.
+//
+// Counted before the handshake rather than after: between the check and a
+// completed upgrade there is room for a second request to have seen zero.
+func (s *server) take() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.allowMultiple && s.clients > 0 {
+		return false
+	}
+	s.clients++
+	return true
+}
+
+// logRefusalOnce reports that the lock turned a client away, the first time it
+// happens for the connection currently holding it.
+func (s *server) logRefusalOnce() {
+	s.mu.Lock()
+	first := !s.refusalLogged
+	s.refusalLogged = true
+	s.mu.Unlock()
+	if first {
+		lifecycle("refused a second client — this agent is locked to the one already connected (--allow-multiple lifts that); further attempts stay quiet until it disconnects")
+	}
+}
+
+// release gives the slot back and reports how many are still held.
+func (s *server) release() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clients--
+	s.refusalLogged = false
+	return s.clients
+}
+
+func (s *server) held() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.clients
+}
+
+// lifecycle reports a connection coming or going, on stderr rather than stdout.
+//
+// stdout carries exactly one thing scripts parse — the URL with the token — and
+// a line arriving there later, on somebody else's schedule, is the kind of
+// thing that breaks a pipe reader six months from now.
+func lifecycle(message string) {
+	fmt.Fprintf(os.Stderr, "agent: %s\n", message)
+}
+
+// refuse logs why a request was turned away and reports it as not allowed.
+//
+// From the browser's side a rejected upgrade looks exactly like an agent that
+// is not running, so without this line the user goes off to debug a process
+// that is doing precisely what it was told.
+func refuse(what, value, hint string) bool {
+	if value == "" {
+		value = "(none)"
+	}
+	fmt.Fprintf(os.Stderr, "agent: refused %s %s — %s\n", what, value, hint)
+	return false
 }
 
 func (s *server) originAllowed(origin string) bool {
 	if origin == "" {
-		return true // non-browser client; the token still gates it
+		// A browser always sends one. The absence of the header is therefore
+		// never the app, and it used to be the way past this check entirely.
+		if s.allowNoOrigin {
+			return true
+		}
+		return refuse("client with no Origin", "", "pass --allow-no-origin to permit non-browser clients")
 	}
 	trimmed := strings.TrimRight(origin, "/")
+	for _, o := range defaultOrigins {
+		if o == trimmed {
+			return true
+		}
+	}
 	for _, o := range s.origins {
 		if o == trimmed {
 			return true
 		}
 	}
-	return loopbackOrigin.MatchString(origin)
+	return refuse("origin", origin, "pass --allow-origin "+origin)
+}
+
+// hostAllowed is the second lock, and the one that does not depend on the
+// browser volunteering a header we like.
+//
+// A page on attacker.example whose DNS answers 127.0.0.1 reaches this process
+// directly — DNS rebinding. Such a request carries the attacker's own Origin
+// and the check above refuses it, but that is one check, and under
+// --allow-no-origin there is no Origin to judge. The name the request arrived
+// under is the other half: the browser puts the rebound hostname in Host, and
+// that is never one of ours.
+func (s *server) hostAllowed(host string) bool {
+	expected := "127.0.0.1:" + strconv.Itoa(s.port)
+	if host == "" {
+		return refuse("request with no Host header", "", "expected "+expected)
+	}
+	name, port, err := net.SplitHostPort(host)
+	if err != nil {
+		return refuse("unparseable Host", host, "expected "+expected)
+	}
+	if loopbackHosts[name] && port == strconv.Itoa(s.port) {
+		return true
+	}
+	return refuse("Host", host, "this agent answers to "+expected+" only")
 }
 
 func (s *server) cors(w http.ResponseWriter, origin string) {
@@ -374,6 +519,15 @@ func (s *server) cors(w http.ResponseWriter, origin string) {
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
+
+	// Before anything else, the preflight included: a request that reached this
+	// port under a name that is not ours gets nothing back, not even the CORS
+	// grant that would tell the page it is worth trying again.
+	if !s.hostAllowed(r.Host) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
 	s.cors(w, origin)
 
 	if r.Method == http.MethodOptions {
@@ -394,6 +548,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"agent": "enc-tool", "version": version})
 
 	case "/ws":
+		// Order matters: the specific refusals first, so a foreign origin or a
+		// bad token still says so rather than "busy".
 		if !s.originAllowed(origin) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
@@ -402,21 +558,46 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		if !s.take() {
+			s.logRefusalOnce()
+			http.Error(w, "agent busy", http.StatusConflict)
+			return
+		}
 		ws, err := wsUpgrade(w, r)
 		if err != nil {
+			s.release()
 			http.Error(w, "upgrade failed", http.StatusBadRequest)
 			return
 		}
-		s.serveConn(ws)
+		s.serveConn(ws, origin)
 
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
 }
 
-func (s *server) serveConn(ws *wsConn) {
-	conn := &connection{ws: ws, inflight: map[int64]context.CancelFunc{}}
+func (s *server) serveConn(ws *wsConn, origin string) {
+	if origin == "" {
+		origin = "(no Origin)"
+	}
+	if s.allowMultiple {
+		lifecycle(fmt.Sprintf("client connected — %s (%d connected)", origin, s.held()))
+	} else {
+		lifecycle(fmt.Sprintf("client connected — %s — locked: no other client until this one disconnects", origin))
+	}
+
+	conn := &connection{
+		ws:       ws,
+		slots:    make(chan struct{}, maxConcurrentProcs),
+		inflight: map[int64]context.CancelFunc{},
+	}
 	defer func() {
+		left := s.release()
+		if s.allowMultiple {
+			lifecycle(fmt.Sprintf("client disconnected — %s (%d connected)", origin, left))
+		} else {
+			lifecycle(fmt.Sprintf("client disconnected — %s — unlocked, accepting a connection again", origin))
+		}
 		ws.close()
 		conn.mu.Lock()
 		if conn.watcher != nil {
@@ -478,6 +659,11 @@ func (s *server) dispatch(conn *connection, r *req) {
 			delete(conn.inflight, r.id)
 			conn.mu.Unlock()
 		}()
+
+		if spawnsProcess(r.op) {
+			conn.slots <- struct{}{}
+			defer func() { <-conn.slots }()
+		}
 
 		c := &opCtx{ctx: ctx, jail: s.jail, cwd: s.jail.root, info: s.info, conn: conn, id: r.id}
 		data, err := handler(c, r)

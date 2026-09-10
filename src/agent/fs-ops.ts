@@ -68,6 +68,11 @@ export async function readTextFile(jail: Jail, path: string): Promise<FileRead> 
 }
 
 export async function writeTextFile(jail: Jail, path: string, text: string): Promise<{ mtime: number }> {
+  // Reads stop at MAX_TEXT, but the socket accepts a 32 MB frame, so writes had
+  // no ceiling at all: a client could put far more on the disk than the editor
+  // could ever open again. A write that no read can return is not an edit.
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes > MAX_TEXT) throw new Error(`Text is too large: ${bytes} bytes (limit ${MAX_TEXT})`);
   const abs = await jail.toAbsForWrite(path);
   await writeFile(abs, text, "utf8");
   const st = await stat(abs);

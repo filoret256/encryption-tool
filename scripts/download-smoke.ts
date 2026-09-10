@@ -11,6 +11,7 @@
  *  through an allowlist built from the manifest, and the traversal attempts
  *  below are what keeps it that way.
  */
+import { connect } from "node:net";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
@@ -293,18 +294,117 @@ try {
 
     const allowed = await at(5096, "/ping", ALLOWED);
     const foreign = await at(5096, "/ping", FOREIGN);
-    const loopback = await at(5096, "/ping", "http://localhost:5000");
-    await Promise.all([allowed.text(), foreign.text(), loopback.text()]);
+    // The web app's own default port is trusted without a flag.
+    const appPort = await at(5096, "/ping", "http://localhost:5000");
+    // Any other local server is not: this is the loopback wildcard that used
+    // to make every dev server on the machine — and an XSS in any of them —
+    // as privileged as the app itself.
+    const otherLocal = await at(5096, "/ping", "http://localhost:9999");
+    await Promise.all([allowed.text(), foreign.text(), appPort.text(), otherLocal.text()]);
     check(
       "the agent answers the allowed origin and refuses others",
-      allowed.status === 200 && foreign.status === 403 && loopback.status === 200,
-      `allowed ${allowed.status}, foreign ${foreign.status}, loopback ${loopback.status}`,
+      allowed.status === 200 && foreign.status === 403 && appPort.status === 200 && otherLocal.status === 403,
+      `allowed ${allowed.status}, foreign ${foreign.status}, app port ${appPort.status}, other local port ${otherLocal.status}`,
     );
     check(
       "a refused origin gets no CORS grant either",
       foreign.headers.get("access-control-allow-origin") === null &&
         allowed.headers.get("access-control-allow-origin") === ALLOWED,
       "the browser is not told it may read the response",
+    );
+
+    // A browser always sends an Origin, so a request without one is not the
+    // app. It used to be the way past the check entirely.
+    const noOrigin = await fetch("http://127.0.0.1:5096/ping");
+    await noOrigin.text();
+    const stopOpenAgent = await startAgent(5092, ["--root", dir, "--allow-no-origin"]);
+    let withFlag: Response;
+    try {
+      withFlag = await fetch("http://127.0.0.1:5092/ping");
+      await withFlag.text();
+    } finally {
+      stopOpenAgent();
+    }
+    check(
+      "a client sending no Origin is refused unless the flag says otherwise",
+      noOrigin.status === 403 && withFlag.status === 200,
+      `without the flag ${noOrigin.status}, with --allow-no-origin ${withFlag.status}`,
+    );
+
+    // One client at a time, unless told otherwise. The lock is checked after
+    // origin and token, so a foreign origin still hears "forbidden" rather
+    // than "busy".
+    const wsAt = (port: number): Promise<WebSocket | string> =>
+      new Promise((resolve) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}/ws?token=smoke`, {
+          headers: { Origin: ALLOWED },
+        } as unknown as string[]);
+        const timer = setTimeout(() => resolve("timeout"), 4000);
+        ws.addEventListener("open", () => {
+          clearTimeout(timer);
+          resolve(ws);
+        });
+        ws.addEventListener("error", () => {
+          clearTimeout(timer);
+          resolve("refused");
+        });
+      });
+
+    const stopLocked = await startAgent(5090, ["--root", dir, "--allow-origin", ALLOWED]);
+    const stopShared = await startAgent(5089, ["--root", dir, "--allow-origin", ALLOWED, "--allow-multiple"]);
+    let lockResult = "";
+    let sharedResult = "";
+    try {
+      const held = await wsAt(5090);
+      const secondOnLocked = await wsAt(5090);
+      lockResult = typeof secondOnLocked === "string" ? secondOnLocked : "CONNECTED";
+      if (typeof held !== "string") held.close();
+      // The slot comes back when the holder goes away.
+      await new Promise((r) => setTimeout(r, 800));
+      const afterRelease = await wsAt(5090);
+      const reclaimed = typeof afterRelease === "string" ? afterRelease : "CONNECTED";
+      if (typeof afterRelease !== "string") afterRelease.close();
+
+      const firstShared = await wsAt(5089);
+      const secondShared = await wsAt(5089);
+      sharedResult = typeof secondShared === "string" ? secondShared : "CONNECTED";
+      if (typeof firstShared !== "string") firstShared.close();
+      if (typeof secondShared !== "string") secondShared.close();
+
+      check(
+        "the agent serves one client at a time, and --allow-multiple lifts it",
+        lockResult === "refused" && reclaimed === "CONNECTED" && sharedResult === "CONNECTED",
+        `second client ${lockResult}, after release ${reclaimed}, with --allow-multiple ${sharedResult}`,
+      );
+    } finally {
+      stopLocked();
+      stopShared();
+    }
+
+    // DNS rebinding: attacker.example resolves to 127.0.0.1, so the request
+    // does arrive here — carrying the name it was asked for. fetch() will not
+    // set Host (a forbidden header there), and choosing it is the whole
+    // attack, so this speaks HTTP itself.
+    const CRLF = String.fromCharCode(13, 10);
+    const rawGet = (port: number, host: string): Promise<string> =>
+      new Promise((resolve, reject) => {
+        const socket = connect(port, "127.0.0.1", () => {
+          socket.write(
+            ["GET /ping HTTP/1.1", `Host: ${host}`, `Origin: ${ALLOWED}`, "Connection: close", "", ""].join(CRLF),
+          );
+        });
+        let buf = "";
+        socket.setEncoding("utf8");
+        socket.on("data", (d) => (buf += d));
+        socket.on("end", () => resolve(buf));
+        socket.on("error", reject);
+      });
+    const rebound = await rawGet(5096, "attacker.example:5096");
+    const ownName = await rawGet(5096, "127.0.0.1:5096");
+    check(
+      "a request arriving under another host name is refused",
+      rebound.startsWith("HTTP/1.1 403") && ownName.startsWith("HTTP/1.1 200"),
+      `Host: attacker.example -> ${rebound.slice(9, 12)}, Host: 127.0.0.1 -> ${ownName.slice(9, 12)}`,
     );
 
     // Origin is checked before the token, so a stolen token is still useless

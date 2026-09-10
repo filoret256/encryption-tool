@@ -44,6 +44,10 @@ const argvFor = (impl: Impl, root: string, port: number): string[] => [
   root,
   "--port",
   String(port),
+  // This harness is not a browser and sends no Origin, which the agent now
+  // refuses by default. Saying so explicitly is the point: the flag is the
+  // only way in for a non-browser client, and these tests are one.
+  "--allow-no-origin",
 ];
 
 // ── building the Go agent ─────────────────────────────────────────────────
@@ -548,6 +552,16 @@ async function hardening(
     await denied("the remote action is not a git subcommand", "git.remote",
       { action: "clone", remote: "origin" }, /^Invalid remote action:/);
     await allowed("git.remotes still lists the configured one", "git.remotes", {}, "origin");
+
+    // ── write size ──
+    //
+    // Reads stop at 4 MB; writes used to stop only at the 32 MB WebSocket
+    // frame, which let a client put on the disk what no read could return.
+    const overCap = "x".repeat(4 * 1024 * 1024 + 1);
+    await denied("a write past the read limit is refused", "fs.write",
+      { path: "too-big.txt", text: overCap }, /^Text is too large: [0-9]+ bytes .limit 4194304.$/);
+    await allowed("a write at the limit still goes through", "fs.write",
+      { path: "at-limit.txt", text: "y".repeat(4 * 1024 * 1024) }, "exactly 4 MB");
   } catch (e) {
     check("unexpected error (hardening)", false, e instanceof Error ? e.message : String(e));
   } finally {

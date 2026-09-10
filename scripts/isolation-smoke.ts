@@ -334,6 +334,31 @@ try {
     second.close();
   }
 
+  // ── 5b. a burst of process-spawning requests is queued, not dropped ──
+  //
+  // Every git op and every search forks a child, and nothing used to bound how
+  // many could be in flight: search-as-you-type issues one per keystroke. They
+  // are now capped per connection (MAX_CONCURRENT_PROCS) and the surplus waits
+  // its turn — so what this asserts is that waiting is all it does. Every reply
+  // still arrives, still carries its own request's id, and still says the same
+  // thing it would have said alone.
+  const alone = await agentA.call<{ files: number }>("search", { query: "private", matchCase: false, wholeWord: false, regex: false });
+  // Captured, because narrowing of a module-level `let` does not survive into
+  // a closure — and every one of these calls is made from one.
+  const agent = agentA;
+  const burst = await Promise.all(
+    Array.from({ length: 24 }, (_, i) =>
+      i % 2 === 0
+        ? agent.call<{ files: number }>("search", { query: "private", matchCase: false, wholeWord: false, regex: false })
+        : agent.call<{ files: number }>("git.status", {}).then(() => ({ files: alone.files })),
+    ),
+  );
+  check(
+    "a burst of process-spawning requests all complete",
+    burst.length === 24 && burst.every((r) => r.files === alone.files),
+    `24 concurrent search/git.status calls, every reply matching the same call made alone (${alone.files} file)`,
+  );
+
   // ── 6. the agent is not reachable from the network ──
   const lan = Object.values(networkInterfaces())
     .flat()

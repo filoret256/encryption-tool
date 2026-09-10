@@ -46,7 +46,7 @@ if (typeof document !== "undefined") {
   document.addEventListener("securitypolicyviolation", (e) => {
     if (!(e.effectiveDirective || e.violatedDirective).startsWith("connect-src")) return;
     try {
-      blockedPorts.add(new global.URL(e.blockedURI).port);
+      blockedPorts.add(new URL(e.blockedURI).port);
     } catch {
       /* blockedURI is not always a URL — it can be "self", "inline", a bare scheme */
     }
@@ -57,7 +57,7 @@ if (typeof document !== "undefined") {
 function unreachableReason(url: string): string {
   let port: string;
   try {
-    port = new global.URL(url).port;
+    port = new URL(url).port;
   } catch {
     return UNREACHABLE;
   }
@@ -103,7 +103,7 @@ export class AgentClient {
    *  so the badge can say something useful instead of just "failed". */
   static async probe(wsUrl: string): Promise<boolean> {
     try {
-      const u = new global.URL(wsUrl);
+      const u = new URL(wsUrl);
       u.protocol = u.protocol === "wss:" ? "https:" : "http:";
       u.pathname = "/ping";
       u.search = "";
@@ -123,7 +123,18 @@ export class AgentClient {
     } catch {
       /* private mode — the session still works, it just will not be remembered */
     }
-    return this.open();
+    try {
+      return await this.open();
+    } catch (e) {
+      // A refused WebSocket carries no reason a page is allowed to read, so a
+      // busy agent and a stopped one look identical here. /ping tells them
+      // apart: it answers only if the agent is up and this origin is welcome,
+      // which leaves exactly one explanation for the socket being turned away.
+      if (this.lastError === UNREACHABLE && (await AgentClient.probe(this.url))) {
+        this.fail("the agent is running but refused this connection — it is already serving another tab");
+      }
+      throw e instanceof Error && !this.lastError ? e : new Error(this.lastError);
+    }
   }
 
   private open(): Promise<AgentInfo> {

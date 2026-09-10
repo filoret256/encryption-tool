@@ -12,7 +12,9 @@ export interface Harness {
 /** `env` lets a test start the agent with a doctored PATH — that is how the
  *  ripgrep and fallback search engines get compared against each other. */
 export async function startAgent(root: string, port: number, env?: Record<string, string>): Promise<Harness> {
-  const proc = Bun.spawn(["bun", "src/agent/cli.ts", "--root", root, "--port", String(port)], {
+  // No Origin header comes from a Bun WebSocket, and the agent refuses such a
+  // client unless told otherwise — see --allow-no-origin in src/agent/main.ts.
+  const proc = Bun.spawn(["bun", "src/agent/cli.ts", "--root", root, "--port", String(port), "--allow-no-origin"], {
     cwd: process.cwd(),
     env: env ?? (process.env as Record<string, string>),
     stdout: "pipe",

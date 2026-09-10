@@ -104,6 +104,13 @@ func readTextFile(j *jail, path string) (*fileRead, error) {
 }
 
 func writeTextFile(j *jail, path, text string) (map[string]int64, error) {
+	// Reads stop at maxTextBytes, but the socket accepts a 32 MB frame, so writes
+	// had no ceiling at all: a client could put far more on the disk than the
+	// editor could ever open again. A write that no read can return is not an
+	// edit.
+	if len(text) > maxTextBytes {
+		return nil, fmt.Errorf("Text is too large: %d bytes (limit %d)", len(text), maxTextBytes)
+	}
 	abs, err := j.toAbsForWrite(path)
 	if err != nil {
 		return nil, err

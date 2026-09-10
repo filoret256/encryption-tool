@@ -43,7 +43,16 @@ and be pointed at a project instead of copied into one:
   --port <n>              loopback port (default: 5001)
   --token <str>           fixed access token (default: random, printed below)
   --allow-origin <url>    origin allowed to connect, repeatable
-                          (loopback origins are always allowed)
+                          (http://localhost:5000 and http://127.0.0.1:5000 are
+                          allowed by default — the web app's own port)
+  --allow-no-origin       also accept clients that send no Origin header:
+                          curl, scripts, anything that is not a browser. Off by
+                          default — a browser always sends one, so a missing
+                          Origin is never the app.
+  --allow-multiple        serve more than one client at once. By default the
+                          agent takes a single connection and refuses the rest
+                          while it is held, so it is always clear which page is
+                          holding the folder.
   --no-clipboard          do not copy the URL to the clipboard on startup
   --version               print the version and exit
 
@@ -54,11 +63,13 @@ Environment:
 The agent listens on 127.0.0.1 only. Paste the URL below into the editor tab.`
 
 type options struct {
-	root        string
-	port        int
-	token       string
-	origins     []string
-	noClipboard bool
+	root          string
+	port          int
+	token         string
+	origins       []string
+	noClipboard   bool
+	allowNoOrigin bool
+	allowMultiple bool
 }
 
 // envOrigins reads comma- or space-separated origins from the environment.
@@ -127,6 +138,10 @@ func parseArgs(argv []string) options {
 			o.origins = append(o.origins, strings.TrimSuffix(value(), "/"))
 		case "--no-clipboard":
 			o.noClipboard = true
+		case "--allow-no-origin":
+			o.allowNoOrigin = true
+		case "--allow-multiple":
+			o.allowMultiple = true
 		case "--version", "-v":
 			fmt.Println(version)
 			os.Exit(0)
@@ -213,7 +228,15 @@ func main() {
 		Watch: watcherSupported(j.root),
 	}
 
-	srv := &server{jail: j, info: info, token: token, origins: opts.origins, isRepo: top != ""}
+	srv := &server{
+		jail:          j,
+		info:          info,
+		token:         token,
+		origins:       opts.origins,
+		allowNoOrigin: opts.allowNoOrigin,
+		allowMultiple: opts.allowMultiple,
+		isRepo:        top != "",
+	}
 
 	listener, err := listenLoopback(opts.port)
 	if err != nil {
@@ -221,6 +244,9 @@ func main() {
 		os.Exit(1)
 	}
 	port := listener.Addr().(*net.TCPAddr).Port
+	// The Host check compares against the port this agent actually answers on,
+	// which is the one the listener reports.
+	srv.port = port
 
 	gitLine := "NOT FOUND — git operations are unavailable"
 	if info.GitVersion != nil {
@@ -234,9 +260,14 @@ func main() {
 	if info.Watch {
 		watchLine = "live"
 	}
-	originLine := "loopback only (pass --allow-origin for a remote UI)"
-	if len(opts.origins) > 0 {
-		originLine = strings.Join(opts.origins, ", ")
+	originLine := strings.Join(append(append([]string{}, defaultOrigins...), opts.origins...), ", ")
+	noOriginLine := "refused"
+	if opts.allowNoOrigin {
+		noOriginLine = "accepted (--allow-no-origin)"
+	}
+	clientsLine := "one at a time — the second is refused while the first holds"
+	if opts.allowMultiple {
+		clientsLine = "many (--allow-multiple)"
 	}
 
 	url := fmt.Sprintf("ws://127.0.0.1:%d/ws?token=%s", port, token)
@@ -257,11 +288,13 @@ enc-tool agent %s
   ripgrep   %s
   watcher   %s
   origins   %s
+  no-origin %s
+  clients   %s
 
   Paste this into the editor tab:
   %s%s
 
-`, version, j.root, gitLine, rgLine, watchLine, originLine, url, clipLine)
+`, version, j.root, gitLine, rgLine, watchLine, originLine, noOriginLine, clientsLine, url, clipLine)
 
 	httpSrv := &http.Server{Handler: srv}
 	if err := httpSrv.Serve(listener); err != nil {

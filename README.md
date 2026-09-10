@@ -105,6 +105,10 @@ It prints a `ws://127.0.0.1:5001/ws?token=…` URL — paste it into the code ta
 --port <n>              loopback port (default: 5001)
 --token <str>           fixed access token (default: random, printed at startup)
 --allow-origin <url>    origin allowed to connect, repeatable
+                        (http://localhost:5000 and http://127.0.0.1:5000 are
+                        allowed by default — the web app's own port)
+--allow-no-origin       also accept clients that send no Origin header at all
+--allow-multiple        serve more than one client at once (default: one)
 --no-clipboard          do not copy the URL to the clipboard on startup
 ```
 
@@ -219,13 +223,33 @@ any Go at all, the smoke suite says so and runs the TypeScript half.
 
 ### Security / Безопасность
 
-The agent is a filesystem bridge, so four things gate it:
+The agent is a filesystem bridge, so five things gate it:
 
 1. binds **`127.0.0.1` only** — never reachable from the network;
 2. a **token** is required on every connection;
-3. the **`Origin` header** is checked against an allowlist (loopback always allowed);
-4. every path is confined to the workspace — lexical checks plus a `realpath` test, so
+3. the **`Origin` header** is checked against an allowlist. Allowed by default:
+   the web app's own default port (`http://localhost:5000`, `http://127.0.0.1:5000`)
+   and nothing else. A request with **no** `Origin` is refused unless
+   `--allow-no-origin` says otherwise — a browser always sends one, so a missing
+   `Origin` is never the app;
+4. the **`Host` header** must name this agent: `127.0.0.1`, `localhost` or `[::1]`
+   on its own port. This is what stops DNS rebinding, where a name the attacker
+   controls resolves to `127.0.0.1` and the request arrives here under it;
+5. every path is confined to the workspace — lexical checks plus a `realpath` test, so
    a symlink inside the folder cannot point out of it.
+
+One client at a time. The agent takes a single connection and refuses the rest
+while it is held — so it is always clear which page has the folder — and says so
+on stderr: `client connected … locked`, `refused a second client`,
+`client disconnected … unlocked`. A second tab is told the agent is busy rather
+than left guessing why it will not connect. `--allow-multiple` lifts the limit
+for the case where two panes onto one folder is the point.
+
+Two ceilings keep one connection from being the whole machine: a file write is
+refused above the 4 MB that a read would return anyway, and the ops that spawn a
+child process — every `git.*` and `search` — are capped at four at a time per
+connection. Past that they queue, so search-as-you-type is a wait rather than a
+process per keystroke.
 
 Git is spawned with an argv array (never a shell) and `GIT_TERMINAL_PROMPT=0`.
 Credentials are never handled by this app: the system credential helper and your SSH
@@ -235,7 +259,11 @@ agent do that, so no token ever reaches the browser or the server.
 > `enc-tool agent --allow-origin https://your-host`, or sets `ENC_TOOL_ALLOW_ORIGIN`
 > once instead of passing the flag every time. Any page from that origin can then
 > talk to that user's agent — trusting the server means trusting it with your working
-> directory. Without either, only `localhost` origins can connect.
+> directory. Without either, only the app's own default port on `localhost` connects.
+>
+> Serving the app on some other local port? Name it: `--allow-origin http://localhost:3000`.
+> Every refusal is logged to the agent's stderr with the flag that would permit it,
+> because a rejected connection looks identical to a stopped agent from the browser.
 
 ---
 

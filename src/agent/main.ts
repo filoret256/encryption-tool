@@ -33,7 +33,26 @@ interface Options {
   token: string;
   origins: string[];
   noClipboard: boolean;
+  allowNoOrigin: boolean;
+  allowMultiple: boolean;
 }
+
+/** Origins trusted without being named on the command line: the port the web
+ *  app is served from by default (src/server.ts PORT), and nothing else.
+ *
+ *  What this replaced was a pattern matching *any* loopback origin on *any*
+ *  port, which meant every other dev server on the machine — and script
+ *  injected into any of them — spoke to this agent with the same authority as
+ *  the app itself. A user serving the app elsewhere names it with
+ *  --allow-origin: one flag, against a whole class of silent access. */
+const DEFAULT_ORIGINS = ["http://localhost:5000", "http://127.0.0.1:5000", "http://[::1]:5000"];
+
+/** Names this agent answers to. Anything else arrived here under a name we did
+ *  not choose — see hostAllowed(). */
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/** Character class rather than an escape, to match envOrigins() above. */
+const TRAILING_SLASH = /[/]+$/;
 
 /** Comma- or space-separated origins from the environment.
  *
@@ -54,7 +73,15 @@ function fail(message: string): never {
 }
 
 function parseArgs(argv: string[]): Options {
-  const o: Options = { root: "", port: 5001, token: "", origins: envOrigins(), noClipboard: false };
+  const o: Options = {
+    root: "",
+    port: 5001,
+    token: "",
+    origins: envOrigins(),
+    noClipboard: false,
+    allowNoOrigin: false,
+    allowMultiple: false,
+  };
   let rootFrom = "";
 
   const setRoot = (dir: string, source: string): void => {
@@ -74,6 +101,8 @@ function parseArgs(argv: string[]): Options {
       case "--token": o.token = value(); break;
       case "--allow-origin": o.origins.push(value().replace(/\/$/, "")); break;
       case "--no-clipboard": o.noClipboard = true; break;
+      case "--allow-no-origin": o.allowNoOrigin = true; break;
+      case "--allow-multiple": o.allowMultiple = true; break;
       case "--version":
       case "-v":
         console.log(VERSION);
@@ -109,7 +138,16 @@ and be pointed at a project instead of copied into one:
   --port <n>              loopback port (default: 5001)
   --token <str>           fixed access token (default: random, printed below)
   --allow-origin <url>    origin allowed to connect, repeatable
-                          (loopback origins are always allowed)
+                          (http://localhost:5000 and http://127.0.0.1:5000 are
+                          allowed by default — the web app's own port)
+  --allow-no-origin       also accept clients that send no Origin header:
+                          curl, scripts, anything that is not a browser. Off by
+                          default — a browser always sends one, so a missing
+                          Origin is never the app.
+  --allow-multiple        serve more than one client at once. By default the
+                          agent takes a single connection and refuses the rest
+                          while it is held, so it is always clear which page is
+                          holding the folder.
   --no-clipboard          do not copy the URL to the clipboard on startup
   --version               print the version and exit
 
@@ -121,10 +159,57 @@ The agent listens on 127.0.0.1 only. Paste the URL below into the editor tab.`;
 
 // ── connection state ──────────────────────────────────────────────────────
 
+/** How many child processes one connection may have running at once.
+ *
+ *  `search` and every git op spawn one. Search-as-you-type issues a request per
+ *  keystroke, and nothing bounded how many of those could be running: the cap
+ *  turns a burst into a queue instead of a fork bomb. Four is enough that no
+ *  single slow scan blocks the panel a user is looking at. */
+const MAX_CONCURRENT_PROCS = 4;
+
+/** A counting semaphore, per connection.
+ *
+ *  Queues rather than refuses: the client asked for work it is entitled to, and
+ *  a request that waits its turn is an ordinary slow response, while one that
+ *  fails is an error the UI has to explain. */
+class Slots {
+  private free: number;
+  private waiting: (() => void)[] = [];
+
+  constructor(limit: number) {
+    this.free = limit;
+  }
+
+  async acquire(): Promise<void> {
+    if (this.free > 0) {
+      this.free--;
+      return;
+    }
+    await new Promise<void>((resolve) => this.waiting.push(resolve));
+  }
+
+  release(): void {
+    const next = this.waiting.shift();
+    if (next) next();
+    else this.free++;
+  }
+
+  /** Let everyone through, for a connection that is going away: a waiter that
+   *  is never resolved is a promise that never settles. */
+  drain(): void {
+    for (const resolve of this.waiting.splice(0)) resolve();
+  }
+}
+
+/** Ops that start a child process, and so are worth counting. */
+const spawnsProcess = (op: string): boolean => op === "search" || op.startsWith("git.");
+
 interface Conn {
   watcher: Watcher | null;
   /** Cancellation flags for requests still running, keyed by request id. */
   inflight: Map<number, Signal>;
+  /** Bounds concurrent child processes — see MAX_CONCURRENT_PROCS. */
+  slots: Slots;
 }
 
 // ── op dispatch ───────────────────────────────────────────────────────────
@@ -304,10 +389,51 @@ export async function startAgent(argv: string[]): Promise<void> {
   info.watch = probeWatcher !== null;
   probeWatcher?.close();
 
+  const allowedOrigins = new Set([...DEFAULT_ORIGINS, ...opts.origins]);
+
+  /** Refusals are logged: from the browser's side a rejected upgrade looks
+   *  exactly like an agent that is not running, so without this line the user
+   *  goes off to debug a process that is doing precisely what it was told. */
+  const refuse = (what: string, value: string, hint: string): false => {
+    console.error(`agent: refused ${what} ${value || "(none)"} — ${hint}`);
+    return false;
+  };
+
   const originAllowed = (origin: string | null): boolean => {
-    if (!origin) return true; // non-browser client; the token still gates it
-    if (opts.origins.includes(origin.replace(/\/$/, ""))) return true;
-    return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(origin);
+    if (!origin) {
+      // A browser always sends one. The absence of the header is therefore
+      // never the app, and used to be the way past this check entirely.
+      return (
+        opts.allowNoOrigin ||
+        refuse("client with no Origin", "", "pass --allow-no-origin to permit non-browser clients")
+      );
+    }
+    if (allowedOrigins.has(origin.replace(TRAILING_SLASH, ""))) return true;
+    return refuse("origin", origin, `pass --allow-origin ${origin}`);
+  };
+
+  /** The second lock, and the one that does not depend on the browser
+   *  volunteering a header we like.
+   *
+   *  A page on attacker.example whose DNS answers 127.0.0.1 reaches this
+   *  process directly — DNS rebinding. Such a request carries the attacker's
+   *  own Origin and the check above refuses it, but it is one check, and with
+   *  --allow-no-origin there is no Origin to judge. The name the request
+   *  arrived under is the other half: the browser puts the rebound hostname
+   *  in Host, and that is never one of ours. */
+  const hostAllowed = (host: string | null, port: number): boolean => {
+    // The bound port, not the one that was asked for: they are the same today,
+    // but the name this agent answers to is the one it actually got.
+    const expected = `127.0.0.1:${port}`;
+    if (!host) return refuse("request with no Host header", "", "expected " + expected);
+    let parsed: URL;
+    try {
+      parsed = new URL(`http://${host}`);
+    } catch {
+      return refuse("unparseable Host", host, "expected " + expected);
+    }
+    if (LOOPBACK_HOSTS.has(parsed.hostname) && parsed.port === String(port)) return true;
+    return refuse("Host", host, "this agent answers to " + expected + " only");
   };
 
   const cors = (origin: string | null): Record<string, string> =>
@@ -322,13 +448,53 @@ export async function startAgent(argv: string[]): Promise<void> {
         }
       : {};
 
-  const server = Bun.serve<{ conn: Conn }>({
+  /** Connections held right now. The lock in the /ws branch reads it, and the
+   *  startup banner promises what it will do. */
+  let clients = 0;
+
+  /** Whether the current lock has already been reported. Reset when it lifts. */
+  let refusalLogged = false;
+
+  /** Connection lifecycle goes to stderr, not stdout.
+   *
+   *  stdout carries exactly one thing scripts parse — the URL with the token —
+   *  and a line arriving there later, on somebody else's schedule, is the kind
+   *  of thing that breaks a pipe reader six months from now. */
+  const lifecycle = (message: string): void => console.error(`agent: ${message}`);
+
+  /** Wrapped so a taken port reads as a sentence rather than a stack trace.
+   *
+   *  Running a second agent on a second folder is an ordinary thing to do, and
+   *  the first thing that happens is this — the Go agent already says it in one
+   *  line, and there is no reason for the two to differ. */
+  const listen = <T>(start: () => T): T => {
+    try {
+      return start();
+    } catch (e) {
+      const code = (e as { code?: string }).code;
+      if (code === "EADDRINUSE") {
+        console.error(`agent: cannot listen on 127.0.0.1:${opts.port}: address already in use`);
+        console.error("agent: another agent is probably on that port — pass --port <n> to pick a free one");
+      } else {
+        console.error(`agent: cannot listen on 127.0.0.1:${opts.port}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      process.exit(1);
+    }
+  };
+
+  const server = listen(() =>
+    Bun.serve<{ conn: Conn; origin: string }>({
     port: opts.port,
     hostname: "127.0.0.1",
     fetch(req, srv) {
       const url = new URL(req.url);
       const origin = req.headers.get("origin");
       const headers = cors(origin);
+
+      // Before anything else, the preflight included: a request that reached
+      // this port under a name that is not ours gets nothing back, not even the
+      // CORS grant that would tell the page it is worth trying again.
+      if (!hostAllowed(req.headers.get("host"), srv.port ?? opts.port)) return new Response("forbidden", { status: 403 });
 
       if (req.method === "OPTIONS") return new Response(null, { status: 204, headers });
 
@@ -341,9 +507,29 @@ export async function startAgent(argv: string[]): Promise<void> {
       }
 
       if (url.pathname === "/ws") {
+        // Order matters: the specific refusals first, so a foreign origin or a
+        // bad token still says so rather than "busy".
         if (!originAllowed(origin)) return new Response("forbidden", { status: 403, headers });
         if (url.searchParams.get("token") !== token) return new Response("unauthorized", { status: 401, headers });
-        if (srv.upgrade(req, { data: { conn: { watcher: null, inflight: new Map() } } })) return undefined;
+        if (!opts.allowMultiple && clients > 0) {
+          // Once per lock, not once per attempt: a refused tab keeps
+          // reconnecting on a backoff, and a line every few seconds would bury
+          // the one event worth seeing.
+          if (!refusalLogged) {
+            refusalLogged = true;
+            lifecycle(
+              "refused a second client — this agent is locked to the one already connected (--allow-multiple lifts that); further attempts stay quiet until it disconnects",
+            );
+          }
+          return new Response("agent busy", { status: 409, headers });
+        }
+        // Counted here rather than in open(): between this check and the
+        // handshake completing there is a turn of the loop, and two upgrades
+        // arriving in it would both have seen zero.
+        clients++;
+        const conn: Conn = { watcher: null, inflight: new Map(), slots: new Slots(MAX_CONCURRENT_PROCS) };
+        if (srv.upgrade(req, { data: { conn, origin: origin ?? "(no Origin)" } })) return undefined;
+        clients--;
         return new Response("upgrade failed", { status: 400, headers });
       }
       return new Response("not found", { status: 404, headers });
@@ -377,7 +563,15 @@ export async function startAgent(argv: string[]): Promise<void> {
         // starting with "-" threw before any promise existed. That escaped this
         // callback and killed the process — a crash reachable by exactly the
         // input the validation was written to reject.
-        void (async () => handler(ctx, req))()
+        void (async () => {
+          if (!spawnsProcess(req.op)) return handler(ctx, req);
+          await conn.slots.acquire();
+          try {
+            return await handler(ctx, req);
+          } finally {
+            conn.slots.release();
+          }
+        })()
           .then(
             (data) => send({ id: req.id, ok: true, data }),
             (e: unknown) => {
@@ -387,15 +581,33 @@ export async function startAgent(argv: string[]): Promise<void> {
           )
           .finally(() => conn.inflight.delete(req.id));
       },
+      open(ws) {
+        lifecycle(
+          opts.allowMultiple
+            ? `client connected — ${ws.data.origin} (${clients} connected)`
+            : `client connected — ${ws.data.origin} — locked: no other client until this one disconnects`,
+        );
+      },
       close(ws) {
+        clients--;
+        refusalLogged = false;
+        lifecycle(
+          opts.allowMultiple
+            ? `client disconnected — ${ws.data.origin} (${clients} connected)`
+            : `client disconnected — ${ws.data.origin} — unlocked, accepting a connection again`,
+        );
         ws.data.conn.watcher?.close();
         ws.data.conn.watcher = null;
+        // Anything still queued for a slot would otherwise wait for a turn that
+        // is never coming.
+        ws.data.conn.slots.drain();
         // Nothing will read the results now; let running scans stop early.
         for (const signal of ws.data.conn.inflight.values()) signal.cancelled = true;
         ws.data.conn.inflight.clear();
       },
     },
-  });
+  }),
+  );
 
   const url = `ws://127.0.0.1:${server.port}/ws?token=${token}`;
 
@@ -411,7 +623,9 @@ enc-tool agent ${VERSION}
   git       ${info.gitVersion ?? "NOT FOUND — git operations are unavailable"}
   ripgrep   ${info.ripgrep ?? "not found — using the slower built-in search"}
   watcher   ${info.watch ? "live" : "unavailable on this platform"}
-  origins   ${opts.origins.length ? opts.origins.join(", ") : "loopback only (pass --allow-origin for a remote UI)"}
+  origins   ${[...allowedOrigins].join(", ")}
+  no-origin ${opts.allowNoOrigin ? "accepted (--allow-no-origin)" : "refused"}
+  clients   ${opts.allowMultiple ? "many (--allow-multiple)" : "one at a time — the second is refused while the first holds"}
 
   Paste this into the editor tab:
   ${url}${copied ? "\n  ✓ copied to your clipboard" : ""}
