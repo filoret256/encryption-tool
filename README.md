@@ -86,6 +86,18 @@ bun run agent -- ~/work/my-project
 It prints a `ws://127.0.0.1:5001/ws?token=…` URL — paste it into the code tab
 (`connect…`). The tab remembers it.
 
+The agent takes the **first free port in 5001-5010**, so a second folder in a
+second tab needs no flag: start another agent and it lands on 5002. That range
+is not arbitrary — it is exactly what the page's `connect-src` permits (see
+`AGENT_PORTS` below), and a port outside it is refused by the browser before a
+packet leaves, which from the tab looks the same as an agent that never started.
+`--port` still pins one explicitly, and the agent says so on stderr if that port
+falls outside the range.
+
+Агент сам занимает первый свободный порт из 5001-5010 — для второй папки флаг
+не нужен. Порт вне диапазона браузер не пропустит: его запрещает `connect-src`
+страницы, если приложение не запущено с `AGENT_PORTS`.
+
 > **Why a loopback URL works from a page served by a cloud host.** `127.0.0.1` is
 > resolved by the browser, on the machine the browser is running on — the page's
 > JavaScript executes there, so the socket goes to the user's own agent and the
@@ -102,7 +114,8 @@ It prints a `ws://127.0.0.1:5001/ws?token=…` URL — paste it into the code ta
 ```
 [folder]                folder to expose, as the first argument
 --root <dir>            the same thing as a flag (default: current directory)
---port <n>              loopback port (default: 5001)
+--port <n>              pin the loopback port (default: the first free port
+                        in 5001-5010, the range the page may connect to)
 --token <str>           fixed access token (default: random, printed at startup)
 --allow-origin <url>    origin allowed to connect, repeatable
                         (http://localhost:5000 and http://127.0.0.1:5000 are
@@ -326,13 +339,16 @@ needs network access.
 |----------|---------|
 | `AGENT_DIR` | where the archives and `agents.json` live (default: `/usr/local/share/enc-tool/agents`, then `dist/agents`) |
 | `AGENT_DOWNLOAD_BASE` | serve the archives from a mirror rather than from this image |
-| `AGENT_PORTS` | loopback ports the code tab may connect to, comma-separated (default: `5001`) |
+| `AGENT_PORTS` | loopback ports the code tab may connect to — ports and `low-high` ranges, comma-separated (default: `5001-5010`) |
 
-`AGENT_PORTS` is what `connect-src` in the CSP permits. The agent's default is
-5001; if your users start it with `--port`, list that port here, otherwise the
-browser refuses the connection before it is made and the code tab reports the
-port as blocked. A value that is not a port number stops the server at startup
-rather than being ignored.
+`AGENT_PORTS` is what `connect-src` in the CSP permits, and the agent binds the
+first free port in the same range, so the two agree out of the box and several
+folders can be open at once. If your users start agents with `--port` outside
+5001-5010, list those ports here — otherwise the browser refuses the connection
+before it is made, and the code tab says which port was blocked and which ones
+are allowed. A value that is not a port or a range stops the server at startup
+rather than being ignored, and the list is capped at 64 ports because every one
+of them is written out in the header on every response.
 
 Open http://localhost:5000 / Откройте http://localhost:5000
 

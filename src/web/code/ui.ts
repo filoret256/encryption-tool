@@ -28,6 +28,27 @@ const ENTITIES: Record<string, string> = {
 
 export const esc = (s: string): string => s.replace(/[&<>"']/g, (c) => ENTITIES[c]!);
 
+/** The height of one row in every list the code tab draws, in pixels.
+ *
+ *  Four places need this number and three of them are arithmetic, not styling:
+ *  the explorer and the search results size a virtual-scroll spacer by it, and
+ *  the history graph draws its lanes on a canvas exactly this tall. A row whose
+ *  CSS height disagrees with the number used to place it does not look wrong —
+ *  it drifts, a pixel per row, until the rows and what is drawn beside them are
+ *  visibly out of step.
+ *
+ *  It was duplicated in all four, and the history had drifted to 26 while the
+ *  rest stayed at 22. So it is stated here and pushed into CSS by applyRowHeight
+ *  below, rather than written down again in the stylesheet and hoped about. */
+export const ROW_H = 22;
+
+/** Publish ROW_H to CSS as --row. Called once, when the code tab mounts; the
+ *  stylesheet carries the same value as its own default, so the tab still looks
+ *  right in the moment before the code chunk has finished loading. */
+export function applyRowHeight(): void {
+  document.documentElement.style.setProperty("--row", `${ROW_H}px`);
+}
+
 /** Replace a scrollable container's contents without throwing the reader back
  *  to the top.
  *

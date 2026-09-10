@@ -8,6 +8,7 @@
 import type { AgentClient } from "./agent.ts";
 import type { Branch, GitStatus, StatusEntry } from "../../agent/protocol.ts";
 import { esc, modalConfirm, modalPrompt, setHtmlKeepingScroll, showMenu } from "./ui.ts";
+import { iconBranch, iconCheck, iconDiscard, iconFetch, iconMinus, iconMore, iconPlus, iconPull, iconPush } from "./icons.ts";
 
 export interface GitPanelCallbacks {
   /** kind: "worktree" (index vs disk), "staged" (HEAD vs index) or a commit oid. */
@@ -29,13 +30,13 @@ const GROUP_TITLES: Record<Group, string> = {
 
 const SHELL = `
   <div class="gp-head">
-    <button class="t-btn js-branch" type="button" title="Branches">⑂ <span class="js-branch-name">—</span></button>
+    <button class="t-btn js-branch" type="button" title="Branches">${iconBranch}<span class="js-branch-name">—</span></button>
     <span class="gp-sync js-sync"></span>
     <span class="t-spacer"></span>
-    <button class="t-icon js-fetch" type="button" title="Fetch">⟲</button>
-    <button class="t-icon js-pull" type="button" title="Pull">↓</button>
-    <button class="t-icon js-push" type="button" title="Push">↑</button>
-    <button class="t-icon js-more" type="button" title="More actions">⋯</button>
+    <button class="t-icon js-fetch" type="button" title="Fetch">${iconFetch}</button>
+    <button class="t-icon js-pull" type="button" title="Pull">${iconPull}</button>
+    <button class="t-icon js-push" type="button" title="Push">${iconPush}</button>
+    <button class="t-icon js-more" type="button" title="More actions">${iconMore}</button>
   </div>
   <div class="gp-commit">
     <textarea class="js-message" rows="2" placeholder="Message (Ctrl+Enter to commit)" spellcheck="false"></textarea>
@@ -200,11 +201,11 @@ export class GitPanel {
     const open = !this.collapsed.has(group);
     const bulk =
       group === "staged"
-        ? `<button class="t-icon" data-bulk="unstage" data-group="${group}" title="Unstage all">−</button>`
+        ? `<button class="t-icon" data-bulk="unstage" data-group="${group}" title="Unstage all">${iconMinus}</button>`
         : group === "conflict"
-          ? `<button class="t-icon" data-bulk="stage" data-group="${group}" title="Mark all resolved">✓</button>`
-          : `<button class="t-icon" data-bulk="stage" data-group="${group}" title="Stage all">+</button>
-             <button class="t-icon" data-bulk="discard" data-group="${group}" title="Discard all">↺</button>`;
+          ? `<button class="t-icon" data-bulk="stage" data-group="${group}" title="Mark all resolved">${iconCheck}</button>`
+          : `<button class="t-icon" data-bulk="stage" data-group="${group}" title="Stage all">${iconPlus}</button>
+             <button class="t-icon" data-bulk="discard" data-group="${group}" title="Discard all">${iconDiscard}</button>`;
 
     // The caret is its own button rather than the whole header: the header also
     // carries "stage all" and "discard all", and a bar that both collapses and
@@ -226,11 +227,11 @@ export class GitPanel {
     const letter = e.conflict ? "!" : e.untracked ? "U" : group === "staged" ? e.index : e.work;
     const actions =
       group === "staged"
-        ? `<button class="t-icon" data-act="unstage" title="Unstage">−</button>`
+        ? `<button class="t-icon" data-act="unstage" title="Unstage">${iconMinus}</button>`
         : group === "conflict"
-          ? `<button class="t-icon" data-act="stage" title="Mark resolved">✓</button>`
-          : `<button class="t-icon" data-act="discard" title="Discard">↺</button>
-             <button class="t-icon" data-act="stage" title="Stage">+</button>`;
+          ? `<button class="t-icon" data-act="stage" title="Mark resolved">${iconCheck}</button>`
+          : `<button class="t-icon" data-act="discard" title="Discard">${iconDiscard}</button>
+             <button class="t-icon" data-act="stage" title="Stage">${iconPlus}</button>`;
 
     return `<div class="gp-row" data-path="${esc(e.path)}" data-group="${group}" title="${esc(e.path)}">
       <span class="gp-name">${esc(name)}</span>

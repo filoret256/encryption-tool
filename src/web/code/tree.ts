@@ -9,10 +9,10 @@
  *  height is constant, which is the only hard part of the general problem.
  */
 import type { DirEntry, StatusEntry } from "../../agent/protocol.ts";
-import { esc, modalPrompt, showMenu } from "./ui.ts";
+import { esc, modalPrompt, showMenu, ROW_H } from "./ui.ts";
 import { fileIcon } from "./file-icons.ts";
 
-const ROW = 22;
+const ROW = ROW_H;
 /** Rows rendered above and below the viewport to hide scroll tearing. */
 const OVERSCAN = 8;
 

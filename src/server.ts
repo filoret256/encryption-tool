@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { helm, ansible } from "./crypto/index.ts";
 import { VERSION } from "./version.ts";
+import { AGENT_PORT_RANGE } from "./ports.ts";
 import { TARGETS, archiveName, type AgentBuild } from "./agent/targets.ts";
 
 // Static assets are imported with the `file` loader so that `bun build --compile`
@@ -40,27 +41,55 @@ if (process.argv.includes("--health")) {
 
 /** Loopback ports the page may open a connection to.
  *
- *  The agent defaults to 5001 (src/agent/main.ts), but `--port` moves it, so a
- *  deployment that tells its users a different port has to be able to say so
- *  here — otherwise the policy would cut them off with no way to opt in.
+ *  The agent binds the first free port in 5001-5010, and `--port` may pin any
+ *  one of them — src/ports.ts is where that range is stated and why. The policy
+ *  therefore has to permit the whole range, or the agent's choice would not be
+ *  a choice. A deployment that puts the agent somewhere else entirely says so
+ *  here, otherwise the policy would cut its users off with no way to opt in:
  *
- *    AGENT_PORTS   comma-separated, e.g. "5001,5002"
+ *    AGENT_PORTS   comma-separated ports and ranges, e.g. "5001-5010,7000"
  *
  *  A malformed value stops the server rather than being quietly dropped: the
  *  symptom of a silently ignored port is a code tab that cannot connect and
  *  gives no reason, which is exactly the failure this is meant to prevent.
  */
-const AGENT_PORTS = (process.env.AGENT_PORTS ?? "5001")
-  .split(",")
-  .map((p) => p.trim())
-  .filter(Boolean);
 
-for (const port of AGENT_PORTS) {
-  if (!/^[0-9]{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
-    console.error(`AGENT_PORTS: "${port}" is not a port number`);
+/** Every source lands in connect-src in full, on every response, so the list is
+ *  capped at a number a person would plausibly ask for rather than left to
+ *  whatever a mistyped range expands to. */
+const MAX_AGENT_PORTS = 64;
+
+function parseAgentPorts(spec: string): string[] {
+  const reject = (item: string, why: string): never => {
+    console.error(`AGENT_PORTS: "${item}" ${why}`);
+    process.exit(1);
+  };
+  const port = (text: string, item: string): number => {
+    if (!/^[0-9]{1,5}$/.test(text) || Number(text) < 1 || Number(text) > 65535) reject(item, "is not a port number");
+    return Number(text);
+  };
+
+  const out: number[] = [];
+  for (const item of spec.split(",").map((s) => s.trim()).filter(Boolean)) {
+    const parts = item.split("-");
+    if (parts.length > 2) reject(item, "is neither a port nor a low-high range");
+    const lo = port(parts[0], item);
+    const hi = parts.length === 2 ? port(parts[1], item) : lo;
+    if (hi < lo) reject(item, "is a range that runs backwards");
+    if (hi - lo + 1 > MAX_AGENT_PORTS) reject(item, `covers more than ${MAX_AGENT_PORTS} ports`);
+    for (let p = lo; p <= hi; p++) out.push(p);
+  }
+
+  const unique = [...new Set(out)].sort((a, b) => a - b);
+  if (unique.length > MAX_AGENT_PORTS) {
+    console.error(`AGENT_PORTS: ${unique.length} ports listed, more than the ${MAX_AGENT_PORTS} this policy will name`);
     process.exit(1);
   }
+  return unique.map(String);
 }
+
+const AGENT_PORTS = parseAgentPorts(process.env.AGENT_PORTS ?? AGENT_PORT_RANGE);
+
 if (!AGENT_PORTS.length) {
   console.error("AGENT_PORTS: no ports left after parsing — the code tab could reach no agent at all");
   process.exit(1);
@@ -83,9 +112,9 @@ const AGENT_SOURCES = AGENT_PORTS.flatMap((port) =>
  *  needs because it injects its themes as a <style> element at runtime.
  *
  *  connect-src has to allow loopback so the page can reach the user's agent —
- *  but only on the agent's own port. Opening every loopback port would hand
- *  injected script a channel to every other service on the machine, which is a
- *  far larger grant than the one thing the tab actually needs.
+ *  but only on the ports an agent is allowed to bind. Opening every loopback
+ *  port would hand injected script a channel to every other service on the
+ *  machine, which is a far larger grant than the one thing the tab needs.
  */
 const cspFor = (nonce: string): string =>
   [
@@ -281,6 +310,17 @@ async function loadAgents(): Promise<void> {
 /** Placeholder in src/web/index.html, swapped for the request's nonce. */
 const NONCE_SLOT = "__CSP_NONCE__";
 
+/** Placeholder in src/web/index.html, swapped for the ports connect-src names.
+ *
+ *  A page cannot read its own policy, and a connection the policy refuses looks
+ *  exactly like an agent that never started: same error event, same close, no
+ *  status code anywhere. The violation report tells them apart, but it is
+ *  delivered in a queued task — after the WebSocket constructor has already
+ *  thrown and the failure has been reported to the user. Handing the page the
+ *  list up front lets it name the real reason at the moment it fails, in every
+ *  browser, instead of racing an event that may arrive too late. */
+const PORTS_SLOT = "__AGENT_PORTS__";
+
 const AGENT_TYPE: Record<string, string> = { zip: "application/zip", "tar.gz": "application/gzip" };
 
 // `server agent [...]` runs the local filesystem + git bridge for the code tab
@@ -300,7 +340,9 @@ if (process.argv[2] === "agent") {
       // The shell is the one response that has to be built rather than streamed:
       // it carries the nonce that admits CodeMirror's runtime <style>. Read per
       // request so editing it in dev needs no restart; it is 6 KB.
-      const html = (await Bun.file(indexHtml).text()).replaceAll(NONCE_SLOT, nonce);
+      const html = (await Bun.file(indexHtml).text())
+        .replaceAll(NONCE_SLOT, nonce)
+        .replaceAll(PORTS_SLOT, AGENT_PORTS.join(","));
       // A nonce that outlived its response would be a policy no longer matching
       // its page, so the shell is never stored by the HTTP cache. The service
       // worker keeps its own copy for offline, headers and all, and is unaffected.

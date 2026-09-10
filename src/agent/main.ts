@@ -24,12 +24,16 @@ import { search, type Signal } from "./search.ts";
 import { Watcher } from "./watch.ts";
 import type { AgentInfo, Req, ServerFrame } from "./protocol.ts";
 import { VERSION } from "../version.ts";
+import { AGENT_PORT_MAX, AGENT_PORT_MIN, AGENT_PORT_RANGE, agentPortRange } from "../ports.ts";
 
 // ── CLI ───────────────────────────────────────────────────────────────────
 
 interface Options {
   root: string;
   port: number;
+  /** Whether --port named it. An explicit port is bound or the agent stops; the
+   *  default one is only where the search for a free port starts. */
+  portExplicit: boolean;
   token: string;
   origins: string[];
   noClipboard: boolean;
@@ -75,7 +79,8 @@ function fail(message: string): never {
 function parseArgs(argv: string[]): Options {
   const o: Options = {
     root: "",
-    port: 5001,
+    port: AGENT_PORT_MIN,
+    portExplicit: false,
     token: "",
     origins: envOrigins(),
     noClipboard: false,
@@ -97,7 +102,17 @@ function parseArgs(argv: string[]): Options {
     const value = (): string => inline ?? argv[++i] ?? "";
     switch (flag) {
       case "--root": setRoot(value(), "--root"); break;
-      case "--port": o.port = Number(value()) || o.port; break;
+      case "--port": {
+        // A mistyped port used to fall back to the default, which is the silent
+        // wrong answer this file refuses everywhere else: the user would be
+        // handed a URL for a port they never asked for.
+        const raw = value();
+        const n = Number(raw);
+        if (!Number.isInteger(n) || n < 1 || n > 65535) fail(`--port takes a port number, not "${raw}"`);
+        o.port = n;
+        o.portExplicit = true;
+        break;
+      }
       case "--token": o.token = value(); break;
       case "--allow-origin": o.origins.push(value().replace(/\/$/, "")); break;
       case "--no-clipboard": o.noClipboard = true; break;
@@ -135,7 +150,13 @@ and be pointed at a project instead of copied into one:
 
   --root <dir>            same thing as the positional folder
                           (default: current directory)
-  --port <n>              loopback port (default: 5001)
+  --port <n>              pin the loopback port. Without it the agent takes the
+                          first free port in ${AGENT_PORT_RANGE} — the ports the
+                          web app is allowed to open a connection to — so a
+                          second agent on a second folder needs no flag at all.
+                          A port outside that range is bound as asked, but the
+                          browser refuses it unless the web app was started
+                          with AGENT_PORTS naming it.
   --token <str>           fixed access token (default: random, printed below)
   --allow-origin <url>    origin allowed to connect, repeatable
                           (http://localhost:5000 and http://127.0.0.1:5000 are
@@ -462,29 +483,44 @@ export async function startAgent(argv: string[]): Promise<void> {
    *  of thing that breaks a pipe reader six months from now. */
   const lifecycle = (message: string): void => console.error(`agent: ${message}`);
 
-  /** Wrapped so a taken port reads as a sentence rather than a stack trace.
+  /** Bind the first free port, and say why in a sentence when there is none.
    *
    *  Running a second agent on a second folder is an ordinary thing to do, and
-   *  the first thing that happens is this — the Go agent already says it in one
-   *  line, and there is no reason for the two to differ. */
-  const listen = <T>(start: () => T): T => {
-    try {
-      return start();
-    } catch (e) {
-      const code = (e as { code?: string }).code;
-      if (code === "EADDRINUSE") {
-        console.error(`agent: cannot listen on 127.0.0.1:${opts.port}: address already in use`);
-        console.error("agent: another agent is probably on that port — pass --port <n> to pick a free one");
-      } else {
-        console.error(`agent: cannot listen on 127.0.0.1:${opts.port}: ${e instanceof Error ? e.message : String(e)}`);
+   *  what used to happen is that it stopped dead on "address already in use",
+   *  leaving the user to pick a port by hand — and then to find out that the
+   *  page is only allowed to reach some of them. Walking the range is that
+   *  decision made once, here.
+   *
+   *  An explicit --port is never second-guessed. It names a port, and quietly
+   *  serving a different one would hand this folder to a tab that asked for
+   *  somebody else's. */
+  const listen = <T>(start: (port: number) => T): T => {
+    let last: unknown;
+    for (const port of opts.portExplicit ? [opts.port] : agentPortRange()) {
+      try {
+        return start(port);
+      } catch (e) {
+        // Any refusal moves on to the next candidate rather than stopping: the
+        // errno for a taken port is not reported the same way on every
+        // platform, and the last one is still reported if none of them work.
+        last = e;
       }
-      process.exit(1);
     }
+    const inUse = (last as { code?: string })?.code === "EADDRINUSE";
+    const why = inUse ? "address already in use" : last instanceof Error ? last.message : String(last);
+    if (opts.portExplicit) {
+      console.error(`agent: cannot listen on 127.0.0.1:${opts.port}: ${why}`);
+      if (inUse) console.error(`agent: drop --port and the agent takes the first free port in ${AGENT_PORT_RANGE}`);
+    } else {
+      console.error(`agent: no free loopback port in ${AGENT_PORT_RANGE}: ${why}`);
+      console.error("agent: stop an agent you are done with, or pass --port <n> and start the web app with AGENT_PORTS naming that port");
+    }
+    process.exit(1);
   };
 
-  const server = listen(() =>
+  const server = listen((port) =>
     Bun.serve<{ conn: Conn; origin: string }>({
-    port: opts.port,
+    port,
     hostname: "127.0.0.1",
     fetch(req, srv) {
       const url = new URL(req.url);
@@ -494,7 +530,7 @@ export async function startAgent(argv: string[]): Promise<void> {
       // Before anything else, the preflight included: a request that reached
       // this port under a name that is not ours gets nothing back, not even the
       // CORS grant that would tell the page it is worth trying again.
-      if (!hostAllowed(req.headers.get("host"), srv.port ?? opts.port)) return new Response("forbidden", { status: 403 });
+      if (!hostAllowed(req.headers.get("host"), srv.port ?? port)) return new Response("forbidden", { status: 403 });
 
       if (req.method === "OPTIONS") return new Response(null, { status: 204, headers });
 
@@ -609,7 +645,22 @@ export async function startAgent(argv: string[]): Promise<void> {
   }),
   );
 
-  const url = `ws://127.0.0.1:${server.port}/ws?token=${token}`;
+  /** The port actually bound — which is the one the banner, the Host check and
+   *  the URL all have to agree on, and with the range walked above it is no
+   *  longer necessarily the one that was asked for. */
+  const bound = server.port ?? opts.port;
+
+  // The page's connect-src names the range and nothing outside it, so a port
+  // beyond it is one the browser refuses before a packet leaves — which from
+  // the tab looks exactly like an agent that never started. On stderr: stdout
+  // carries the URL and nothing else, on purpose.
+  if (bound < AGENT_PORT_MIN || bound > AGENT_PORT_MAX) {
+    lifecycle(
+      `warning: port ${bound} is outside ${AGENT_PORT_RANGE} — the editor tab will refuse it unless the web app was started with AGENT_PORTS=${bound}`,
+    );
+  }
+
+  const url = `ws://127.0.0.1:${bound}/ws?token=${token}`;
 
   // Copied for the user rather than left to their mouse: the token is new on
   // every run, so this is the one line they would otherwise select by hand

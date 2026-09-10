@@ -680,3 +680,47 @@ func (s *server) dispatch(conn *connection, r *req) {
 func listenLoopback(port int) (net.Listener, error) {
 	return net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
 }
+
+// listen binds the first free port in the range, or the one --port named, and
+// stops with a sentence rather than a stack trace when there is none.
+//
+// Running a second agent on a second folder is an ordinary thing to do, and
+// what used to happen is that it stopped dead on "address already in use",
+// leaving the user to pick a port by hand — and then to find out that the page
+// is only allowed to reach some of them. Walking the range is that decision
+// made once, here.
+//
+// An explicit --port is never second-guessed. It names a port, and quietly
+// serving a different one would hand this folder to a tab that asked for
+// somebody else's.
+func listen(o options) net.Listener {
+	candidates := []int{o.port}
+	if !o.portExplicit {
+		candidates = candidates[:0]
+		for p := agentPortMin; p <= agentPortMax; p++ {
+			candidates = append(candidates, p)
+		}
+	}
+
+	var last error
+	for _, p := range candidates {
+		l, err := listenLoopback(p)
+		if err == nil {
+			return l
+		}
+		// Any refusal moves on to the next candidate rather than stopping: a
+		// taken port is not reported as the same errno on every platform, and
+		// the last error is still reported if none of them work.
+		last = err
+	}
+
+	if o.portExplicit {
+		fmt.Fprintf(os.Stderr, "agent: cannot listen on 127.0.0.1:%d: %v\n", o.port, last)
+		fmt.Fprintf(os.Stderr, "agent: drop --port and the agent takes the first free port in %s\n", agentPortRange)
+	} else {
+		fmt.Fprintf(os.Stderr, "agent: no free loopback port in %s: %v\n", agentPortRange, last)
+		fmt.Fprintln(os.Stderr, "agent: stop an agent you are done with, or pass --port <n> and start the web app with AGENT_PORTS naming that port")
+	}
+	os.Exit(1)
+	return nil
+}

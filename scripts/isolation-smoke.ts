@@ -18,6 +18,7 @@ import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { iter } from "../src/agent/proc.ts";
+import { AGENT_PORT_MAX, AGENT_PORT_MIN, AGENT_PORT_RANGE } from "../src/ports.ts";
 import { git, startAgent, type Harness } from "./harness.ts";
 import { ansible, helm } from "../src/crypto/index.ts";
 import type { FileRead, SearchSummary } from "../src/agent/protocol.ts";
@@ -100,7 +101,7 @@ try {
   });
   await encRes.text();
   const shellRes = await fetch(`${base}/`);
-  await shellRes.text();
+  const htmlShell = await shellRes.text();
   const identifying = ["set-cookie", "etag", "last-modified", "x-request-id"].filter(
     (h) => encRes.headers.get(h) !== null,
   );
@@ -131,10 +132,28 @@ try {
   );
   const connectSrc = (csp.split(";").find((d) => d.trim().startsWith("connect-src")) ?? "").trim();
   const sources = connectSrc.split(" ").filter(Boolean).slice(1);
+  // The agent binds the first free port in this range (src/ports.ts), so the
+  // policy has to cover the whole of it — the ends are what a second and a
+  // tenth agent land on, and either one missing is a tab that cannot connect.
+  const missingAgentPorts = [AGENT_PORT_MIN, AGENT_PORT_MAX].flatMap((p) =>
+    ["ws", "http"].map((s) => `${s}://127.0.0.1:${p}`).filter((src) => !connectSrc.includes(src)),
+  );
   check(
-    "the policy still permits the loopback agent",
-    connectSrc.includes("ws://127.0.0.1:5001") && connectSrc.includes("http://127.0.0.1:5001"),
-    "connect-src allows ws:// and http:// on the agent's default port",
+    "the policy still permits the loopback agent, across the whole port range",
+    missingAgentPorts.length === 0,
+    missingAgentPorts.length ? `missing ${missingAgentPorts.join(", ")}` : `ws:// and http:// on ${AGENT_PORT_RANGE}`,
+  );
+
+  // The page cannot read its own policy, and a refused connection is
+  // indistinguishable from an absent agent without this: the violation report
+  // that would tell them apart arrives in a queued task, after the failure has
+  // already been reported to the user. See src/web/code/agent.ts.
+  const metaPorts = /<meta name="agent-ports" content="([^"]*)"/.exec(htmlShell)?.[1] ?? "";
+  const listed = metaPorts.split(",").filter(Boolean);
+  check(
+    "the shell names those ports, so the tab can explain a refusal",
+    listed.length > 0 && listed.every((p) => connectSrc.includes(`ws://127.0.0.1:${p}`)),
+    listed.length ? `${listed.length} ports, every one of them in connect-src` : "no agent-ports meta in the shell",
   );
   // The point of pinning it: injected script gets a channel to the agent, not
   // to every other thing the user happens to be running on loopback.

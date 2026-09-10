@@ -7,6 +7,7 @@ import type { AgentClient } from "./agent.ts";
 import type { Commit, CommitDetail } from "../../agent/protocol.ts";
 import { esc, modalConfirm, modalPrompt, setHtmlKeepingScroll, showMenu } from "./ui.ts";
 import { computeGraph, continuationSvg, laneSvg, LANE_W, type GraphRow } from "./graph.ts";
+import { iconRefresh } from "./icons.ts";
 
 const PAGE = 100;
 
@@ -21,7 +22,7 @@ const SHELL = `
     <label class="hist-toggle"><input type="checkbox" class="js-all" checked /> all branches</label>
     <label class="hist-toggle"><input type="checkbox" class="js-graph" checked /> graph</label>
     <span class="t-spacer"></span>
-    <button class="t-icon js-reload" type="button" title="Reload">⟳</button>
+    <button class="t-icon js-reload" type="button" title="Reload">${iconRefresh}</button>
   </div>
   <div class="hist-list js-list"></div>
   <button class="t-btn hist-more js-more" type="button" hidden>load more</button>`;
@@ -259,7 +260,10 @@ function refsHtml(refs: string): string {
     .filter(Boolean)
     .map((r) => {
       const kind = r.startsWith("tag: ") ? "tag" : r.includes("HEAD") ? "head" : r.includes("/") ? "remote" : "local";
-      return `<span class="hist-ref ref-${kind}">${esc(r.replace(/^tag: /, ""))}</span>`;
+      const label = r.replace(/^tag: /, "");
+      // A pill truncates when the panel is narrow and several refs land on one
+      // commit, which is exactly when knowing the full name matters most.
+      return `<span class="hist-ref ref-${kind}" title="${esc(label)}">${esc(label)}</span>`;
     });
   return `<span class="hist-refs">${chips.join("")}</span>`;
 }

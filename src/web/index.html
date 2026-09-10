@@ -8,6 +8,11 @@
        NONCE_SLOT). CodeMirror mounts its themes as a <style> element at
        runtime, and style-src admits that element by this nonce alone. -->
   <meta name="csp-nonce" content="__CSP_NONCE__" />
+  <!-- The loopback ports connect-src permits, filled in per request by the
+       server (src/server.ts: PORTS_SLOT). The code tab reads it to explain a
+       refused agent connection, which the browser otherwise reports as an
+       ordinary failure to connect. -->
+  <meta name="agent-ports" content="__AGENT_PORTS__" />
   <link rel="stylesheet" href="/public/main.css" />
 
   <!-- PWA. Two theme-colour tags so the browser chrome follows the user's

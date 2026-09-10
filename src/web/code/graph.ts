@@ -10,9 +10,9 @@
  *  never move a lane sideways so lines stay straight and stable between rows.
  */
 import type { Commit } from "../../agent/protocol.ts";
+import { ROW_H } from "./ui.ts";
 
 export const LANE_W = 12;
-export const ROW_H = 26;
 /** Lane colours cycle; the CSS variables are defined in style.css. */
 export const LANE_COLORS = 8;
 

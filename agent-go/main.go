@@ -29,7 +29,20 @@ import (
 // src/version.ts — the one place the version is stated.
 var version = "dev"
 
-const helpText = `enc-tool agent — local filesystem + git bridge for the web editor
+// The loopback ports an agent may bind, mirroring src/ports.ts — which is where
+// the reasoning lives. Two processes have to agree on this: the agent picks a
+// port, and the page is only allowed to open a connection to the ports its own
+// connect-src names. Disagreement is silent, and looks from the tab exactly
+// like an agent that never started.
+const (
+	agentPortMin = 5001
+	agentPortMax = 5010
+)
+
+// agentPortRange is the "5001-5010" spelling, for help text and messages.
+var agentPortRange = fmt.Sprintf("%d-%d", agentPortMin, agentPortMax)
+
+var helpText = fmt.Sprintf(`enc-tool agent — local filesystem + git bridge for the web editor
 
   enc-tool-agent [folder] [options]
 
@@ -40,7 +53,13 @@ and be pointed at a project instead of copied into one:
 
   --root <dir>            same thing as the positional folder
                           (default: current directory)
-  --port <n>              loopback port (default: 5001)
+  --port <n>              pin the loopback port. Without it the agent takes the
+                          first free port in %s — the ports the web app is
+                          allowed to open a connection to — so a second agent on
+                          a second folder needs no flag at all. A port outside
+                          that range is bound as asked, but the browser refuses
+                          it unless the web app was started with AGENT_PORTS
+                          naming it.
   --token <str>           fixed access token (default: random, printed below)
   --allow-origin <url>    origin allowed to connect, repeatable
                           (http://localhost:5000 and http://127.0.0.1:5000 are
@@ -60,11 +79,12 @@ Environment:
   ENC_TOOL_ALLOW_ORIGIN   extra allowed origins, comma-separated — the same as
                           --allow-origin, but set once instead of per run
 
-The agent listens on 127.0.0.1 only. Paste the URL below into the editor tab.`
+The agent listens on 127.0.0.1 only. Paste the URL below into the editor tab.`, agentPortRange)
 
 type options struct {
 	root          string
 	port          int
+	portExplicit  bool
 	token         string
 	origins       []string
 	noClipboard   bool
@@ -96,7 +116,7 @@ func fail(message string) {
 }
 
 func parseArgs(argv []string) options {
-	o := options{port: 5001, origins: envOrigins()}
+	o := options{port: agentPortMin, origins: envOrigins()}
 	rootFrom := ""
 
 	setRoot := func(dir, source string) {
@@ -129,9 +149,17 @@ func parseArgs(argv []string) options {
 		case "--root":
 			setRoot(value(), "--root")
 		case "--port":
-			if n, err := strconv.Atoi(value()); err == nil && n != 0 {
-				o.port = n
+			// A mistyped port used to be ignored and the default used instead,
+			// which is the silent wrong answer this file refuses everywhere
+			// else: the user would be handed a URL for a port they never asked
+			// for.
+			raw := value()
+			n, err := strconv.Atoi(raw)
+			if err != nil || n < 1 || n > 65535 {
+				fail(fmt.Sprintf("--port takes a port number, not %q", raw))
 			}
+			o.port = n
+			o.portExplicit = true
 		case "--token":
 			o.token = value()
 		case "--allow-origin":
@@ -238,11 +266,7 @@ func main() {
 		isRepo:        top != "",
 	}
 
-	listener, err := listenLoopback(opts.port)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "agent: cannot listen on 127.0.0.1:%d: %v\n", opts.port, err)
-		os.Exit(1)
-	}
+	listener := listen(opts)
 	port := listener.Addr().(*net.TCPAddr).Port
 	// The Host check compares against the port this agent actually answers on,
 	// which is the one the listener reports.
@@ -268,6 +292,15 @@ func main() {
 	clientsLine := "one at a time — the second is refused while the first holds"
 	if opts.allowMultiple {
 		clientsLine = "many (--allow-multiple)"
+	}
+
+	// The page's connect-src names the range and nothing outside it, so a port
+	// beyond it is one the browser refuses before a packet leaves. Said on
+	// stderr: stdout carries the URL and nothing else, on purpose.
+	if port < agentPortMin || port > agentPortMax {
+		fmt.Fprintf(os.Stderr,
+			"agent: warning: port %d is outside %s — the editor tab will refuse it unless the web app was started with AGENT_PORTS=%d\n",
+			port, agentPortRange, port)
 	}
 
 	url := fmt.Sprintf("ws://127.0.0.1:%d/ws?token=%s", port, token)

@@ -32,3 +32,52 @@ export const iconNewFolder = svg(`<path d="M2 4.2a1.1 1.1 0 0 1 1.1-1.1h2.6l1.3 
 
 /** Circular arrow — reload. */
 export const iconRefresh = svg(`<path d="M13.3 8a5.3 5.3 0 1 1-1.7-3.9"/><path d="M13.5 2.6v2.9h-2.9"/>`);
+
+/* The set below covers the source-control, history and search panels, which
+ * drew their buttons with characters — ⟲ ⟳ ↺ ⇄ ⑂ ⋯ — until now.
+ *
+ * That is the same mistake the rail made and this file was written to fix, and
+ * it shows up twice. A monospace font ships none of those code points, so each
+ * one is drawn by whatever fallback the OS picks: a different weight, a
+ * different optical size, a different baseline, all of it varying by platform.
+ * And because .t-icon sizes itself to its content, a button holding a 12px
+ * character came out four pixels shorter than the identical button holding a
+ * 16px icon — which is why two header bars that should have matched did not. */
+
+/** Two arrows around a circle — fetch. */
+export const iconFetch = svg(
+  `<path d="M13.2 7.4a5.2 5.2 0 0 0-8.9-3"/><path d="M13.4 2.4v3h-3"/><path d="M2.8 8.6a5.2 5.2 0 0 0 8.9 3"/><path d="M2.6 13.6v-3h3"/>`,
+);
+
+/** Arrow down onto a line — pull. */
+export const iconPull = svg(`<path d="M8 2.4v7.4"/><path d="M4.9 6.7 8 9.8l3.1-3.1"/><path d="M3.1 13.3h9.8"/>`);
+
+/** Arrow up off a line — push. */
+export const iconPush = svg(`<path d="M8 13.6V6.2"/><path d="M4.9 9.3 8 6.2l3.1 3.1"/><path d="M3.1 2.7h9.8"/>`);
+
+/** Three dots — the overflow menu. */
+export const iconMore = svg(
+  `<circle cx="3.6" cy="8" r="1.15" fill="currentColor" stroke="none"/><circle cx="8" cy="8" r="1.15" fill="currentColor" stroke="none"/><circle cx="12.4" cy="8" r="1.15" fill="currentColor" stroke="none"/>`,
+);
+
+/** Checkmark — stage, mark resolved, commit. */
+export const iconCheck = svg(`<path d="m3.4 8.4 3.1 3.2 6.1-7.2"/>`);
+
+/** Minus — unstage. */
+export const iconMinus = svg(`<path d="M3.4 8h9.2"/>`);
+
+/** Plus — stage. Drawn rather than typed as "+", so it matches the minus it
+ *  sits next to instead of being a character of a different weight. */
+export const iconPlus = svg(`<path d="M8 3.4v9.2"/><path d="M3.4 8h9.2"/>`);
+
+/** Counter-clockwise arrow — discard, the mirror of reload so the two read as
+ *  opposites rather than as the same button drawn twice. */
+export const iconDiscard = svg(`<path d="M2.7 8a5.3 5.3 0 1 0 1.7-3.9"/><path d="M2.5 2.6v2.9h2.9"/>`);
+
+/** Two arrows passing — replace. */
+export const iconReplace = svg(
+  `<path d="M3 5.4h8"/><path d="M8.7 3 11.1 5.4 8.7 7.8"/><path d="M13 10.6H5"/><path d="M7.3 8.2 4.9 10.6l2.4 2.4"/>`,
+);
+
+/** A cross — close, dismiss. */
+export const iconClose = svg(`<path d="M4.2 4.2 11.8 11.8"/><path d="M11.8 4.2 4.2 11.8"/>`);

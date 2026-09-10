@@ -14,7 +14,7 @@ import { HistoryPanel } from "./history.ts";
 import { SearchPanel } from "./search-panel.ts";
 import { DiffView } from "./diff.ts";
 import { findConflicts } from "./conflicts.ts";
-import { esc, modalConfirm, modalPrompt } from "./ui.ts";
+import { applyRowHeight, esc, modalConfirm, modalPrompt } from "./ui.ts";
 import { iconBranch, iconFiles, iconHistory, iconNewFile, iconNewFolder, iconRefresh, iconSearch } from "./icons.ts";
 
 export interface CodeContext {
@@ -114,6 +114,9 @@ const SHELL = `
 
 export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   host.innerHTML = SHELL;
+  // The lists below size their virtual-scroll geometry from ROW_H; this is what
+  // makes the stylesheet use the same number rather than its own copy of it.
+  applyRowHeight();
   const $ = <T extends HTMLElement>(sel: string): T => host.querySelector<T>(sel)!;
 
   const { agent } = ctx;
@@ -788,18 +791,27 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     }
   }
 
-  /** An agent URL sitting on the clipboard, if there is one and if we are
-   *  allowed to look.
+  /** An agent URL sitting on the clipboard, if there is one, if we are allowed
+   *  to look, and if the answer arrives quickly.
    *
    *  Strictly an optimisation. Reading the clipboard needs a permission the
    *  browser may prompt for, and Firefox does not offer it to pages at all, so
    *  every failure path just leaves the saved URL in the field. It runs inside
    *  the click that opened the dialog, which is the only moment the browsers
-   *  that do allow it will. */
+   *  that do allow it will.
+   *
+   *  The timeout is the part that is not optional. readText() does not reject
+   *  while the permission prompt is up — it simply does not settle, and the
+   *  prompt is a small bubble under the address bar that nobody is looking at,
+   *  because they just clicked a button in the page. The dialog was awaiting
+   *  this, so "connect…" did nothing at all, with no error and nothing to
+   *  retry. Half a second and we open the dialog without the prefill. */
   async function clipboardUrl(): Promise<string | null> {
     try {
-      const text = (await navigator.clipboard.readText()).trim();
-      return isAgentUrl(text) ? text : null;
+      const read = navigator.clipboard.readText();
+      const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 500));
+      const text = (await Promise.race([read, timeout]))?.trim();
+      return text && isAgentUrl(text) ? text : null;
     } catch {
       return null;
     }

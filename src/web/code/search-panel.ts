@@ -10,6 +10,8 @@ import type { AgentClient } from "./agent.ts";
 import type { FileRead, SearchHit, SearchSummary } from "../../agent/protocol.ts";
 import { VirtualList } from "./vlist.ts";
 import { esc, modalConfirm } from "./ui.ts";
+import { iconClose, iconReplace } from "./icons.ts";
+import { ROW_H as SHARED_ROW_H } from "./ui.ts";
 
 export interface SearchCallbacks {
   openAt(path: string, line: number, col: number): void;
@@ -30,7 +32,7 @@ export interface Options {
 }
 
 const OPTS_KEY = "enc-search-opts";
-const ROW_H = 22;
+const ROW_H = SHARED_ROW_H;
 const DEBOUNCE_MS = 300;
 /** Results are repainted on a timer, not per hit: a broad query can stream
  *  thousands of matches and re-rendering on each one would stall the tab. */
@@ -47,7 +49,7 @@ const SHELL = `
     <div class="sp-line">
       <input class="t-input js-replace" placeholder="Replace" spellcheck="false" autocomplete="off" />
       <button class="sp-tog js-preserve" type="button" title="Preserve case">AB</button>
-      <button class="t-icon js-replace-all" type="button" title="Replace all">⇄</button>
+      <button class="t-icon js-replace-all" type="button" title="Replace all">${iconReplace}</button>
     </div>
     <details class="sp-globs">
       <summary>files to include / exclude</summary>
@@ -242,15 +244,15 @@ export class SearchPanel {
         <span class="sp-fdir">${esc(dir)}</span>
         <span class="sp-count">${row.count}</span>
         <span class="sp-acts">
-          <button class="t-icon" data-act="replace-file" title="Replace in this file">⇄</button>
-          <button class="t-icon" data-act="dismiss-file" title="Dismiss file">✕</button>
+          <button class="t-icon" data-act="replace-file" title="Replace in this file">${iconReplace}</button>
+          <button class="t-icon" data-act="dismiss-file" title="Dismiss file">${iconClose}</button>
         </span>
       </div>`;
     }
     return `<div class="sp-hit" data-path="${esc(row.path)}" data-key="${esc(row.key)}">
       <span class="sp-lineno">${row.hit.line}</span>
       <span class="sp-text">${hitHtml(row.hit)}</span>
-      <span class="sp-acts"><button class="t-icon" data-act="dismiss-hit" title="Dismiss match">✕</button></span>
+      <span class="sp-acts"><button class="t-icon" data-act="dismiss-hit" title="Dismiss match">${iconClose}</button></span>
     </div>`;
   }
 

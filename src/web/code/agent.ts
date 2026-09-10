@@ -30,14 +30,33 @@ export const isAgentUrl = (text: string): boolean => AGENT_URL.test(text.trim())
 
 const UNREACHABLE = "cannot reach the agent";
 
-/** Ports this page was refused a connection to, by its own policy.
+/** The loopback ports this page is allowed to open a connection to.
  *
- *  connect-src pins the agent's port (server.ts: AGENT_PORTS), so an agent
- *  started on some other port is refused by the browser before a packet leaves
- *  — and that is indistinguishable from nothing listening: the same error
- *  event, the same close, no status code anywhere. The violation report is the
- *  only thing that separates them, and without it the user is sent off to debug
- *  an agent that is running perfectly well. */
+ *  connect-src pins them (server.ts: AGENT_PORTS), so an agent started on some
+ *  other port is refused by the browser before a packet leaves — and that is
+ *  indistinguishable from nothing listening: the same error event, the same
+ *  close, no status code anywhere. Without a reason the user is sent off to
+ *  debug an agent that is running perfectly well.
+ *
+ *  A page cannot read its own policy, so the server states the list in the
+ *  shell (server.ts: PORTS_SLOT). Empty when the shell came from somewhere that
+ *  did not fill it in — a file:// copy, or a service-worker cache older than
+ *  this — and empty is read as "no opinion", never as "nothing allowed". */
+const allowedPorts: string[] =
+  typeof document === "undefined"
+    ? []
+    : (document.querySelector<HTMLMetaElement>('meta[name="agent-ports"]')?.content ?? "")
+        .split(",")
+        .map((p) => p.trim())
+        .filter((p) => /^[0-9]{1,5}$/.test(p));
+
+/** Ports a violation report says this page was actually refused.
+ *
+ *  Kept alongside the list above rather than replaced by it, because the two
+ *  fail in different directions: the list can be stale (a cached shell), and
+ *  the report can be late — it is delivered in a queued task, while Chromium
+ *  throws from the WebSocket constructor synchronously, so the first attempt is
+ *  already over by the time it lands. Either one naming the port is enough. */
 const blockedPorts = new Set<string>();
 
 // Guarded because isAgentUrl() above is also imported by the smoke tests,
@@ -53,16 +72,30 @@ if (typeof document !== "undefined") {
   });
 }
 
+/** "5001-5010" when the allowed ports are one run, "5001, 7000" when they are not. */
+function portsText(ports: string[]): string {
+  const n = ports.map(Number).sort((a, b) => a - b);
+  const oneRun = n.length > 1 && n.every((p, i) => i === 0 || p === n[i - 1] + 1);
+  return oneRun ? `${n[0]}-${n[n.length - 1]}` : n.join(", ");
+}
+
 /** Why the last attempt did not connect, as far as the page can tell. */
 function unreachableReason(url: string): string {
   let port: string;
   try {
-    port = new URL(url).port;
+    const u = new URL(url);
+    // An agent URL may omit the port, in which case the scheme's default is the
+    // one the browser would have dialled — and the one the policy judges.
+    port = u.port || (u.protocol === "wss:" || u.protocol === "https:" ? "443" : "80");
   } catch {
     return UNREACHABLE;
   }
-  if (!blockedPorts.has(port)) return UNREACHABLE;
-  return `port ${port || "(default)"} is blocked by this page's security policy — the server allows only the agent's own port`;
+  const refused = blockedPorts.has(port);
+  const outside = allowedPorts.length > 0 && !allowedPorts.includes(port);
+  if (!refused && !outside) return UNREACHABLE;
+  return allowedPorts.length
+    ? `port ${port} is blocked by this page's security policy — it allows ${portsText(allowedPorts)}. Start the agent without --port and it takes a free port in that range.`
+    : `port ${port} is blocked by this page's security policy — the server allows only the agent's own ports`;
 }
 
 export type AgentState = "offline" | "connecting" | "online" | "error";
