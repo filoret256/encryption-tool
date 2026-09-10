@@ -114,6 +114,12 @@ export class HistoryPanel {
       this.commits.map((c, i) => this.commitHtml(c, this.graph[i])).join(""),
       anchorOid ? `.hist-item[data-oid="${anchorOid}"] .hist-row` : undefined,
     );
+    // The gutter width cannot be a style="" attribute any more (style-src has
+    // no 'unsafe-inline'), so it rides in data-lanes and is applied here, once
+    // the rows are in the DOM.
+    for (const gutter of list.querySelectorAll<HTMLElement>(".hist-gutter")) {
+      gutter.style.width = `${Number(gutter.dataset.lanes) * LANE_W}px`;
+    }
     this.$(".js-more").hidden = this.commits.length < this.limit;
   }
 
@@ -144,7 +150,7 @@ export class HistoryPanel {
     // <svg height="100%"> with no definite parent height falls back to its
     // intrinsic 150px and padded the block out with dead space.
     const gutter = row
-      ? `<div class="hist-gutter" style="width:${row.columns * LANE_W}px">${continuationSvg(row)}</div>`
+      ? `<div class="hist-gutter" data-lanes="${row.columns}">${continuationSvg(row)}</div>`
       : "";
     if (!detail) return `<div class="hist-files">${gutter}<div class="hist-files-body"><span class="gp-empty">loading…</span></div></div>`;
 

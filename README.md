@@ -298,6 +298,13 @@ needs network access.
 |----------|---------|
 | `AGENT_DIR` | where the archives and `agents.json` live (default: `/usr/local/share/enc-tool/agents`, then `dist/agents`) |
 | `AGENT_DOWNLOAD_BASE` | serve the archives from a mirror rather than from this image |
+| `AGENT_PORTS` | loopback ports the code tab may connect to, comma-separated (default: `5001`) |
+
+`AGENT_PORTS` is what `connect-src` in the CSP permits. The agent's default is
+5001; if your users start it with `--port`, list that port here, otherwise the
+browser refuses the connection before it is made and the code tab reports the
+port as blocked. A value that is not a port number stops the server at startup
+rather than being ignored.
 
 Open http://localhost:5000 / Откройте http://localhost:5000
 
@@ -368,12 +375,20 @@ Nothing is shared between users, by construction rather than by convention:
 - **crypto** runs in the page — plaintext and passwords never reach the server;
 - **the server** keeps no state, no session and no cookie — there is nothing for two
   requests to share;
-- **the code tab** talks only to the user's own loopback agent, jailed to one folder;
+- **the code tab** talks only to the user's own loopback agent, jailed to one folder,
+  and the CSP pins `connect-src` to that agent's port — not to loopback at large,
+  which would be a channel to every other service on the machine;
 - **the download route** resolves a request only against the names in `agents.json`,
   so nothing else on that directory's path is reachable through it;
-- every response carries a strict **CSP** (`script-src 'self'`, no inline, no remote),
-  plus `nosniff`, `no-referrer`, COOP and a `Permissions-Policy`; crypto responses are
-  `Cache-Control: no-store`.
+- every response carries a strict **CSP**: `script-src 'self'`, nothing remote, and
+  no `'unsafe-inline'` in any directive. The one `<style>` the app creates at
+  runtime — CodeMirror mounting its themes — is admitted by a per-request nonce
+  the shell carries; `connect-src` reaches the agent's port and nothing else on
+  loopback. Alongside it: `nosniff`, `no-referrer`, COOP, CORP, `X-Frame-Options`,
+  HSTS and a `Permissions-Policy`; crypto responses are `Cache-Control: no-store`.
+  All of them are stamped on the way out of the request handler, so a route cannot
+  be added without them. HSTS carries no `includeSubDomains`: TLS is terminated by
+  whatever proxy runs in front, and the app has no cookie a sibling host could reach.
 
 The CSP matters because the agent's token lives in `localStorage`: script injection on
 this origin would otherwise be script injection into someone's working directory.

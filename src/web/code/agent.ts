@@ -28,6 +28,43 @@ const AGENT_URL = /^wss?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?\/ws
 
 export const isAgentUrl = (text: string): boolean => AGENT_URL.test(text.trim());
 
+const UNREACHABLE = "cannot reach the agent";
+
+/** Ports this page was refused a connection to, by its own policy.
+ *
+ *  connect-src pins the agent's port (server.ts: AGENT_PORTS), so an agent
+ *  started on some other port is refused by the browser before a packet leaves
+ *  — and that is indistinguishable from nothing listening: the same error
+ *  event, the same close, no status code anywhere. The violation report is the
+ *  only thing that separates them, and without it the user is sent off to debug
+ *  an agent that is running perfectly well. */
+const blockedPorts = new Set<string>();
+
+// Guarded because isAgentUrl() above is also imported by the smoke tests,
+// which run in Bun — there is no document there to listen on.
+if (typeof document !== "undefined") {
+  document.addEventListener("securitypolicyviolation", (e) => {
+    if (!(e.effectiveDirective || e.violatedDirective).startsWith("connect-src")) return;
+    try {
+      blockedPorts.add(new global.URL(e.blockedURI).port);
+    } catch {
+      /* blockedURI is not always a URL — it can be "self", "inline", a bare scheme */
+    }
+  });
+}
+
+/** Why the last attempt did not connect, as far as the page can tell. */
+function unreachableReason(url: string): string {
+  let port: string;
+  try {
+    port = new global.URL(url).port;
+  } catch {
+    return UNREACHABLE;
+  }
+  if (!blockedPorts.has(port)) return UNREACHABLE;
+  return `port ${port || "(default)"} is blocked by this page's security policy — the server allows only the agent's own port`;
+}
+
 export type AgentState = "offline" | "connecting" | "online" | "error";
 
 interface Pending {
@@ -96,7 +133,9 @@ export class AgentClient {
       try {
         ws = new WebSocket(this.url);
       } catch (e) {
-        this.fail(e instanceof Error ? e.message : "bad agent URL");
+        // Firefox throws here for a policy refusal; Chromium only fires "error".
+        const blocked = unreachableReason(this.url);
+        this.fail(blocked !== UNREACHABLE ? blocked : e instanceof Error ? e.message : "bad agent URL");
         return reject(new Error(this.lastError));
       }
       this.ws = ws;
@@ -124,13 +163,16 @@ export class AgentClient {
         for (const [, p] of this.pending) p.reject(new Error("agent disconnected"));
         this.pending.clear();
         if (this.state === "online") this.setState("offline");
+        // The violation report can land after "error" did, so the reason is
+        // settled here, once, rather than in whichever handler ran first.
+        if (this.lastError === "" || this.lastError === UNREACHABLE) this.lastError = unreachableReason(this.url);
         if (this.wantOpen) this.scheduleRetry();
         reject(new Error(this.lastError || "agent connection closed"));
       });
 
       // "error" carries no detail in browsers; the close handler reports it.
       ws.addEventListener("error", () => {
-        if (this.state === "connecting") this.lastError = "cannot reach the agent";
+        if (this.state === "connecting") this.lastError = unreachableReason(this.url);
       });
     });
   }

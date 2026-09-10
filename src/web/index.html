@@ -4,6 +4,10 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Encryption Tool</title>
+  <!-- Swapped for a fresh per-request value by the server (src/server.ts:
+       NONCE_SLOT). CodeMirror mounts its themes as a <style> element at
+       runtime, and style-src admits that element by this nonce alone. -->
+  <meta name="csp-nonce" content="__CSP_NONCE__" />
   <link rel="stylesheet" href="/public/main.css" />
 
   <!-- PWA. Two theme-colour tags so the browser chrome follows the user's
@@ -50,7 +54,7 @@
        toolbar template, and is populated by the lazily-loaded code chunk. -->
   <div id="code-tab" class="tab-content"></div>
 
-  <input type="file" id="file-input" style="display:none" accept=".txt,.yaml,.yml,.json,.env" />
+  <input type="file" id="file-input" hidden accept=".txt,.yaml,.yml,.json,.env" />
   <div id="toast" class="toast"></div>
 
   <!-- Shown when a new service worker is waiting; the swap only happens when

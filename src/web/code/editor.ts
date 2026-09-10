@@ -31,6 +31,7 @@ import { highlightSelectionMatches, search, searchKeymap } from "@codemirror/sea
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import { grammarFor } from "./grammars.ts";
 import { conflictHighlighter } from "./conflicts.ts";
+import { cspNonce } from "../csp.ts";
 
 const theme = EditorView.theme({
   "&": { height: "100%", backgroundColor: "var(--panel)", color: "var(--text)" },
@@ -63,6 +64,8 @@ export class CodeEditor {
 
   private extensions(lang: Extension | null, readOnly: boolean): Extension[] {
     return [
+      // First, so CodeMirror has it before it mounts a single style module.
+      EditorView.cspNonce.of(cspNonce),
       lineNumbers(),
       history(),
       drawSelection(),

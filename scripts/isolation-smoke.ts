@@ -129,15 +129,80 @@ try {
     missingCsp.length === 0 && !/script-src[^;]*unsafe-inline/.test(csp) && !/script-src[^;]*https?:/.test(csp),
     missingCsp.length ? `missing ${missingCsp.join(", ")}` : "script-src is 'self' only",
   );
+  const connectSrc = (csp.split(";").find((d) => d.trim().startsWith("connect-src")) ?? "").trim();
+  const sources = connectSrc.split(" ").filter(Boolean).slice(1);
   check(
     "the policy still permits the loopback agent",
-    /connect-src[^;]*127\.0\.0\.1/.test(csp) && /connect-src[^;]*ws:\/\//.test(csp),
-    "connect-src allows ws:// and http:// on loopback",
+    connectSrc.includes("ws://127.0.0.1:5001") && connectSrc.includes("http://127.0.0.1:5001"),
+    "connect-src allows ws:// and http:// on the agent's default port",
+  );
+  // The point of pinning it: injected script gets a channel to the agent, not
+  // to every other thing the user happens to be running on loopback.
+  const unpinned = sources.filter((src) => src !== "'self'" && !/:[0-9]{1,5}$/.test(src));
+  check(
+    "and to nothing else on loopback",
+    sources.length > 1 && unpinned.length === 0,
+    unpinned.length ? `not pinned to a port: ${unpinned.join(", ")}` : `${sources.length - 1} sources, every one a fixed port`,
   );
 
-  const hardening = ["x-content-type-options", "referrer-policy", "cross-origin-opener-policy", "permissions-policy"];
+  // style-src used to carry 'unsafe-inline' for CodeMirror's runtime <style>.
+  // A nonce replaces it, and a nonce is worth something only if it is fresh
+  // per response and actually matches the shell it arrived with.
+  const nonceOf = (policy: string): string => new RegExp("style-src[^;]*'nonce-([^']+)'").exec(policy)?.[1] ?? "";
+  const shellA = await fetch(`${base}/`);
+  const htmlA = await shellA.text();
+  const nonceA = nonceOf(shellA.headers.get("content-security-policy") ?? "");
+  const shellB = await fetch(`${base}/`);
+  await shellB.text();
+  const nonceB = nonceOf(shellB.headers.get("content-security-policy") ?? "");
+  check(
+    "no directive falls back to 'unsafe-inline'",
+    !csp.includes("unsafe-inline"),
+    csp.includes("unsafe-inline") ? "still present" : "style-src is 'self' plus a nonce",
+  );
+  check(
+    "the shell carries the nonce it was served with, and a fresh one each time",
+    nonceA.length >= 16 && htmlA.includes(`content="${nonceA}"`) && nonceA !== nonceB,
+    nonceA.length >= 16 ? `${nonceA.length}-char nonce, matched in the page, and not reused` : "no nonce in style-src",
+  );
+
+  const hardening = [
+    "x-content-type-options",
+    "referrer-policy",
+    "cross-origin-opener-policy",
+    "x-frame-options",
+    "cross-origin-resource-policy",
+    "permissions-policy",
+    "strict-transport-security",
+  ];
   const missingHeaders = hardening.filter((h) => shellRes.headers.get(h) === null);
   check("hardening headers are present", missingHeaders.length === 0, missingHeaders.length ? `missing ${missingHeaders.join(", ")}` : hardening.join(", "));
+
+  // Every branch of the request handler, including the ones that are easy to
+  // forget: the two 404s and a rejected request body. The headers are stamped
+  // on the way out of `fetch` precisely so this list cannot drift, and this is
+  // the check that says so — a route added without them fails here.
+  const policy = ["content-security-policy", ...hardening];
+  const fresh: [string, Response][] = [
+    ["GET /public/main.js", await fetch(`${base}/public/main.js`)],
+    ["GET /manifest.webmanifest", await fetch(`${base}/manifest.webmanifest`)],
+    ["GET /agent/downloads", await fetch(`${base}/agent/downloads`)],
+    ["GET /agent/download/<unknown>", await fetch(`${base}/agent/download/nope.zip`)],
+    ["GET /<unknown>", await fetch(`${base}/no-such-route`)],
+    [
+      "POST /helm/encrypt (bad body)",
+      await fetch(`${base}/helm/encrypt`, { method: "POST", headers: { "content-type": "application/json" }, body: "{" }),
+    ],
+  ];
+  await Promise.all(fresh.map(([, r]) => r.text()));
+  // shellRes and encRes are drained above; only their headers are read here.
+  const everyRoute: [string, Response][] = [["GET /", shellRes], ["POST /ansible/encrypt", encRes], ...fresh];
+  const bare = everyRoute.filter(([, r]) => policy.some((h) => r.headers.get(h) === null)).map(([name]) => name);
+  check(
+    "no route can answer without the policy headers",
+    bare.length === 0,
+    bare.length ? `served bare: ${bare.join(", ")}` : `${everyRoute.length} routes checked, 404s and rejected bodies included`,
+  );
 
   // ── 2b. the other half of the CSP ──
   //

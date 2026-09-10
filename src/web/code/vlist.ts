@@ -23,6 +23,10 @@ export class VirtualList<T> {
     this.viewport = host.querySelector(".vlist-viewport")!;
     this.spacer = host.querySelector(".vlist-spacer")!;
     this.layer = host.querySelector(".vlist-layer")!;
+    // Every row is the same height, so it rides on the layer as a custom
+    // property instead of a style="" attribute per row — which style-src no
+    // longer admits. Styles assigned from script are not restricted at all.
+    this.layer.style.setProperty("--vlist-row-h", `${rowHeight}px`);
     this.viewport.addEventListener("scroll", () => this.paint(), { passive: true });
     new ResizeObserver(() => this.paint()).observe(this.viewport);
   }
@@ -62,7 +66,7 @@ export class VirtualList<T> {
     this.layer.innerHTML = slice
       .map(
         (item, k) =>
-          `<div class="vlist-row" data-i="${first + k}" style="height:${this.rowHeight}px">${this.renderRow(item, first + k)}</div>`,
+          `<div class="vlist-row" data-i="${first + k}">${this.renderRow(item, first + k)}</div>`,
       )
       .join("");
   }

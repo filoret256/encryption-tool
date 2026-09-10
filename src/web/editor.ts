@@ -30,6 +30,7 @@ import { openSearchPanel, search, searchKeymap } from "@codemirror/search";
 import { linter, lintGutter } from "@codemirror/lint";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import { yamlDiagnostics } from "./yaml-lint.ts";
+import { cspNonce } from "./csp.ts";
 
 export type Tab = "ansible" | "helm";
 export interface ViewPrefs {
@@ -158,6 +159,8 @@ export class TabEditor {
       state: EditorState.create({
         doc: "",
         extensions: [
+          // First, so CodeMirror has it before it mounts a single style module.
+          EditorView.cspNonce.of(cspNonce),
           this.cLine.of(TabEditor.extensionFor("lineNumbers", p.lineNumbers)),
           history(),
           drawSelection(),

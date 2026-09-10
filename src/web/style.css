@@ -320,7 +320,9 @@ body {
 .vlist-viewport { position: relative; height: 100%; overflow: auto; }
 .vlist-spacer { width: 1px; }
 .vlist-layer { position: absolute; top: 0; left: 0; right: 0; will-change: transform; }
-.vlist-row { display: flex; align-items: stretch; }
+/* Height comes from the layer's --vlist-row-h, set once from script: the
+   per-row style="" attribute it replaces is no longer allowed by style-src. */
+.vlist-row { display: flex; align-items: stretch; height: var(--vlist-row-h); }
 .vlist-row > * { flex: 1; min-width: 0; }
 
 /* ── Search panel ─────────────────────────────────────────────────────── */

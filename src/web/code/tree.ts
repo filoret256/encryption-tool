@@ -224,6 +224,11 @@ export class FileTree {
 
     this.layer.style.transform = `translateY(${first * ROW}px)`;
     this.layer.innerHTML = slice.map((n) => this.rowHtml(n)).join("");
+    // The indent cannot be a style="" attribute any more (style-src has no
+    // 'unsafe-inline'), so it rides in data-depth and is applied here.
+    for (const row of this.layer.querySelectorAll<HTMLElement>(".tree-row")) {
+      row.style.paddingLeft = `${4 + Number(row.dataset.depth) * 12}px`;
+    }
   }
 
   private rowHtml(n: TreeNode): string {
@@ -237,7 +242,7 @@ export class FileTree {
     else if (st) cls.push("dec-modified");
     if (n.dir && this.dirtyDirs.has(n.path)) cls.push("dec-dirty");
 
-    return `<div class="${cls.join(" ")}" draggable="true" data-path="${esc(n.path)}" style="padding-left:${4 + n.depth * 12}px">
+    return `<div class="${cls.join(" ")}" draggable="true" data-path="${esc(n.path)}" data-depth="${n.depth}">
       <span class="tree-caret">${n.dir ? (n.expanded ? "▾" : "▸") : ""}</span>
       <span class="tree-icon">${fileIcon(n.name, n.dir)}</span>
       <span class="tree-name">${esc(n.name)}</span>

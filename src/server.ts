@@ -1,6 +1,7 @@
 /** Bun HTTP server — replaces the Flask app. Stateless crypto endpoints, the
  *  static frontend, and the download point for prebuilt local agents. */
 import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 import { helm, ansible } from "./crypto/index.ts";
 import { VERSION } from "./version.ts";
 import { TARGETS, archiveName, type AgentBuild } from "./agent/targets.ts";
@@ -37,6 +38,41 @@ if (process.argv.includes("--health")) {
   }
 }
 
+/** Loopback ports the page may open a connection to.
+ *
+ *  The agent defaults to 5001 (src/agent/main.ts), but `--port` moves it, so a
+ *  deployment that tells its users a different port has to be able to say so
+ *  here — otherwise the policy would cut them off with no way to opt in.
+ *
+ *    AGENT_PORTS   comma-separated, e.g. "5001,5002"
+ *
+ *  A malformed value stops the server rather than being quietly dropped: the
+ *  symptom of a silently ignored port is a code tab that cannot connect and
+ *  gives no reason, which is exactly the failure this is meant to prevent.
+ */
+const AGENT_PORTS = (process.env.AGENT_PORTS ?? "5001")
+  .split(",")
+  .map((p) => p.trim())
+  .filter(Boolean);
+
+for (const port of AGENT_PORTS) {
+  if (!/^[0-9]{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
+    console.error(`AGENT_PORTS: "${port}" is not a port number`);
+    process.exit(1);
+  }
+}
+if (!AGENT_PORTS.length) {
+  console.error("AGENT_PORTS: no ports left after parsing — the code tab could reach no agent at all");
+  process.exit(1);
+}
+
+/** The agent binds 127.0.0.1 only (agent-go/server.go: listenLoopback), and the
+ *  page reaches it two ways: the WebSocket, and a plain fetch of /ping. Hence
+ *  four schemes — but each pinned to a port, not to `:*`. */
+const AGENT_SOURCES = AGENT_PORTS.flatMap((port) =>
+  ["ws", "wss", "http", "https"].flatMap((scheme) => [`${scheme}://127.0.0.1:${port}`, `${scheme}://localhost:${port}`]),
+);
+
 /** Sent on every response.
  *
  *  The threat this is really aimed at: the code tab keeps the local agent's URL
@@ -46,38 +82,76 @@ if (process.argv.includes("--health")) {
  *  policy costs nothing — the one relaxation is inline styles, which CodeMirror
  *  needs because it injects its themes as a <style> element at runtime.
  *
- *  connect-src has to allow loopback so the page can reach the user's agent.
+ *  connect-src has to allow loopback so the page can reach the user's agent —
+ *  but only on the agent's own port. Opening every loopback port would hand
+ *  injected script a channel to every other service on the machine, which is a
+ *  far larger grant than the one thing the tab actually needs.
  */
-const CSP = [
-  "default-src 'self'",
-  "script-src 'self'",
-  "style-src 'self' 'unsafe-inline'",
-  "img-src 'self' data:",
-  "font-src 'self'",
-  "connect-src 'self' ws://127.0.0.1:* wss://127.0.0.1:* http://127.0.0.1:* https://127.0.0.1:* ws://localhost:* wss://localhost:* http://localhost:* https://localhost:*",
-  "worker-src 'self'",
-  "manifest-src 'self'",
-  "object-src 'none'",
-  "base-uri 'none'",
-  "form-action 'none'",
-  "frame-ancestors 'none'",
-].join("; ");
+const cspFor = (nonce: string): string =>
+  [
+    "default-src 'self'",
+    "script-src 'self'",
+    // CodeMirror injects its themes as a <style> element at runtime, so the
+    // policy has to admit one — by nonce, which an attacker cannot guess,
+    // rather than by 'unsafe-inline', which admits every style anywhere.
+    `style-src 'self' 'nonce-${nonce}'`,
+    "img-src 'self' data:",
+    "font-src 'self'",
+    `connect-src 'self' ${AGENT_SOURCES.join(" ")}`,
+    "worker-src 'self'",
+    "manifest-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+  ].join("; ");
 
-const SECURITY_HEADERS: Record<string, string> = {
-  "content-security-policy": CSP,
+const securityHeaders = (nonce: string): Record<string, string> => ({
+  "content-security-policy": cspFor(nonce),
   "x-content-type-options": "nosniff",
   "referrer-policy": "no-referrer",
+  // frame-ancestors 'none' above already says this to every browser that reads
+  // CSP. The legacy header is kept because scanners check for it by name.
+  "x-frame-options": "DENY",
   "cross-origin-opener-policy": "same-origin",
+  // Nothing on this origin is meant to be pulled into someone else's page.
+  // No CORS headers are sent either, so this only closes the no-cors loads that
+  // CORS never covered in the first place: <img>, <script>, <link>, <iframe>.
+  "cross-origin-resource-policy": "same-origin",
   // Nothing here needs a camera, a microphone or a location.
   "permissions-policy": "camera=(), microphone=(), geolocation=(), interest-cohort=()",
-};
+  // This process only ever speaks plain HTTP — TLS is terminated by whatever
+  // proxy the deployment puts in front. A browser must ignore this header when
+  // it arrives over a non-secure transport, so sending it unconditionally is
+  // harmless here and takes effect exactly where it should.
+  //
+  // includeSubDomains is deliberately absent: there are no cookies here to
+  // protect from a sibling host, and an operator serving the app from an apex
+  // domain would be forcing HTTPS onto every unrelated subdomain they own.
+  "strict-transport-security": "max-age=31536000",
+});
 
-const withSecurity = (headers: Record<string, string>): Record<string, string> => ({ ...SECURITY_HEADERS, ...headers });
+/** A fresh nonce per request. The shell embeds it so CodeMirror's runtime
+ *  <style> is admitted; every other response carries one nothing uses, which
+ *  costs 24 bytes and keeps one code path instead of two. */
+const newNonce = (): string => randomBytes(16).toString("base64");
+
+/** Stamps the policy headers onto a finished response.
+ *
+ *  This runs on the way out of `fetch` rather than at every `return`, so a
+ *  route added later cannot ship without them — the previous shape, a helper
+ *  each branch had to remember to call, held only as long as everyone
+ *  remembered. These win over anything a route set: they are policy, not
+ *  content. */
+function secure(res: Response, nonce: string): Response {
+  for (const [name, value] of Object.entries(securityHeaders(nonce))) res.headers.set(name, value);
+  return res;
+}
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), {
     status,
-    headers: { "content-type": "application/json", "cache-control": "no-store", ...SECURITY_HEADERS },
+    headers: { "content-type": "application/json", "cache-control": "no-store" },
   });
 
 const ok = (result: unknown) => json({ result });
@@ -204,6 +278,9 @@ async function loadAgents(): Promise<void> {
   }
 }
 
+/** Placeholder in src/web/index.html, swapped for the request's nonce. */
+const NONCE_SLOT = "__CSP_NONCE__";
+
 const AGENT_TYPE: Record<string, string> = { zip: "application/zip", "tar.gz": "application/gzip" };
 
 // `server agent [...]` runs the local filesystem + git bridge for the code tab
@@ -216,49 +293,61 @@ if (process.argv[2] === "agent") {
 } else {
   await loadAgents();
 
+  async function route(req: Request, nonce: string): Promise<Response> {
+    const { pathname } = new URL(req.url);
+
+    if (req.method === "GET" && pathname === "/") {
+      // The shell is the one response that has to be built rather than streamed:
+      // it carries the nonce that admits CodeMirror's runtime <style>. Read per
+      // request so editing it in dev needs no restart; it is 6 KB.
+      const html = (await Bun.file(indexHtml).text()).replaceAll(NONCE_SLOT, nonce);
+      // A nonce that outlived its response would be a policy no longer matching
+      // its page, so the shell is never stored by the HTTP cache. The service
+      // worker keeps its own copy for offline, headers and all, and is unaffected.
+      return new Response(html, { headers: { "content-type": "text/html", "cache-control": "no-store" } });
+    }
+
+    if (req.method === "POST" && pathname in ROUTES) {
+      return crypto(req, ROUTES[pathname]);
+    }
+
+    // Fetched only when the user opens the code tab, so the crypto tabs
+    // never ask for it.
+    if (req.method === "GET" && pathname === "/agent/downloads") {
+      return json({ version: VERSION, builds: agentBuilds });
+    }
+
+    if (req.method === "GET" && pathname.startsWith("/agent/download/")) {
+      const file = decodeURIComponent(pathname.slice("/agent/download/".length));
+      const path = agentFiles.get(file);
+      if (!path) return new Response("Not found", { status: 404 });
+      return new Response(Bun.file(path), {
+        headers: {
+          "content-type": AGENT_TYPE[file.endsWith(".zip") ? "zip" : "tar.gz"],
+          // The version is part of the name, so a given file never changes.
+          "cache-control": IMMUTABLE,
+          "content-disposition": `attachment; filename="${file}"`,
+        },
+      });
+    }
+
+    if (req.method === "GET" && pathname in STATIC) {
+      const asset = STATIC[pathname];
+      const headers: Record<string, string> = { "content-type": asset.type };
+      if (asset.cache) headers["cache-control"] = asset.cache;
+      return new Response(Bun.file(asset.path), { headers });
+    }
+
+    return new Response("Not found", { status: 404 });
+  }
+
   const server = Bun.serve({
     port: PORT,
     hostname: "0.0.0.0", // bind all interfaces so the container is reachable
     maxRequestBodySize: MAX_BODY,
-    async fetch(req) {
-      const { pathname } = new URL(req.url);
-
-      if (req.method === "GET" && pathname === "/") {
-        return new Response(Bun.file(indexHtml), { headers: withSecurity({ "content-type": "text/html" }) });
-      }
-
-      if (req.method === "POST" && pathname in ROUTES) {
-        return crypto(req, ROUTES[pathname]);
-      }
-
-      // Fetched only when the user opens the code tab, so the crypto tabs
-      // never ask for it.
-      if (req.method === "GET" && pathname === "/agent/downloads") {
-        return json({ version: VERSION, builds: agentBuilds });
-      }
-
-      if (req.method === "GET" && pathname.startsWith("/agent/download/")) {
-        const file = decodeURIComponent(pathname.slice("/agent/download/".length));
-        const path = agentFiles.get(file);
-        if (!path) return new Response("Not found", { status: 404, headers: SECURITY_HEADERS });
-        return new Response(Bun.file(path), {
-          headers: withSecurity({
-            "content-type": AGENT_TYPE[file.endsWith(".zip") ? "zip" : "tar.gz"],
-            // The version is part of the name, so a given file never changes.
-            "cache-control": IMMUTABLE,
-            "content-disposition": `attachment; filename="${file}"`,
-          }),
-        });
-      }
-
-      if (req.method === "GET" && pathname in STATIC) {
-        const asset = STATIC[pathname];
-        const headers: Record<string, string> = { "content-type": asset.type };
-        if (asset.cache) headers["cache-control"] = asset.cache;
-        return new Response(Bun.file(asset.path), { headers: withSecurity(headers) });
-      }
-
-      return new Response("Not found", { status: 404, headers: SECURITY_HEADERS });
+    fetch: async (req) => {
+      const nonce = newNonce();
+      return secure(await route(req, nonce), nonce);
     },
   });
 
