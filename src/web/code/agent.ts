@@ -13,6 +13,21 @@ import type { AgentInfo, Push, Req, Res } from "../../agent/protocol.ts";
 
 const URL_KEY = "enc-agent-url";
 
+/** Does this text look like an agent URL, rather than whatever else happens to
+ *  be on the clipboard?
+ *
+ *  Deliberately narrow. It gates two conveniences — prefilling the connect
+ *  dialog and connecting straight from a paste — and both act on data the page
+ *  did not ask a human about, so the shape has to be the agent's own and
+ *  nothing else: a loopback host, the /ws path, a token.
+ *
+ *  Loopback-only is not a restriction invented here. The agent binds 127.0.0.1
+ *  and the page's own connect-src permits nothing else, so a remote ws:// would
+ *  be blocked a moment later anyway — better not to offer it at all. */
+const AGENT_URL = /^wss?:\/\/(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?\/ws\?(?:[^\s]*&)?token=[^\s&]+$/;
+
+export const isAgentUrl = (text: string): boolean => AGENT_URL.test(text.trim());
+
 export type AgentState = "offline" | "connecting" | "online" | "error";
 
 interface Pending {

@@ -44,6 +44,7 @@ and be pointed at a project instead of copied into one:
   --token <str>           fixed access token (default: random, printed below)
   --allow-origin <url>    origin allowed to connect, repeatable
                           (loopback origins are always allowed)
+  --no-clipboard          do not copy the URL to the clipboard on startup
   --version               print the version and exit
 
 Environment:
@@ -53,10 +54,11 @@ Environment:
 The agent listens on 127.0.0.1 only. Paste the URL below into the editor tab.`
 
 type options struct {
-	root    string
-	port    int
-	token   string
-	origins []string
+	root        string
+	port        int
+	token       string
+	origins     []string
+	noClipboard bool
 }
 
 // envOrigins reads comma- or space-separated origins from the environment.
@@ -123,6 +125,8 @@ func parseArgs(argv []string) options {
 			o.token = value()
 		case "--allow-origin":
 			o.origins = append(o.origins, strings.TrimSuffix(value(), "/"))
+		case "--no-clipboard":
+			o.noClipboard = true
 		case "--version", "-v":
 			fmt.Println(version)
 			os.Exit(0)
@@ -235,6 +239,17 @@ func main() {
 		originLine = strings.Join(opts.origins, ", ")
 	}
 
+	url := fmt.Sprintf("ws://127.0.0.1:%d/ws?token=%s", port, token)
+
+	// Copied for the user rather than left to their mouse: the token is new on
+	// every run, so this is the one line they would otherwise select by hand
+	// every single time. Only when someone is actually watching — see
+	// interactive() — and never when they have asked us not to.
+	clipLine := ""
+	if !opts.noClipboard && interactive() && copyToClipboard(url) {
+		clipLine = "\n  ✓ copied to your clipboard"
+	}
+
 	fmt.Printf(`
 enc-tool agent %s
   folder    %s
@@ -244,9 +259,9 @@ enc-tool agent %s
   origins   %s
 
   Paste this into the editor tab:
-  ws://127.0.0.1:%d/ws?token=%s
+  %s%s
 
-`, version, j.root, gitLine, rgLine, watchLine, originLine, port, token)
+`, version, j.root, gitLine, rgLine, watchLine, originLine, url, clipLine)
 
 	httpSrv := &http.Server{Handler: srv}
 	if err := httpSrv.Serve(listener); err != nil {

@@ -48,6 +48,11 @@ func readDir(j *jail, path string) ([]dirEntry, error) {
 
 	out := make([]dirEntry, 0, len(ents))
 	for _, d := range ents {
+		// The jail refuses to open anything under the git directory, so listing
+		// it would only offer the explorer a row that errors when clicked.
+		if isGitDirName(d.Name()) {
+			continue
+		}
 		link := d.Type()&fs.ModeSymlink != 0
 		e := dirEntry{Name: d.Name(), Dir: d.IsDir(), Link: link}
 
@@ -99,7 +104,7 @@ func readTextFile(j *jail, path string) (*fileRead, error) {
 }
 
 func writeTextFile(j *jail, path, text string) (map[string]int64, error) {
-	abs, err := j.toAbs(path)
+	abs, err := j.toAbsForWrite(path)
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +119,7 @@ func writeTextFile(j *jail, path, text string) (map[string]int64, error) {
 }
 
 func createFile(j *jail, path string) error {
-	abs, err := j.toAbs(path)
+	abs, err := j.toAbsForWrite(path)
 	if err != nil {
 		return err
 	}
@@ -130,7 +135,7 @@ func createFile(j *jail, path string) error {
 }
 
 func createDir(j *jail, path string) error {
-	abs, err := j.toAbs(path)
+	abs, err := j.toAbsForWrite(path)
 	if err != nil {
 		return err
 	}
@@ -142,7 +147,7 @@ func movePath(j *jail, from, to string) error {
 	if err != nil {
 		return err
 	}
-	dst, err := j.toAbs(to)
+	dst, err := j.toAbsForWrite(to)
 	if err != nil {
 		return err
 	}

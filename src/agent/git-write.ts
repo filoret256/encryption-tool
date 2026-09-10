@@ -11,14 +11,14 @@
  *  process or the browser.
  */
 import { run, runLines } from "./proc.ts";
-import { GitError } from "./git.ts";
+// safe/oneOf live in git.ts because the read operations need them just as much:
+// `--output=<file>` is a diff option, so `git log` accepts it too.
+import { GitError, oneOf, safe } from "./git.ts";
 
-/** Reject option-looking values; everything else git treats as data. */
-function safe(v: unknown, what: string): string {
-  const s = String(v ?? "");
-  if (s === "" || s.startsWith("-")) throw new GitError(`Invalid ${what}: ${s}`);
-  return s;
-}
+const RESET_MODES = ["soft", "mixed", "hard"] as const;
+const REBASE_ACTIONS = ["start", "continue", "abort", "skip"] as const;
+const STASH_ACTIONS = ["push", "pop", "apply", "drop", "list", "clear"] as const;
+const REMOTE_ACTIONS = ["fetch", "pull", "push"] as const;
 
 async function git(cwd: string, args: string[]): Promise<string> {
   const r = await run(["git", ...args], cwd);
@@ -68,8 +68,10 @@ export const branchDelete = (cwd: string, name: string, force = false) =>
 export const branchRename = (cwd: string, from: string, to: string) =>
   git(cwd, ["branch", "-m", safe(from, "branch"), safe(to, "branch")]);
 
+// The mode is concatenated into the flag, so it is checked against the list
+// rather than merely screened for a leading "-".
 export const reset = (cwd: string, oid: string, mode: "soft" | "mixed" | "hard") =>
-  git(cwd, ["reset", `--${mode}`, safe(oid, "commit")]);
+  git(cwd, ["reset", `--${oneOf(mode, RESET_MODES, "reset mode")}`, safe(oid, "commit")]);
 
 export const revert = (cwd: string, oid: string) =>
   git(cwd, ["revert", "--no-edit", safe(oid, "commit")]);
@@ -100,8 +102,8 @@ export async function rebase(
   action: "start" | "continue" | "abort" | "skip",
   ref?: string,
 ): Promise<{ conflict: boolean; output: string }> {
-  const args =
-    action === "start" ? ["rebase", safe(ref, "ref")] : ["rebase", `--${action}`];
+  const verb = oneOf(action, REBASE_ACTIONS, "rebase action");
+  const args = verb === "start" ? ["rebase", safe(ref, "ref")] : ["rebase", `--${verb}`];
   const r = await run(["git", ...args], cwd);
   const output = (r.stdout + r.stderr).trim();
   if (r.code === 0) return { conflict: false, output };
@@ -120,7 +122,9 @@ export async function stash(
   action: "push" | "pop" | "apply" | "drop" | "list" | "clear",
   opts: { message?: string; ref?: string } = {},
 ): Promise<string> {
-  switch (action) {
+  // The default branch passes the action through as a git subcommand, so this
+  // is a fixed list rather than a type assertion the wire never honoured.
+  switch (oneOf(action, STASH_ACTIONS, "stash action")) {
     case "push":
       return git(cwd, ["stash", "push", "--include-untracked", ...(opts.message ? ["-m", opts.message] : [])]);
     case "list":
@@ -134,6 +138,21 @@ export async function stash(
 
 // ── remotes ───────────────────────────────────────────────────────────────
 
+/** Resolve a remote *name*, and only a name.
+ *
+ *  Git reads the `<repository>` argument as a URL whenever it is not a
+ *  configured remote, so an unchecked value here is `git push https://…  HEAD`
+ *  — the user's repository handed to whoever asked for it, and `git fetch`
+ *  pulling back whatever they choose to serve. Screening for a leading "-"
+ *  does not catch that; being on the repository's own remote list does.
+ */
+async function knownRemote(cwd: string, name: string): Promise<string> {
+  const wanted = safe(name, "remote");
+  const known = await remotes(cwd);
+  if (!known.some((r) => r.name === wanted)) throw new GitError(`Unknown remote: ${wanted}`);
+  return wanted;
+}
+
 /** fetch/pull/push write their progress to stderr; stream it so the UI shows a
  *  live log instead of freezing until the transfer ends. */
 export async function remote(
@@ -142,12 +161,13 @@ export async function remote(
   opts: { remote?: string; ref?: string; setUpstream?: boolean; force?: boolean },
   onProgress: (line: string) => void,
 ): Promise<{ output: string }> {
-  const args: string[] = [action, "--progress"];
+  // The action is the git subcommand itself, so it comes off a list.
+  const args: string[] = [oneOf(action, REMOTE_ACTIONS, "remote action"), "--progress"];
   if (action === "fetch") args.push("--prune");
   if (action === "push" && opts.setUpstream) args.push("--set-upstream");
   // --force-with-lease refuses to clobber commits this clone has not seen.
   if (action === "push" && opts.force) args.push("--force-with-lease");
-  if (opts.remote) args.push(safe(opts.remote, "remote"));
+  if (opts.remote) args.push(await knownRemote(cwd, opts.remote));
   if (opts.ref) args.push(safe(opts.ref, "ref"));
 
   const lines: string[] = [];

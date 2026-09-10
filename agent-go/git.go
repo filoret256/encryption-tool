@@ -191,7 +191,11 @@ func gitLog(ctx context.Context, cwd string, o logOpts) ([]commit, error) {
 	if o.all {
 		args = append(args, "--all")
 	} else if o.ref != "" {
-		args = append(args, o.ref)
+		r, err := safeArg(o.ref, "ref")
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, r)
 	}
 	// `--` keeps a path that looks like a flag from being parsed as one.
 	if o.path != "" {
@@ -248,6 +252,10 @@ func gitBranches(ctx context.Context, cwd string) ([]branch, error) {
 }
 
 func gitCommitDetail(ctx context.Context, cwd, oid string) (*commitDetail, error) {
+	oid, err := safeArg(oid, "commit")
+	if err != nil {
+		return nil, err
+	}
 	out, err := gitOut(ctx, cwd, "log", "-1", "--format="+logFmt, oid)
 	if err != nil {
 		return nil, err
@@ -367,6 +375,10 @@ func parseFileList(out string) []commitFile {
 // blobAt is the text of path at revision rev, or nil when it does not exist
 // there or is binary. rev is a commit-ish, or "" for the index (":<path>").
 func blobAt(ctx context.Context, cwd, rev, path string) (*string, bool, error) {
+	rev, err := safeOptArg(rev, "revision")
+	if err != nil {
+		return nil, false, err
+	}
 	spec := ":" + path
 	if rev != "" {
 		spec = rev + ":" + path
@@ -422,15 +434,21 @@ func gitDiffPair(ctx context.Context, cwd, path, kind string, readWorktree func(
 		}, nil
 	}
 
-	before, bBin, err := blobAt(ctx, cwd, kind+"^", path)
+	// Anything else is a commit-ish, which means it is client data reaching an
+	// argv — the one branch here that has to be checked.
+	rev, err := safeArg(kind, "commit")
 	if err != nil {
 		return nil, err
 	}
-	after, aBin, err := blobAt(ctx, cwd, kind, path)
+	before, bBin, err := blobAt(ctx, cwd, rev+"^", path)
 	if err != nil {
 		return nil, err
 	}
-	short := kind
+	after, aBin, err := blobAt(ctx, cwd, rev, path)
+	if err != nil {
+		return nil, err
+	}
+	short := rev
 	if len(short) > 8 {
 		short = short[:8]
 	}

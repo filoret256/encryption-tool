@@ -12,5 +12,8 @@ server.exe
 *.log
 .env
 .claude
+backlog.md
+./backlog.md
+
 # cross-compiled agent binaries (bun run agents:build)
 dist/

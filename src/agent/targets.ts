@@ -83,7 +83,7 @@ export const TARGETS: AgentTarget[] = [
 
 export const byId = (id: string): AgentTarget | undefined => TARGETS.find((t) => t.id === id);
 
-/** `enc-tool-agent-3.5.0-darwin-arm64.tar.gz` — the version is in the name so a
+/** `enc-tool-agent-4.0.0-darwin-arm64.tar.gz` — the version is in the name so a
  *  mirror can hold several releases side by side. */
 export const archiveName = (t: AgentTarget, version: string): string =>
   `enc-tool-agent-${version}-${t.id}.${t.kind}`;

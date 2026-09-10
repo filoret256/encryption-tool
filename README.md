@@ -105,7 +105,34 @@ It prints a `ws://127.0.0.1:5001/ws?token=…` URL — paste it into the code ta
 --port <n>              loopback port (default: 5001)
 --token <str>           fixed access token (default: random, printed at startup)
 --allow-origin <url>    origin allowed to connect, repeatable
+--no-clipboard          do not copy the URL to the clipboard on startup
 ```
+
+### Getting the URL across / Как перенести URL
+
+The token is new on every run, so that one line would otherwise be selected with
+the mouse every single time. Two halves meet in the middle:
+
+- **the agent copies it** as it starts, through the platform's own clipboard
+  tool (`clip`, `pbcopy`, `wl-copy`/`xclip`/`xsel`), and says so in the banner.
+  Only when stdout is a terminal — piped output belongs to a script, not to
+  someone about to paste — and never with `--no-clipboard`;
+- **the tab takes it**: paste anywhere on the code tab and it connects. The
+  `connect…` dialog also prefills from the clipboard where the browser permits
+  reading it, falling back to the last URL used.
+
+A paste is only acted on when it is the agent's own URL — a loopback host, the
+`/ws` path, a token — and only while no agent is connected and the caret is not
+in a field or in the editor. Anything else is left to paste where it was aimed.
+
+Токен новый при каждом запуске, поэтому агент сам кладёт URL в буфер обмена, а
+вкладка подхватывает его из вставки — `Ctrl+V` в любом месте вкладки `code`.
+
+> The URL is a credential. Putting it on the clipboard makes it readable by any
+> process on the machine, and Windows Cloud Clipboard or macOS Universal
+> Clipboard may sync it to your other devices — `--no-clipboard` turns that off.
+>
+> URL — это учётные данные: в буфере обмена его видит любой процесс.
 
 **Requires:** `git` on `PATH`. **Optional:** `ripgrep` — без него поиск использует
 более медленный встроенный обход.

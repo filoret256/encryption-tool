@@ -19,6 +19,7 @@ import { gunzipSync, inflateRawSync } from "node:zlib";
 import { iter } from "../src/agent/proc.ts";
 import { pack } from "./archive.ts";
 import { VERSION } from "../src/version.ts";
+import { isAgentUrl } from "../src/web/code/agent.ts";
 
 const results: { name: string; ok: boolean; note: string }[] = [];
 function check(name: string, ok: boolean, note = ""): void {
@@ -359,6 +360,71 @@ try {
       typo.code === 2 && /unknown option/.test(typo.out) &&
         twice.code === 2 && twicePositional.code === 2 && /given twice/.test(twice.out),
       "otherwise the agent would silently expose the current directory",
+    );
+
+    // ── 5. getting the URL out of the terminal ──
+    //
+    // The agent copies its URL to the clipboard as it starts, because the token
+    // is new every run and that line would otherwise be selected by hand every
+    // time. --no-clipboard has to be a real flag rather than an unknown option,
+    // and the URL has to keep being printed either way — the clipboard is the
+    // convenience, the banner is the contract.
+    const noClip = await runCli([dir, "--no-clipboard", "--port", "5091", "--version"]);
+    check(
+      "--no-clipboard is a recognised flag",
+      noClip.code === 0 && !/unknown option/.test(noClip.out),
+      noClip.out.trim().split("\n")[0] ?? "",
+    );
+
+    // Piped output is not a terminal, so nothing here touches the developer's
+    // clipboard — which is also what keeps the smoke suites from stomping it.
+    const banner = await new Promise<string>((resolve) => {
+      const p = Bun.spawn(["bun", "src/agent/cli.ts", dir, "--port", "5091"], {
+        cwd: process.cwd(),
+        stdout: "pipe",
+        stderr: "ignore",
+        stdin: "ignore",
+      });
+      let buf = "";
+      void (async () => {
+        for await (const chunk of iter(p.stdout as ReadableStream<Uint8Array>)) {
+          buf += new TextDecoder().decode(chunk);
+          if (/ws:\/\/127\.0\.0\.1:\d+\/ws\?token=/.test(buf)) break;
+        }
+        p.kill();
+        resolve(buf);
+      })();
+    });
+    check(
+      "the URL is still printed, and not claimed as copied when it was not",
+      /ws:\/\/127\.0\.0\.1:5091\/ws\?token=[0-9a-f]{32}/.test(banner) && !/copied to your clipboard/.test(banner),
+      "piped output is not a terminal, so the copy is skipped and not announced",
+    );
+
+    // The matcher the page uses to decide what it may connect to on its own —
+    // from a paste, or from the clipboard when it prefills the dialog. It is a
+    // security boundary, not a convenience: loopback only, /ws only, token
+    // required.
+    const good = [
+      "ws://127.0.0.1:5001/ws?token=abc123",
+      "ws://localhost:5001/ws?token=abc123",
+      "ws://[::1]:5001/ws?token=abc123",
+      "wss://127.0.0.1:5001/ws?token=abc123",
+      "ws://127.0.0.1/ws?token=abc123",
+    ];
+    const bad = [
+      "ws://evil.example/ws?token=abc123", // not loopback
+      "ws://127.0.0.1:5001/ws", // no token
+      "ws://127.0.0.1:5001/other?token=abc", // not the agent's path
+      "http://127.0.0.1:5001/ws?token=abc", // not a socket
+      "ws://127.0.0.1.evil.example/ws?token=a", // loopback as a prefix only
+      "not a url at all",
+      "",
+    ];
+    check(
+      "the auto-connect matcher accepts the agent's URL and nothing else",
+      good.every((u) => isAgentUrl(u)) && bad.every((u) => !isAgentUrl(u)),
+      `${good.length} accepted, ${bad.length} rejected`,
     );
   } finally {
     stopFlag();
