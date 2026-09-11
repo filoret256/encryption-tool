@@ -17,8 +17,13 @@ import { GitError, oneOf, readOnly, safe } from "./git.ts";
 
 const RESET_MODES = ["soft", "mixed", "hard"] as const;
 const REBASE_ACTIONS = ["start", "continue", "abort", "skip"] as const;
+const SEQUENCER_KINDS = ["cherry-pick", "revert"] as const;
+const SEQUENCER_ACTIONS = ["continue", "abort", "skip"] as const;
 const STASH_ACTIONS = ["push", "pop", "apply", "drop", "list", "clear"] as const;
 const REMOTE_ACTIONS = ["fetch", "pull", "push"] as const;
+/** How `git pull` integrates: a merge commit, a rebase, or refusing anything
+ *  that is not a fast-forward. */
+const PULL_MODES = ["merge", "rebase", "ff-only"] as const;
 
 async function git(cwd: string, args: string[]): Promise<string> {
   const r = await run(["git", ...args], cwd);
@@ -107,9 +112,18 @@ export const cherryPick = (cwd: string, oid: string) =>
 /** Merge is expected to fail on conflict: git leaves conflict markers in the
  *  worktree and a non-zero exit. Report that as data, not as an error, so the
  *  UI can open the conflict resolver instead of a toast. */
-export async function merge(cwd: string, ref: string, noFf: boolean): Promise<{ conflict: boolean; output: string }> {
+export async function merge(
+  cwd: string,
+  ref: string,
+  noFf: boolean,
+  squash = false,
+): Promise<{ conflict: boolean; output: string }> {
   const args = ["merge", "--no-edit"];
-  if (noFf) args.push("--no-ff");
+  // --squash stages the result and stops before committing; it is incompatible
+  // with --no-ff, and the two never arrive together because the UI asks for one
+  // strategy, not a set of flags.
+  if (squash) args.push("--squash");
+  else if (noFf) args.push("--no-ff");
   args.push(safe(ref, "ref"));
   const r = await run(["git", ...args], cwd);
   const output = (r.stdout + r.stderr).trim();
@@ -131,6 +145,29 @@ export async function rebase(
   const output = (r.stdout + r.stderr).trim();
   if (r.code === 0) return { conflict: false, output };
   if (/conflict|could not apply/i.test(output)) return { conflict: true, output };
+  throw new GitError(output);
+}
+
+/** Finish or abandon a stopped cherry-pick or revert.
+ *
+ *  Same shape as `rebase` above, and here for the same reason: `Cherry-pick
+ *  onto current` and `Revert this commit` are two clicks away in the history
+ *  panel, both stop on a conflict, and without this the only way out of one was
+ *  a terminal. `--continue` needs no editor, so `--no-edit` keeps it from
+ *  blocking on one that will never open.
+ */
+export async function sequencer(
+  cwd: string,
+  what: "cherry-pick" | "revert",
+  action: "continue" | "abort" | "skip",
+): Promise<{ conflict: boolean; output: string }> {
+  const verb = oneOf(what, SEQUENCER_KINDS, "sequencer command");
+  const step = oneOf(action, SEQUENCER_ACTIONS, "sequencer action");
+  const args = [verb, `--${step}`, ...(step === "continue" ? ["--no-edit"] : [])];
+  const r = await run(["git", ...args], cwd);
+  const output = (r.stdout + r.stderr).trim();
+  if (r.code === 0) return { conflict: false, output };
+  if (/conflict/i.test(output)) return { conflict: true, output };
   throw new GitError(output);
 }
 
@@ -181,12 +218,20 @@ async function knownRemote(cwd: string, name: string): Promise<string> {
 export async function remote(
   cwd: string,
   action: "fetch" | "pull" | "push",
-  opts: { remote?: string; ref?: string; setUpstream?: boolean; force?: boolean },
+  opts: { remote?: string; ref?: string; setUpstream?: boolean; force?: boolean; mode?: string },
   onProgress: (line: string) => void,
 ): Promise<{ output: string }> {
   // The action is the git subcommand itself, so it comes off a list.
   const args: string[] = [oneOf(action, REMOTE_ACTIONS, "remote action"), "--progress"];
   if (action === "fetch") args.push("--prune");
+  // How a pull integrates what it fetched. Passed explicitly rather than left
+  // to `pull.rebase`, so the UI can say which one it is about to do — and so a
+  // trunk-based repository is not handed a merge commit because a config the
+  // page cannot see was not set.
+  if (action === "pull" && opts.mode) {
+    const mode = oneOf(opts.mode, PULL_MODES, "pull mode");
+    args.push(mode === "rebase" ? "--rebase" : mode === "ff-only" ? "--ff-only" : "--no-rebase");
+  }
   if (action === "push" && opts.setUpstream) args.push("--set-upstream");
   // --force-with-lease refuses to clobber commits this clone has not seen.
   if (action === "push" && opts.force) args.push("--force-with-lease");

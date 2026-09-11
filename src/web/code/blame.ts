@@ -25,6 +25,9 @@ export interface BlameLine {
   time: number;
   /** 1-based line in the committed file. */
   line: number;
+  /** Subject of the commit the line came from — shown on hover, so the gutter
+   *  can answer "which change was this" without opening anything. */
+  summary: string;
 }
 
 /** Rows for the open document, or null to take the gutter away. */
@@ -83,7 +86,16 @@ class BlameMarker extends GutterMarker {
   override toDOM(): HTMLElement {
     const el = document.createElement("span");
     el.className = `cm-blame-cell shade-${this.shade}${this.first ? " first" : ""}`;
-    el.title = `${this.row.oid.slice(0, 8)} · ${this.row.author} · ${when(this.row.time)}\nClick to open this commit`;
+    // Everything the gutter has no width for. What the cell can show is a
+    // first name and an age; the question it raises — *which change was this* —
+    // needed a click and a lost reading position to answer, and the answer was
+    // already in the reply git sent.
+    el.title = [
+      this.row.summary || "(no subject)",
+      `${this.row.oid.slice(0, 8)} · ${this.row.author}`,
+      absoluteDay(this.row.time),
+      "Click to open this commit",
+    ].join("\n");
     // Only the first line of a run is labelled; the rest carry the tint alone.
     el.textContent = this.first ? `${short(this.row.author)} ${when(this.row.time)}` : "";
     return el;
@@ -92,6 +104,15 @@ class BlameMarker extends GutterMarker {
 
 /** Not-yet-committed lines. Blame reports these with the all-zero oid. */
 const UNCOMMITTED = /^0+$/;
+
+/** The date as a date, for the tooltip — where there is room to be unambiguous
+ *  and no reason not to be. */
+const absoluteDay = (seconds: number): string => {
+  const d = new Date(seconds * 1000);
+  return Number.isNaN(d.getTime())
+    ? "unknown date"
+    : d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+};
 
 const when = (seconds: number): string => {
   const d = new Date(seconds * 1000);

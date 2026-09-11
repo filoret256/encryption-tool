@@ -8,4 +8,4 @@
  *
  *  Keep in step with package.json.
  */
-export const VERSION = "4.7.0";
+export const VERSION = "4.8.0";

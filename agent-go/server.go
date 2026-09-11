@@ -210,7 +210,9 @@ func init() {
 		"git.reflog": func(c *opCtx, p *req) (any, error) {
 			return gitReflog(c.ctx, c.cwd, p.number("limit", 50))
 		},
-		"git.commitDetail": func(c *opCtx, p *req) (any, error) { return gitCommitDetail(c.ctx, c.cwd, p.str("oid")) },
+		"git.commitDetail": func(c *opCtx, p *req) (any, error) {
+			return gitCommitDetail(c.ctx, c.cwd, p.str("oid"), p.number("parent", 1))
+		},
 		"git.blob": func(c *opCtx, p *req) (any, error) {
 			text, binary, err := blobAt(c.ctx, c.cwd, p.str("rev"), p.str("path"))
 			if err != nil {
@@ -270,7 +272,7 @@ func init() {
 
 		// ── git: merge / rebase / stash ──
 		"git.merge": func(c *opCtx, p *req) (any, error) {
-			return gitMerge(c.ctx, c.cwd, p.str("ref"), p.truthy("noFf"))
+			return gitMerge(c.ctx, c.cwd, p.str("ref"), p.truthy("noFf"), p.truthy("squash"))
 		},
 		"git.mergeAbort": func(c *opCtx, _ *req) (any, error) { return gitMergeAbort(c.ctx, c.cwd) },
 		"git.rebase": func(c *opCtx, p *req) (any, error) {
@@ -279,6 +281,17 @@ func init() {
 				action = "start"
 			}
 			return gitRebase(c.ctx, c.cwd, action, p.str("ref"))
+		},
+		"git.sequencer": func(c *opCtx, p *req) (any, error) {
+			what := p.str("what")
+			if what == "" {
+				what = "cherry-pick"
+			}
+			action := p.str("action")
+			if action == "" {
+				action = "abort"
+			}
+			return gitSequencer(c.ctx, c.cwd, what, action)
 		},
 		"git.stash": func(c *opCtx, p *req) (any, error) {
 			action := p.str("action")
@@ -307,6 +320,8 @@ func init() {
 				ref:         p.str("ref"),
 				setUpstream: p.truthy("setUpstream"),
 				force:       p.truthy("force"),
+				mode:        p.str("mode"),
+
 			}, func(line string) {
 				c.chunk(map[string]string{"progress": line})
 			})

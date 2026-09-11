@@ -6,8 +6,8 @@
  *  approximation of them.
  */
 import type { AgentClient } from "./agent.ts";
-import type { Branch, Commit, CommitDetail, GitStatus, ReflogEntry, StatusEntry } from "../../agent/protocol.ts";
-import { esc, modalConfirm, modalPrompt, setHtmlKeepingScroll, showMenu, startTrimmed, type MenuItem } from "./ui.ts";
+import type { Branch, Commit, CommitDetail, CommitFile, GitOperation, GitStatus, ReflogEntry, StatusEntry } from "../../agent/protocol.ts";
+import { esc, modalChoice, modalConfirm, modalPrompt, setHtmlKeepingScroll, showMenu, startTrimmed, type MenuItem } from "./ui.ts";
 import { pickRef } from "./refpicker.ts";
 import { iconBranch, iconCheck, iconDiscard, iconFetch, iconMinus, iconMore, iconPlus, iconPull, iconPush } from "./icons.ts";
 
@@ -15,7 +15,21 @@ export interface GitPanelCallbacks {
   /** kind: "worktree" (index vs disk), "staged" (HEAD vs index) or a commit oid. */
   openDiff(path: string, kind: string): void;
   openFile(path: string): void;
-  toast(message: string, isError?: boolean): void;
+  /** `scope` tags a notice as being about a state rather than an event, so it
+   *  can be taken down when that state passes — see `dismiss` below. */
+  toast(message: string, isError?: boolean, scope?: string): void;
+  /** Drop the notices carrying this scope. */
+  dismiss(scope: string): void;
+  /** A one-line summary plus everything the command actually said.
+   *
+   *  git answers in paragraphs — which files conflicted, which refs moved, what
+   *  it suggests doing next — and all of it used to be dropped on the floor for
+   *  the operations that succeed, leaving `git merged` in the log and nothing
+   *  to check it against. The summary is the line; the transcript goes to the
+   *  output log behind a "details" button. */
+  report(summary: string, detail?: string, opts?: { isError?: boolean; scope?: string }): void;
+  /** List what differs between two refs — branches, tags, commits. */
+  compareRefs(left: string, right: string): void;
   /** Something changed on disk or in refs — reload the tree and decorations. */
   afterChange(): void;
 }
@@ -23,11 +37,22 @@ export interface GitPanelCallbacks {
 type Group = "conflict" | "staged" | "changes" | "untracked";
 
 const GROUP_TITLES: Record<Group, string> = {
-  conflict: "merge conflicts",
+  conflict: "conflicts",
   staged: "staged changes",
   changes: "changes",
   untracked: "untracked",
 };
+
+/** The conflict section, named after whatever produced the conflicts.
+ *
+ *  It said "merge conflicts" during a rebase, a cherry-pick and a revert as
+ *  well — three operations whose conflicts resolve to different things, and one
+ *  of which (rebase) reverses the meaning of "current" and "incoming" in the
+ *  editor. A `stash pop` can leave conflicts with no operation in progress at
+ *  all, which is why the plain word is the fallback rather than "merge". */
+function conflictTitle(op: GitOperation | null): string {
+  return op ? `${op.kind} conflicts` : "conflicts";
+}
 
 /** One entry of `git stash list`.
  *
@@ -73,6 +98,7 @@ const SHELL = `
     <button class="t-icon js-push" type="button" title="Push">${iconPush}</button>
     <button class="t-icon js-more" type="button" title="More actions">${iconMore}</button>
   </div>
+  <div class="gp-op js-op" hidden></div>
   <div class="gp-commit">
     <textarea class="js-message" rows="2" placeholder="Message (Ctrl+Enter to commit)" spellcheck="false"></textarea>
     <div class="gp-commit-row">
@@ -90,9 +116,35 @@ const SHELL = `
 /** Collapsible sections: the four file groups plus the stash list. */
 type Section = Group | "stash";
 
+/** Notices about a half-finished operation, taken down when it finishes: see
+ *  notify.ts. "merge stopped with conflicts — resolve them below" is true until
+ *  it is not, and a red box that goes on saying it after the merge commit is
+ *  worse than no box at all. */
+export const OP_SCOPE = "git-operation";
+/** "Commit message is required" stops being true at the first keystroke. */
+const MSG_SCOPE = "commit-message";
+
 const COLLAPSED_KEY = "enc-scm-collapsed";
 const VIEW_KEY = "enc-scm-view";
 const SORT_KEY = "enc-scm-sort";
+const PULL_KEY = "enc-scm-pull";
+
+/** How a pull integrates what it fetched.
+ *
+ *  Asked rather than assumed. `git pull` merges unless `pull.rebase` says
+ *  otherwise, and that config lives on the machine, not in the page — so the
+ *  button used to do whichever one the repository happened to be set up for,
+ *  without saying which, and a branch that was meant to stay linear quietly
+ *  gained a merge commit. */
+type PullMode = "merge" | "rebase" | "ff-only";
+const PULL_MODES = ["merge", "rebase", "ff-only"] as const;
+const PULL_LABELS: Record<PullMode, string> = {
+  merge: "merge",
+  rebase: "rebase",
+  "ff-only": "fast-forward only",
+};
+/** The same three, short enough to sit on the button beside the arrow. */
+const PULL_TAGS: Record<PullMode, string> = { merge: "m", rebase: "rb", "ff-only": "ff" };
 
 const loadCollapsed = (): Set<Section> => {
   try {
@@ -119,6 +171,33 @@ const loadPref = <T extends string>(key: string, allowed: readonly T[], fallback
   }
 };
 
+/** The remembered pull strategy, or null if the user has not chosen one.
+ *
+ *  Null is a real state, not a default: it is what makes the first divergent
+ *  pull ask instead of guessing. */
+/** Per folder, not per browser.
+ *
+ *  One person's machine holds a trunk-based repository and a gitflow one, and
+ *  the right answer for pull is not the same in both — a single remembered
+ *  choice means whichever they answered first is silently applied to the other.
+ *  Keyed by the workspace path the agent reports.
+ */
+const loadPullModes = (): Record<string, PullMode> => {
+  try {
+    const raw = JSON.parse(localStorage.getItem(PULL_KEY) ?? "{}") as unknown;
+    if (!raw || typeof raw !== "object") return {};
+    // The old format was a single mode string for every folder. Nothing is
+    // migrated from it: one repository's answer is not evidence about another.
+    return Object.fromEntries(
+      Object.entries(raw as Record<string, unknown>).filter(
+        (e): e is [string, PullMode] => typeof e[1] === "string" && (PULL_MODES as readonly string[]).includes(e[1]),
+      ),
+    );
+  } catch {
+    return {};
+  }
+};
+
 const savePref = (key: string, value: string): void => {
   try {
     localStorage.setItem(key, value);
@@ -126,6 +205,31 @@ const savePref = (key: string, value: string): void => {
     /* private mode */
   }
 };
+
+/** The other side of a merge, as git named it in MERGE_MSG.
+ *
+ *  "Merge branch 'feature/x' into develop" is a sentence about the operation;
+ *  the banner has already said it is merging, so what is left to say is which
+ *  branch is coming in. Anything that does not match the template — a merged
+ *  tag, a cherry-pick subject — is shown as written. */
+export function mergeSource(subject: string): string {
+  const m = /^Merge (?:branch|remote-tracking branch|tag|commit) '([^']+)'/.exec(subject);
+  return m ? m[1] : subject;
+}
+
+/** What a merge that did not stop on a conflict actually did.
+ *
+ *  The agent runs git with LC_ALL=C, so these phrases are git's own and not a
+ *  translation. Anything unrecognised falls back to naming the ref, which is
+ *  still more than "merged" said. */
+function mergeOutcome(ref: string, output: string, mode: "default" | "no-ff" | "squash" = "default"): string {
+  if (/already up to date/i.test(output)) return `already up to date — ${ref} is in this branch`;
+  // A squash merge stages the changes and stops; saying "merged" would suggest
+  // the work is recorded, and it is not until the user commits.
+  if (mode === "squash") return `squashed ${ref} into the index — write a message and commit`;
+  if (/fast[- ]forward/i.test(output)) return `merged ${ref} (fast-forward)`;
+  return `merged ${ref}${mode === "no-ff" ? " (merge commit)" : ""}`;
+}
 
 /** Relative age, short enough for a row. */
 function ago(seconds: number): string {
@@ -149,10 +253,38 @@ export class GitPanel {
    *  who does not never wants to see it. */
   private view = loadPref(VIEW_KEY, ["list", "tree"] as const, "list");
   private sort = loadPref(SORT_KEY, ["name", "status"] as const, "name");
+  /** Remembered pull strategies, keyed by workspace folder. The current
+   *  folder's entry is null until the user has been asked once — see doPull(). */
+  private pullModes = loadPullModes();
+
+  /** Which folder the remembered strategy belongs to. Falls back to a fixed
+   *  key before the agent has said where it is pointed, so a pull made in that
+   *  window is still remembered somewhere rather than nowhere. */
+  private get folderKey(): string {
+    return this.agent.info?.root ?? "(unknown)";
+  }
+
+  /** The strategy chosen for this folder, if one has been. */
+  private get pull(): PullMode | null {
+    return this.pullModes[this.folderKey] ?? null;
+  }
+  /** The prepared message already put in the box, so a box the user has since
+   *  emptied is not refilled on the next watcher event. */
+  private preparedOffered: string | null = null;
+  /** The stash whose contents are on screen, and what is in it.
+   *
+   *  Until this, the only way to find out what a stash held was to apply it —
+   *  which is the one thing you do not want to do to check. */
+  private openStash: string | null = null;
+  private stashFiles = new Map<string, CommitFile[]>();
   private busy = false;
   /** Fingerprint of the rendered file list, so an unchanged status leaves the
    *  rows — and any click in flight over them — alone. */
   private renderedKey = "";
+  /** The same, for the operation banner: it carries buttons with listeners, so
+   *  rebuilding it on every watcher event would drop clicks the way the file
+   *  rows used to. */
+  private renderedOp = "";
   /** Set when git refused to answer. Shown in place of the file list, because
    *  "No changes." for a failed status is a claim about the working tree that
    *  nothing has checked. */
@@ -173,7 +305,10 @@ export class GitPanel {
     this.$(".js-sync").addEventListener("click", () => void this.sync());
     this.$(".js-more").addEventListener("click", (e) => void this.moreMenu(e as MouseEvent));
     this.$(".js-fetch").addEventListener("click", () => void this.remote("fetch", {}));
-    this.$(".js-pull").addEventListener("click", () => void this.remote("pull", {}));
+    this.$(".js-pull").addEventListener("click", () => void this.doPull());
+    // The button says which strategy is armed, so the choice is not something
+    // you have to remember making.
+    this.showPullMode();
     this.$(".js-push").addEventListener("click", () => void this.push());
     this.$(".js-commit").addEventListener("click", () => void this.commit(false));
     this.$(".js-amend").addEventListener("click", () => void this.commit(true));
@@ -195,6 +330,7 @@ export class GitPanel {
     });
     this.$(".js-groups").addEventListener("pointerdown", (e) => this.onGroupPress(e as PointerEvent));
     this.$(".js-groups").addEventListener("click", (e) => void this.onGroupAction(e as MouseEvent));
+    this.$(".js-groups").addEventListener("contextmenu", (e) => this.onGroupMenu(e as MouseEvent));
   }
 
   // ── data ────────────────────────────────────────────────────────────────
@@ -219,6 +355,17 @@ export class GitPanel {
       this.stashes = parseStashes(stashes);
       this.failure = null;
 
+      // The operation is over, or its conflicts are: whatever was said about
+      // them is now a claim about a state that no longer exists, so take it
+      // down rather than leave it for the user to close by hand.
+      if (!status.operation || !status.entries.some((e) => e.conflict)) this.cb.dismiss(OP_SCOPE);
+
+      this.offerPreparedMessage(status.preparedMessage ?? null);
+      // The strategy is per folder, and which folder this is only becomes known
+      // once the agent has answered — so the button's tag is settled here
+      // rather than in the constructor.
+      this.showPullMode();
+
       // git refuses to commit without an identity; say so before the failure.
       const warn = this.$<HTMLElement>(".js-warn");
       const missing = !identity.name || !identity.email;
@@ -232,6 +379,116 @@ export class GitPanel {
       if (!notARepo) this.cb.toast(message, true);
     }
     this.render();
+  }
+
+  /** Right-click on a stash: the same three actions as the icons, named.
+   *
+   *  The icons appear on hover and are a glyph each; a right-click is what
+   *  people try when they want to know what a row can do, and on these rows it
+   *  used to do nothing at all. */
+  private onGroupMenu(e: MouseEvent): void {
+    const row = (e.target as HTMLElement).closest<HTMLElement>("[data-stash]");
+    const ref = row?.dataset.stash;
+    if (!ref) return;
+    e.preventDefault();
+    const stash = this.stashes.find((s) => s.ref === ref);
+    const name = stash ? stashLabel(stash.subject).text || ref : ref;
+    showMenu(e.clientX, e.clientY, [
+      {
+        label: this.openStash === ref ? "Hide what is in it" : "Show what is in it",
+        run: () => void this.toggleStash(ref),
+      },
+      { label: `Apply ${name} — keep the stash`, separated: true, run: () => void this.stashAction("apply", ref) },
+      { label: `Pop ${name} — apply and remove`, run: () => void this.stashAction("pop", ref) },
+      { label: `Drop ${name}`, danger: true, run: () => void this.stashAction("drop", ref) },
+    ]);
+  }
+
+  /** Open or close a stash, reading its file list the first time.
+   *
+   *  A stash is a commit whose first parent is the commit it was taken on, so
+   *  `git.commitDetail` answers this with no new agent code — and its files
+   *  open in the same diff as any other commit's. */
+  private async toggleStash(ref: string): Promise<void> {
+    if (this.openStash === ref) {
+      this.openStash = null;
+      this.renderedKey = "";
+      this.render();
+      return;
+    }
+    this.openStash = ref;
+    this.renderedKey = "";
+    this.render();
+    if (this.stashFiles.has(ref)) return;
+    try {
+      const detail = await this.agent.call<CommitDetail>("git.commitDetail", { oid: ref });
+      this.stashFiles.set(ref, detail.files);
+    } catch (e) {
+      this.stashFiles.set(ref, []);
+      this.cb.toast(e instanceof Error ? e.message : String(e), true);
+    }
+    if (this.openStash === ref) {
+      this.renderedKey = "";
+      this.render();
+    }
+  }
+
+  /** Put a message in the box and focus it.
+   *
+   *  For an operation that stages something and leaves the wording to the user
+   *  — squashing a run of commits, where the subjects being folded together are
+   *  the obvious first draft. Overwrites whatever is there, because the caller
+   *  has just been confirmed by the user; `offerPreparedMessage` is the one
+   *  that must not. */
+  setMessage(text: string): void {
+    const box = this.$<HTMLTextAreaElement>(".js-message");
+    box.value = text;
+    this.preparedOffered = null;
+    this.onMessageInput();
+    // After the caller's refresh, not before it. A squash is followed by a
+    // status reload and a tab redraw, and both can put the keyboard back in the
+    // editor — which is how the first version of this sent a commit message
+    // into the open source file instead of into the box.
+    setTimeout(() => {
+      box.focus();
+      const firstLine = box.value.indexOf("\n");
+      box.setSelectionRange(0, firstLine === -1 ? box.value.length : firstLine);
+    }, 0);
+  }
+
+  /** Put git's own message in the box, once, when it has written one.
+   *
+   *  Finishing a merge or a squash means committing something git has already
+   *  composed a message for — `Merge branch 'feature/x' into develop`, or the
+   *  list of commits a squash folded together. The box was empty regardless, so
+   *  the message had to be retyped from memory, and pressing commit without
+   *  doing so answered "Commit message is required" for a commit git was
+   *  perfectly happy to make itself.
+   *
+   *  Offered, not enforced: it fills an empty box and never overwrites typing,
+   *  and clearing the box is respected until git prepares a different message.
+   */
+  private offerPreparedMessage(prepared: string | null): void {
+    const box = this.$<HTMLTextAreaElement>(".js-message");
+    if (!prepared) {
+      // The offer is withdrawn when git withdraws it — an aborted merge, a
+      // reset after a squash. Only the untouched offer is taken back: anything
+      // the user has since typed over it is theirs, and a box that empties
+      // itself under someone's hands is worse than a stale suggestion.
+      if (this.preparedOffered && box.value === this.preparedOffered) {
+        box.value = "";
+        this.onMessageInput();
+      }
+      this.preparedOffered = null;
+      return;
+    }
+    if (this.preparedOffered === prepared) return;
+    // A different message is only put in on top of the last untouched offer,
+    // never over typing.
+    if (box.value.trim() && box.value !== this.preparedOffered) return;
+    this.preparedOffered = prepared;
+    box.value = prepared;
+    this.onMessageInput();
   }
 
   /** Entries split into the four sections; a file can be both staged and
@@ -260,7 +517,12 @@ export class GitPanel {
       const el = this.$(sel);
       if (el.textContent !== value) el.textContent = value;
     };
-    set(".js-branch-name", st?.branch ?? (st ? "(detached)" : "—"));
+    // A rebase detaches HEAD, so the branch button would read "(detached)" for
+    // the whole operation — which is true and useless. git knows which branch
+    // is being rebased; say that, and let the banner below say what is going on.
+    const op = st?.operation ?? null;
+    set(".js-branch-name", st?.branch ?? (op?.head ? `${op.head} (rebasing)` : st ? "(detached)" : "—"));
+    this.renderOperation(op);
 
     // The divergence is the most-used control in this panel, so it is a
     // button: it says what it will do and does it. It used to be a <span> —
@@ -287,8 +549,13 @@ export class GitPanel {
         g[k].map((e) => [e.path, e.index, e.work]),
       ),
       this.stashes.map((s) => [s.ref, s.subject]),
+      // An opened stash and the files in it are part of what is drawn.
+      [this.openStash, this.openStash ? (this.stashFiles.get(this.openStash)?.length ?? -1) : 0],
       this.view,
       this.sort,
+      // The conflict section is named after the operation, so a rebase that
+      // follows a merge over the same files has to redraw the heading.
+      this.status?.operation?.kind ?? null,
       [...this.collapsed],
     ]);
     // An error state must be able to redraw itself once the cause is gone, so
@@ -316,6 +583,83 @@ export class GitPanel {
     );
   }
 
+  /** The banner for a half-finished merge, rebase, cherry-pick or revert.
+   *
+   *  It exists because the state was previously only legible to someone who
+   *  already knew git: a rebase showed "(detached)" and a toast that scrolled
+   *  away, and the way out — continue, skip, abort — was the last three items
+   *  of an overflow menu. Those three are still in the menu; this is the thing
+   *  you see without looking for it, and it is also what tells the user which
+   *  side "current" and "incoming" mean in the conflict editor.
+   */
+  private renderOperation(op: GitOperation | null): void {
+    const host = this.$<HTMLElement>(".js-op");
+    host.hidden = !op;
+    if (!op) {
+      host.replaceChildren();
+      this.renderedOp = "";
+      return;
+    }
+
+    const conflicts = (this.status?.entries ?? []).filter((e) => e.conflict).length;
+    const key = JSON.stringify([op, conflicts]);
+    if (key === this.renderedOp) return;
+    this.renderedOp = key;
+
+    const verb = { merge: "MERGING", rebase: "REBASING", "cherry-pick": "CHERRY-PICKING", revert: "REVERTING" }[op.kind];
+    // What the operation is about, in the words of whichever file git wrote it
+    // into: the rebase directory names refs, MERGE_MSG names the commit.
+    const source = op.kind === "rebase" ? [op.head, op.onto && `onto ${op.onto}`].filter(Boolean).join(" ") : mergeSource(op.onto ?? "");
+    const step = op.step && op.total && op.total > 1 ? ` · commit ${op.step} of ${op.total}` : "";
+
+    const next =
+      conflicts > 0
+        ? `${conflicts} conflicted file${conflicts === 1 ? "" : "s"} left — resolve ${conflicts === 1 ? "it" : "them"} below`
+        : op.kind === "merge"
+          ? "conflicts resolved — write a message and commit to finish"
+          : "conflicts resolved — continue to finish";
+
+    host.innerHTML = `
+      <div class="gp-op-line">
+        <span class="gp-op-verb">${verb}</span>
+        <span class="gp-op-what" title="${esc(source)}">${esc(source)}${esc(step)}</span>
+      </div>
+      <p class="gp-op-next">${esc(next)}</p>
+      <div class="gp-op-actions">
+        ${
+          op.kind === "merge"
+            ? ""
+            : `<button class="t-btn t-btn-primary js-op-continue" type="button"${conflicts ? " disabled" : ""}>continue</button>
+               <button class="t-btn js-op-skip" type="button">skip this commit</button>`
+        }
+        <button class="t-btn t-btn-primary t-btn-danger js-op-abort" type="button">abort ${esc(op.kind)}</button>
+      </div>`;
+
+    host.querySelector(".js-op-continue")?.addEventListener("click", () => void this.operationStep("continue", op));
+    host.querySelector(".js-op-skip")?.addEventListener("click", () => void this.operationStep("skip", op));
+    host.querySelector(".js-op-abort")?.addEventListener("click", () => void this.operationStep("abort", op));
+  }
+
+  /** continue / skip / abort, routed to whichever command owns this state. */
+  private async operationStep(action: "continue" | "skip" | "abort", op: GitOperation): Promise<void> {
+    if (action === "abort") {
+      const ok = await modalConfirm({
+        title: `Abort the ${op.kind}?`,
+        detail:
+          op.kind === "rebase"
+            ? "The branch goes back to where it was before the rebase started. Conflict edits made since are lost."
+            : "The working tree goes back to the commit this started from. Conflict edits made since are lost.",
+        okLabel: `abort ${op.kind}`,
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    const done = { continue: "continued", skip: "commit skipped", abort: `${op.kind} aborted` }[action];
+    if (op.kind === "rebase") await this.run("git.rebase", { action }, `rebase ${done}`);
+    else if (op.kind === "merge") await this.run("git.mergeAbort", {}, "merge aborted");
+    else await this.run("git.sequencer", { what: op.kind, action }, `${op.kind} ${done}`);
+  }
+
   /** Stashes, listed and named.
    *
    *  They live below the file groups because they are not part of what is
@@ -340,8 +684,31 @@ export class GitPanel {
                 // otherwise every row repeats "main" and spends the width the
                 // message needs. The full label is in the tooltip regardless.
                 const elsewhere = branch && branch !== this.status?.branch ? branch : "";
+                const open = this.openStash === s.ref;
+                const files = this.stashFiles.get(s.ref);
+                // What is in it, without applying it to find out. A stash is a
+                // commit, so this is the same file list the history shows for
+                // one — and clicking a row opens the same diff.
+                const contents = !open
+                  ? ""
+                  : files === undefined
+                    ? `<div class="gp-stash-files"><span class="gp-empty">loading…</span></div>`
+                    : files.length === 0
+                      ? `<div class="gp-stash-files"><span class="gp-empty">Nothing in this stash.</span></div>`
+                      : `<div class="gp-stash-files">${files
+                          .map(
+                            (f) => `<div class="gp-row gp-stash-file" data-stash-file="${esc(f.path)}"
+                              data-stash-ref="${esc(s.ref)}" title="${esc(f.path)}">
+                              <span class="gp-name">${esc(f.path.split("/").pop() ?? f.path)}</span>
+                              <span class="gp-dir">${esc(startTrimmed(f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : ""))}</span>
+                              <span class="gp-mark">${f.binary ? "bin" : `+${f.added} −${f.deleted}`}</span>
+                            </div>`,
+                          )
+                          .join("")}</div>`;
+
                 return `<div class="gp-row gp-stash" data-stash="${esc(s.ref)}"
                   title="${esc(`${s.ref} — ${s.subject}`)}">
+                  <span class="gp-caret">${open ? "▾" : "▸"}</span>
                   <span class="gp-name">${esc(text || "(no message)")}</span>
                   <span class="gp-dir">${esc([elsewhere, ago(s.time)].filter(Boolean).join(" · "))}</span>
                   <span class="gp-actions">
@@ -349,7 +716,7 @@ export class GitPanel {
                     <button class="t-icon" data-stash-act="pop" title="Pop — apply and remove">↥</button>
                     <button class="t-icon" data-stash-act="drop" title="Drop — delete this stash">${iconDiscard}</button>
                   </span>
-                </div>`;
+                </div>${contents}`;
               })
               .join("")
           : ""
@@ -374,7 +741,7 @@ export class GitPanel {
       <header class="gp-group-head">
         <button class="gp-caret" type="button" data-collapse="${group}"
                 aria-expanded="${open}" title="${open ? "Collapse" : "Expand"}">${open ? "▾" : "▸"}</button>
-        <span>${GROUP_TITLES[group]}</span><span class="gp-count">${entries.length}</span>
+        <span>${group === "conflict" ? esc(conflictTitle(this.status?.operation ?? null)) : GROUP_TITLES[group]}</span><span class="gp-count">${entries.length}</span>
         <span class="t-spacer"></span>${bulk}
       </header>
       ${open ? this.entriesHtml(group, entries) : ""}
@@ -490,16 +857,32 @@ export class GitPanel {
     // Buttons are handled on click, not here.
     if (target.closest("[data-act]") || target.closest("[data-bulk]") || target.closest("[data-stash-act]")) return;
 
+    // A file inside an opened stash: shown as it was when the stash was made,
+    // against the commit it was made on.
+    const stashFile = target.closest<HTMLElement>("[data-stash-file]");
+    if (stashFile) {
+      const ref = stashFile.dataset.stashRef!;
+      return this.cb.openDiff(stashFile.dataset.stashFile!, `${ref}^..${ref}`);
+    }
+
+    // A stash row opens to show what is in it.
+    const stashRow = target.closest<HTMLElement>("[data-stash]");
+    if (stashRow?.dataset.stash) return void this.toggleStash(stashRow.dataset.stash);
+
     const row = target.closest<HTMLElement>(".gp-row");
-    // A stash row shares the row class and has no path: it is a saved state,
-    // not a file, and there is nothing to open in a diff. Its own buttons are
-    // the only thing on it that does anything.
     if (!row?.dataset.path) return;
     const path = row.dataset.path;
     const group = row.dataset.group as Group;
 
     // Untracked files have no "before" side, so they open in the editor.
-    if (group === "untracked") this.cb.openFile(path);
+    //
+    // Conflicts open there too, and for a stronger reason: the file on disk is
+    // the one git left the markers in, and the editor is where `accept current`
+    // / `accept incoming` / `accept both` live. Opening a conflict as a diff —
+    // which is what this did — showed the marker lines as "added" text with no
+    // way to act on them, so the one thing the row is for was reachable only by
+    // finding the same file again in the explorer.
+    if (group === "untracked" || group === "conflict") this.cb.openFile(path);
     else this.cb.openDiff(path, group === "staged" ? "staged" : "worktree");
   }
 
@@ -555,6 +938,9 @@ export class GitPanel {
    *  commit over it would be wrong about some repositories. */
   private onMessageInput(): void {
     const box = this.$<HTMLTextAreaElement>(".js-message");
+    // The complaint about an empty message answered itself the moment there is
+    // one, so it goes as soon as typing starts.
+    if (box.value.trim()) this.cb.dismiss(MSG_SCOPE);
     // Reset first: without it the box can only ever grow.
     box.style.height = "auto";
     box.style.height = `${Math.min(box.scrollHeight, 240)}px`;
@@ -632,7 +1018,7 @@ export class GitPanel {
       }
     }
     const message = box.value.trim();
-    if (!message && !amend) return this.cb.toast("Commit message is required", true);
+    if (!message && !amend) return this.cb.toast("Commit message is required", true, MSG_SCOPE);
 
     // Nothing staged: git answers with the whole of `git status` and four
     // hints about commands to run in a terminal — in a web UI, to a person who
@@ -654,11 +1040,20 @@ export class GitPanel {
       }
     }
 
+    const staged = amend ? 0 : this.groups().staged.length || stageable.length;
     try {
-      await this.agent.call("git.commit", { message, amend });
+      // git prints "[develop 592633f] subject" and a file tally; with LC_ALL=C
+      // in the agent that first line is stable enough to quote the hash out of.
+      // Saying only "committed" left the one question a person asks next — did
+      // it take, and what went in — answered nowhere but the log.
+      const out = String(await this.agent.call<string>("git.commit", { message, amend }) ?? "");
       box.value = "";
       this.onMessageInput();
-      this.cb.toast(amend ? "commit amended" : "committed");
+      const oid = /^\[[^\]]*?\s([0-9a-f]{7,40})\]/m.exec(out)?.[1];
+      const files = staged ? ` · ${staged} file${staged === 1 ? "" : "s"}` : "";
+      // git's own summary — the branch, the insert/delete tally, any mode
+      // changes — goes to the log; the line above is what the toast holds.
+      this.cb.report(`${amend ? "amended" : "committed"}${oid ? ` ${oid.slice(0, 7)}` : ""}${files}`, out);
       await this.refresh();
       this.cb.afterChange();
     } catch (e) {
@@ -677,7 +1072,20 @@ export class GitPanel {
       { label: "Switch to…", hint: "checkout", run: () => void this.switchBranch() },
       { label: "Create branch…", run: () => void this.createBranch() },
       { label: "Create branch from…", run: () => void this.createBranch(true) },
-      { label: "Merge into current…", separated: true, run: () => void this.chooseThen("Merge which ref into the current branch?", (ref) => this.merge(ref)) },
+      // Before deciding to merge or rebase, the question is usually what is
+      // actually on the other branch — a release against main, a feature
+      // against develop. That could only be answered by finding both tips in
+      // the history graph and marking them for comparison one at a time.
+      {
+        label: "Compare with…",
+        separated: true,
+        disabled: !current,
+        run: () =>
+          void this.chooseThen(`Compare ${current} with which ref?`, async (ref) => {
+            if (current) this.cb.compareRefs(current, ref);
+          }),
+      },
+      { label: "Merge into current…", separated: true, run: () => void this.chooseThen("Merge which ref into the current branch?", (ref) => this.mergeChoosing(ref)) },
       { label: "Rebase current onto…", run: () => void this.chooseThen("Rebase the current branch onto…", (ref) => this.rebase(ref)) },
       { label: "Rename this branch…", separated: true, run: () => void this.renameBranch(current) },
       { label: "Publish this branch", run: () => void this.publishBranch(current) },
@@ -851,7 +1259,14 @@ export class GitPanel {
       detail: "Stashing puts them aside (including untracked files) so you can bring them back with “Pop latest stash”. Cancel to commit them first instead.",
       okLabel: "stash and continue",
     });
-    if (!stash) return false;
+    // Backing out here abandons an operation the user already asked for, and
+    // saying nothing about it is how "I pressed switch and nothing happened"
+    // happens: the dialog closes, the branch does not change, and there is not
+    // a line about it in the panel or the output log.
+    if (!stash) {
+      this.cb.toast(`${what} cancelled — the working tree was left as it is`);
+      return false;
+    }
 
     try {
       await this.agent.call("git.stash", { action: "push", message: `before ${what}` });
@@ -875,10 +1290,65 @@ export class GitPanel {
     if (ref) await then(ref);
   }
 
-  private async merge(ref: string): Promise<void> {
+  /** Merge, after asking how.
+   *
+   *  The three strategies are not interchangeable and the workflow decides
+   *  which one is correct: gitflow wants `--no-ff` so a feature stays visible
+   *  as one merge in the history, trunk-based wants `--squash` so it lands as a
+   *  single commit, and a fast-forward is what you want when the branch is just
+   *  ahead. Before this the button did whichever git defaults to, which is the
+   *  right answer for exactly one of those.
+   *
+   *  Asked per merge rather than remembered: unlike pull, this is a decision
+   *  about one particular branch — a release merge and a tidy-up merge in the
+   *  same repository want different answers.
+   */
+  private async mergeChoosing(ref: string): Promise<void> {
+    const mode = await modalChoice<"default" | "no-ff" | "squash">({
+      title: `Merge ${ref} into ${this.status?.branch ?? "the current branch"}?`,
+      detail: "How the commits from that branch should land here.",
+      options: [
+        {
+          value: "default",
+          label: "Merge",
+          detail: "Fast-forwards when it can, otherwise makes a merge commit. Git's default.",
+        },
+        {
+          value: "no-ff",
+          label: "Merge commit always (--no-ff)",
+          detail: "Keeps the branch visible as one merge even when a fast-forward was possible. The gitflow default.",
+        },
+        {
+          value: "squash",
+          label: "Squash (--squash)",
+          detail: "Puts the whole branch in the index as one set of changes, for you to commit as a single commit.",
+        },
+      ],
+    });
+    if (!mode) return;
+    await this.merge(ref, mode);
+  }
+
+  private async merge(ref: string, mode: "default" | "no-ff" | "squash" = "default"): Promise<void> {
     try {
-      const r = await this.agent.call<{ conflict: boolean; output: string }>("git.merge", { ref });
-      this.cb.toast(r.conflict ? "merge stopped with conflicts — resolve them below" : "merged", r.conflict);
+      const r = await this.agent.call<{ conflict: boolean; output: string }>("git.merge", {
+        ref,
+        noFf: mode === "no-ff",
+        squash: mode === "squash",
+      });
+      // A conflict notice describes the repository, not the click, so it is
+      // scoped: the banner takes over from here, and the toast comes down by
+      // itself when the merge is finished or aborted.
+      //
+      // "merged" was also said for a merge that did nothing. Merging a branch
+      // that is already an ancestor is the commonest thing to get wrong about
+      // a branch — git says "Already up to date", and the UI used to swallow
+      // it, leaving a panel that looks identical either way.
+      this.cb.report(
+        r.conflict ? "merge stopped with conflicts — resolve them below" : mergeOutcome(ref, r.output, mode),
+        r.output,
+        { isError: r.conflict, scope: r.conflict ? OP_SCOPE : undefined },
+      );
     } catch (e) {
       this.cb.toast(e instanceof Error ? e.message : String(e), true);
     }
@@ -889,7 +1359,11 @@ export class GitPanel {
   private async rebase(ref: string): Promise<void> {
     try {
       const r = await this.agent.call<{ conflict: boolean; output: string }>("git.rebase", { action: "start", ref });
-      this.cb.toast(r.conflict ? "rebase stopped with conflicts — resolve, then Continue" : "rebased", r.conflict);
+      this.cb.report(
+        r.conflict ? "rebase stopped with conflicts — resolve them below, then continue" : `rebased onto ${ref}`,
+        r.output,
+        { isError: r.conflict, scope: r.conflict ? OP_SCOPE : undefined },
+      );
     } catch (e) {
       this.cb.toast(e instanceof Error ? e.message : String(e), true);
     }
@@ -899,32 +1373,16 @@ export class GitPanel {
 
   // ── remotes and the overflow menu ───────────────────────────────────────
 
-  /** Is a merge or a rebase half-finished?
-   *
-   *  `.git` is outside the jail on purpose — a page that can write
-   *  `.git/hooks/*` runs code on this machine — so the state cannot be read as
-   *  a file. It can be asked of git instead: `MERGE_HEAD` and `REBASE_HEAD`
-   *  resolve only while the corresponding operation is in progress, so a log
-   *  request for one either answers or fails, and that is the answer.
-   *
-   *  Probed when the menu opens, not on every refresh: the panel reloads on
-   *  every watcher event, and two more git invocations per event is how a
-   *  status poll turns into a busy loop.
-   */
-  private async inProgress(): Promise<{ merge: boolean; rebase: boolean }> {
-    const alive = async (ref: string): Promise<boolean> =>
-      this.agent
-        .call("git.log", { ref, limit: 1 })
-        .then(() => true)
-        .catch(() => false);
-    const [merge, rebase] = await Promise.all([alive("MERGE_HEAD"), alive("REBASE_HEAD")]);
-    return { merge, rebase };
-  }
-
   private async moreMenu(e: MouseEvent): Promise<void> {
     const { x, y } = { x: e.clientX, y: e.clientY };
     const st = this.status;
-    const state = await this.inProgress();
+    // Whatever the last status said. This used to be probed here by asking git
+    // to resolve MERGE_HEAD and REBASE_HEAD — and REBASE_HEAD survives a
+    // *finished* rebase, so the menu went on offering "Continue rebase" and
+    // "Abort rebase" for the rest of the session, both of which could only
+    // answer "fatal: no rebase in progress". The agent now reads the state git
+    // actually keeps for the question (see git.ts: operation()).
+    const op = st?.operation ?? null;
 
     const items: MenuItem[] = [];
 
@@ -959,6 +1417,16 @@ export class GitPanel {
       });
     }
 
+    // What the pull button will do, and how to change it. Shown as the current
+    // answer rather than as a submenu of three: the setting matters to people
+    // who care about the shape of their history, and they want to see at a
+    // glance which one is armed.
+    items.push({
+      label: `⤓ Pull strategy: ${PULL_LABELS[this.pull ?? "merge"]}${this.pull ? "" : " (not chosen yet)"}`,
+      separated: true,
+      run: () => void this.choosePullMode(),
+    });
+
     // How the list is shown. Two settings, so they are a pair of toggles rather
     // than a submenu nobody would find.
     items.push(
@@ -973,18 +1441,22 @@ export class GitPanel {
       },
     );
 
-    // Recovery. Shown only while there is something to recover from: these
-    // four were always on the menu, four of seven items, and pressing one
-    // outside a merge or rebase did nothing but produce an error toast.
-    if (state.merge) {
-      items.push({ label: "✕ Abort merge", separated: true, danger: true, run: () => void this.run("git.mergeAbort", {}, "merge aborted") });
-    }
-    if (state.rebase) {
-      items.push(
-        { label: "▶ Continue rebase", separated: true, run: () => void this.run("git.rebase", { action: "continue" }, "rebase continued") },
-        { label: "↷ Skip this commit", run: () => void this.run("git.rebase", { action: "skip" }, "commit skipped") },
-        { label: "✕ Abort rebase", danger: true, run: () => void this.run("git.rebase", { action: "abort" }, "rebase aborted") },
-      );
+    // Recovery. Shown only while there is something to recover from — the
+    // banner above the file list carries the same three, which is where they
+    // are meant to be found; these are for the hand that is already in the menu.
+    if (op) {
+      if (op.kind !== "merge") {
+        items.push(
+          { label: `▶ Continue ${op.kind}`, separated: true, run: () => void this.operationStep("continue", op) },
+          { label: "↷ Skip this commit", run: () => void this.operationStep("skip", op) },
+        );
+      }
+      items.push({
+        label: `✕ Abort ${op.kind}`,
+        separated: op.kind === "merge",
+        danger: true,
+        run: () => void this.operationStep("abort", op),
+      });
     }
 
     showMenu(x, y, items);
@@ -1022,6 +1494,90 @@ export class GitPanel {
     return this.remote("push", {});
   }
 
+  /** Pull, having settled what "pull" means here.
+   *
+   *  The question is only worth asking when the answer changes the history:
+   *  with nothing local to replay, all three strategies fast-forward and are
+   *  the same operation. So a straightforward "I am behind" pull just runs, and
+   *  a divergence — the case where a merge commit appears out of nowhere — asks
+   *  once and remembers. The choice is visible and changeable in the overflow
+   *  menu afterwards. */
+  private async doPull(): Promise<void> {
+    const st = this.status;
+    const diverged = (st?.ahead ?? 0) > 0 && (st?.behind ?? 0) > 0;
+    let mode = this.pull;
+
+    if (diverged && !mode) {
+      const picked = await modalChoice<PullMode>({
+        title: `Your branch and ${st?.upstream ?? "the remote"} have both moved on.`,
+        detail: `${st?.ahead} local commit${st?.ahead === 1 ? "" : "s"}, ${st?.behind} on the remote. How should they be brought together?`,
+        options: [
+          {
+            value: "rebase",
+            label: "Rebase — replay my commits on top",
+            detail: "Keeps the history linear. Rewrites your local commits, so do not use it on commits you have already shared.",
+          },
+          {
+            value: "merge",
+            label: "Merge — join the two with a merge commit",
+            detail: "Nothing is rewritten; the history shows the branch coming back together.",
+          },
+          {
+            value: "ff-only",
+            label: "Fast-forward only — do nothing if it cannot",
+            detail: "Refuses the pull and leaves the branch alone, so you can decide separately.",
+          },
+        ],
+      });
+      if (!picked) return;
+      mode = picked;
+      this.setPullMode(picked);
+    }
+
+    await this.remote("pull", { mode: mode ?? "merge" });
+  }
+
+  private async choosePullMode(): Promise<void> {
+    const picked = await modalChoice<PullMode>({
+      title: "What should Pull do with local commits?",
+      detail: "Applies when your branch and its upstream have both moved on. It can be changed again at any time.",
+      options: [
+        { value: "rebase", label: "Rebase — replay my commits on top", detail: "Linear history; rewrites local commits." },
+        { value: "merge", label: "Merge — join with a merge commit", detail: "Nothing is rewritten." },
+        { value: "ff-only", label: "Fast-forward only", detail: "Refuses to pull when the branches have diverged." },
+      ],
+    });
+    if (picked) this.setPullMode(picked);
+  }
+
+  private setPullMode(mode: PullMode): void {
+    this.pullModes[this.folderKey] = mode;
+    savePref(PULL_KEY, JSON.stringify(this.pullModes));
+    this.showPullMode();
+  }
+
+  /** Say on the button itself which strategy is armed.
+   *
+   *  The tooltip alone was not enough: this is a setting that decides whether
+   *  the branch gets a merge commit, it is remembered across sessions, and a
+   *  tooltip has to be hunted for by someone who already suspects there is
+   *  something to know. A two-letter tag next to the arrow is readable at a
+   *  glance and costs the width of two characters. Nothing is shown until the
+   *  choice has been made, so the button does not claim a strategy git has not
+   *  been told about. */
+  private showPullMode(): void {
+    const btn = this.$<HTMLButtonElement>(".js-pull");
+    btn.title = this.pull ? `Pull (${PULL_LABELS[this.pull]})` : "Pull";
+    const tag = btn.querySelector<HTMLElement>(".gp-pull-mode") ?? (() => {
+      const el = document.createElement("span");
+      el.className = "gp-pull-mode";
+      btn.appendChild(el);
+      return el;
+    })();
+    tag.textContent = this.pull ? PULL_TAGS[this.pull] : "";
+    tag.hidden = !this.pull;
+  }
+
   private async remote(action: "fetch" | "pull" | "push", opts: Record<string, unknown>): Promise<void> {
     // A pull merges into the worktree, so it hits the same wall as a checkout.
     // fetch and push do not touch it and are left alone.
@@ -1043,16 +1599,52 @@ export class GitPanel {
       void this.agent.call("cancel", { target: id }).catch(() => undefined);
     });
 
+    // What the branch looked like before, so the report can be about what
+    // moved rather than about the command having returned. "pull complete" is
+    // true of a pull that brought nothing and of one that brought thirty
+    // commits, and those are different pieces of news.
+    const before = { ahead: this.status?.ahead ?? 0, behind: this.status?.behind ?? 0, upstream: this.status?.upstream ?? null };
+
     try {
-      await promise;
-      this.cb.toast(`${action} complete`);
-    } catch (e) {
-      this.cb.toast(e instanceof Error ? e.message : String(e), true);
-    } finally {
+      const r = (await promise) as { output?: string } | undefined;
       this.setBusy(null);
       await this.refresh();
+      // The progress git streamed while this ran — which objects were counted,
+      // which refs moved, what it rejected — kept where it can be read back.
+      this.cb.report(this.remoteOutcome(action, before), r?.output);
+    } catch (e) {
+      this.cb.toast(e instanceof Error ? e.message : String(e), true);
+      await this.refresh();
+    } finally {
+      this.setBusy(null);
       this.cb.afterChange();
     }
+  }
+
+  /** What a finished fetch/pull/push actually did, from the divergence it
+   *  changed. Read from the status rather than parsed out of git's progress
+   *  chatter: the counts are the same ones the panel already shows. */
+  private remoteOutcome(
+    action: "fetch" | "pull" | "push",
+    before: { ahead: number; behind: number; upstream: string | null },
+  ): string {
+    const st = this.status;
+    const upstream = st?.upstream ?? before.upstream;
+    const where = upstream ? ` ${action === "push" ? "to" : "from"} ${upstream}` : "";
+    const n = (count: number): string => `${count} commit${count === 1 ? "" : "s"}`;
+
+    if (action === "fetch") {
+      const found = (st?.behind ?? 0) - before.behind;
+      return found > 0 ? `fetched — ${n(found)} to pull${where}` : "fetched — nothing new";
+    }
+    if (action === "pull") {
+      const pulled = before.behind - (st?.behind ?? 0);
+      return pulled > 0 ? `pulled ${n(pulled)}${where}` : "already up to date";
+    }
+    const pushed = before.ahead - (st?.ahead ?? 0);
+    // A first push of a new branch has no "before" to compare against, so it
+    // reports what it sent rather than a difference of nothing.
+    return pushed > 0 ? `pushed ${n(pushed)}${where}` : before.ahead ? `pushed ${n(before.ahead)}${where}` : `pushed${where}`;
   }
 
   /** One place decides what "an operation is running" looks like. */
@@ -1263,8 +1855,14 @@ export class GitPanel {
 
   private async run(op: string, params: Record<string, unknown>, okMessage: string): Promise<void> {
     try {
-      await this.agent.call(op, params);
-      this.cb.toast(okMessage);
+      // Most of these answer with git's stdout; a few answer with an object
+      // carrying it. Either way it is the transcript for the log.
+      const result = await this.agent.call<unknown>(op, params);
+      const output =
+        typeof result === "string" ? result
+        : typeof (result as { output?: unknown })?.output === "string" ? ((result as { output: string }).output)
+        : undefined;
+      this.cb.report(okMessage, output);
     } catch (e) {
       this.cb.toast(e instanceof Error ? e.message : String(e), true);
     }

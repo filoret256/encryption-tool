@@ -112,6 +112,26 @@ export interface StatusEntry {
   conflict?: boolean;
 }
 
+/** A git operation that stopped part-way and is waiting to be finished.
+ *
+ *  Merge, rebase, cherry-pick and revert all leave the repository in a state
+ *  that only `--continue` or `--abort` gets out of, and during a rebase HEAD is
+ *  detached — so without this the UI can only report "(detached)" and leave the
+ *  user to work out what happened to their branch.
+ */
+export interface GitOperation {
+  kind: "merge" | "rebase" | "cherry-pick" | "revert";
+  /** Branch the operation started on: the one a rebase will restore at the end.
+   *  Absent for a merge, where HEAD stays on the branch throughout. */
+  head?: string;
+  /** What the work is being replayed onto (rebase), or the subject line git
+   *  prepared (merge, cherry-pick, revert) — whichever names the other side. */
+  onto?: string;
+  /** Position in a multi-commit rebase: commit `step` of `total`. */
+  step?: number;
+  total?: number;
+}
+
 export interface GitStatus {
   branch: string | null;
   /** null for a detached HEAD or an unborn branch. */
@@ -120,6 +140,16 @@ export interface GitStatus {
   behind: number;
   oid: string | null;
   entries: StatusEntry[];
+  /** Set while a merge/rebase/cherry-pick/revert is half-finished. */
+  operation?: GitOperation | null;
+  /** The commit message git has already written for the next commit, with its
+   *  comment lines stripped: `MERGE_MSG` after a merge or a cherry-pick that
+   *  stopped, `SQUASH_MSG` after `merge --squash`. Null when there is none.
+   *
+   *  A squash leaves no half-finished operation — the index is staged and git is
+   *  done — so this cannot live on `operation`: it is a property of what the
+   *  next commit is going to be, not of an operation in progress. */
+  preparedMessage?: string | null;
 }
 
 export interface Commit {
@@ -181,6 +211,22 @@ export interface CommitDetail {
   commit: Commit;
   body: string;
   files: CommitFile[];
+  /** For a merge: which parent the file list was diffed against, 1-based.
+   *  Absent for an ordinary commit, which has only one side to compare with. */
+  parent?: number;
+}
+
+/** One line of `git blame`. The browser mirror of this is `BlameLine` in
+ *  code/blame.ts, which is where the gutter renders it. */
+export interface BlameRow {
+  oid: string;
+  author: string;
+  /** Author time, seconds since epoch. */
+  time: number;
+  /** 1-based line in the committed file. */
+  line: number;
+  /** Subject of the commit this line came from, as git's porcelain reports it. */
+  summary: string;
 }
 
 export interface SearchHit {

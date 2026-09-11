@@ -9,13 +9,13 @@ import { isAgentUrl, type AgentClient } from "./agent.ts";
 import type { AgentInfo, Commit, CommitDetail, DiffPair, DirEntry, FileRead, FsChange, GitStatus } from "../../agent/protocol.ts";
 import { CodeEditor } from "./editor.ts";
 import { distinguish, FileTree } from "./tree.ts";
-import { GitPanel } from "./git-panel.ts";
+import { GitPanel, mergeSource } from "./git-panel.ts";
 import { absolute as absoluteTime, HistoryPanel } from "./history.ts";
 import { grammarFor, languageOf, LANGUAGES } from "./grammars.ts";
 import { SearchPanel } from "./search-panel.ts";
 import { DiffView, type HunkAction } from "./diff.ts";
 import { hunkPatches } from "./hunkpatch.ts";
-import { findConflicts } from "./conflicts.ts";
+import { findConflicts, type ConflictSides } from "./conflicts.ts";
 import { applyRowHeight, copyToClipboard, esc, modalConfirm, modalPrompt, showMenu, type MenuItem } from "./ui.ts";
 import { draftsFor, dropDraft, putDraft } from "./drafts.ts";
 import { OutputLog } from "./output.ts";
@@ -32,9 +32,13 @@ export interface CodeContext {
   isDark: () => boolean;
   /** A notice with somewhere to go: the summary is shown, and `onDetails`
    *  opens the output log at the entry it came from. */
-  notify: (notice: { message: string; isError?: boolean; onDetails?: () => void }) => void;
+  notify: (notice: { message: string; isError?: boolean; onDetails?: () => void; scope?: string }) => void;
   /** Clear the notification stack — the output log's "clear" empties both. */
   dismissNotices: () => void;
+  /** Take down the notices tagged with one scope, because the state they
+   *  describe has passed. See notify.ts: an error does not expire on a timer,
+   *  but "resolve the conflicts below" must not outlive the conflicts. */
+  dismissScope: (scope: string) => void;
   /** Called whenever agent state changes so the header badge can repaint. */
   onCapsChanged: () => void;
   /** Open the "get agent" popover in the header. */
@@ -112,7 +116,7 @@ const SHELL = `
         <div class="side-view" data-pane="history"></div>
       </div>
     </aside>
-    <div class="code-splitter" title="Drag to resize · double-click to hide (Ctrl+B)"></div>
+    <div class="code-splitter" title="Drag to resize · double-click to widen, again to hide (Ctrl+B)"></div>
     <div class="code-main">
       <div class="code-tabstrip">
         <div class="code-tabs js-tabs" hidden></div>
@@ -185,7 +189,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  and absolute paths. The toast gets the first, the log gets both, and an
    *  error toast carries a way to reach the second.
    */
-  function report(op: string, summary: string, opts: { detail?: string; isError?: boolean } = {}): void {
+  function report(op: string, summary: string, opts: { detail?: string; isError?: boolean; scope?: string } = {}): void {
     const level = opts.isError ? "error" : "info";
     // The badge follows from the log's own onChange hook, not from here — that
     // way it cannot be right for entries added through report() and stale for
@@ -194,6 +198,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     ctx.notify({
       message: summary,
       isError: opts.isError,
+      scope: opts.scope,
       onDetails: opts.detail ? () => output.show(entry.id) : undefined,
     });
   }
@@ -221,9 +226,9 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   /** What the git, history and search panels call. They hand over whatever the
    *  agent said, in full; splitting it into a line and a transcript happens
    *  here so every panel gets the same treatment without knowing about it. */
-  function panelReport(message: string, isError = false): void {
+  function panelReport(message: string, isError = false, scope?: string): void {
     const long = message.includes("\n") || message.length > 200;
-    report("git", firstLine(message), { detail: long ? message : undefined, isError });
+    report("git", firstLine(message), { detail: long ? message : undefined, isError, scope });
   }
 
   function updateOutputBadge(): void {
@@ -265,6 +270,11 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     /** The file was deleted or moved away underneath us. The buffer stays; the
      *  tab says so, and saving asks before writing the file back into being. */
     missing?: boolean;
+    /** The file changed on disk while this buffer held unsaved edits, so the
+     *  two have diverged and the buffer is no longer a picture of the file.
+     *  Saving is still allowed — the edits are the user's — but anything that
+     *  writes the buffer somewhere consequential asks first. */
+    stale?: boolean;
     /** Set when the tab holds a slice of a file too large to open whole.
      *
      *  What used to happen here was "// file too large to open" and nothing
@@ -345,6 +355,14 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   /** The tab a path is open in, if any. A path is in at most one tab: `open()`
    *  focuses the existing one rather than making a second. */
   const tabForPath = (path: string): FileTab | undefined => fileTabs().find((t) => t.path === path && !t.missing);
+  /** The same, counting a tab whose file is currently gone.
+   *
+   *  A missing tab is deliberately not a match for an ordinary open — opening
+   *  the path again should produce a live tab beside the buffer being kept —
+   *  but a *reload* of that path is precisely the file coming back, and it
+   *  belongs in the tab that has been holding it. Without this, switching to a
+   *  branch without the file and back left two tabs on one path. */
+  const tabForPathOrMissing = (path: string): FileTab | undefined => fileTabs().find((t) => t.path === path);
   /** Which tab is on screen. */
   let activeId: string | null = null;
   /** The preview tab, if there is one.
@@ -590,6 +608,10 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   // file — the editor highlights them and offers the per-region actions; this
   // bar just tracks how many are left and stages the file once none are.
   const conflicted = new Set<string>();
+  /** The two sides of the conflicts currently in the tree, named — see
+   *  conflictSides(). Kept here because both the editor decorations and the bar
+   *  above the editor say it, and they must not disagree. */
+  let conflictSidesNow: ConflictSides | null = null;
 
   // ── the file moved while we were not watching ──
   // Tab ids whose buffer is dirty *and* whose file on disk changed underneath
@@ -706,6 +728,28 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     }
   }
 
+  /** Name the two sides of a conflict from the operation that produced it.
+   *
+   *  A merge replays the other branch into the one you are on: current is HEAD,
+   *  incoming is what is being merged. A rebase does the reverse — your commits
+   *  are replayed onto the other branch, so *it* is current and your own commit
+   *  is what arrives as incoming. Cherry-pick and revert behave like a merge.
+   *  Getting this backwards is the one mistake in a conflict editor that throws
+   *  work away silently, which is why it is worked out here rather than left to
+   *  the two words on the buttons.
+   */
+  function conflictSides(st: GitStatus): ConflictSides | null {
+    const op = st.operation;
+    if (!op) return null;
+    if (op.kind === "rebase") {
+      return { current: op.onto ?? "the branch being rebased onto", incoming: op.head ?? "your commit" };
+    }
+    // `onto` for a merge is the subject git wrote into MERGE_MSG — "Merge
+    // branch 'feature/x' into develop" — and what belongs on a button is the
+    // branch name inside it, not the sentence.
+    return { current: st.branch ?? "this branch", incoming: op.onto ? mergeSource(op.onto) : `the ${op.kind}` };
+  }
+
   function renderConflictBar(): void {
     const bar = $(".js-conflict");
     const path = openFile?.path ?? null;
@@ -716,8 +760,14 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     const remaining = findConflicts(editor.state.doc).length;
     bar.hidden = false;
     bar.classList.toggle("resolved", remaining === 0);
+    // Named after the operation for the same reason the panel's section is:
+    // "current" and "incoming" mean opposite things in a merge and a rebase,
+    // and the bar is where someone looks to find out which one they are in.
+    const sides = conflictSidesNow;
     bar.innerHTML = remaining
-      ? `<span>⚠ ${remaining} unresolved conflict${remaining === 1 ? "" : "s"} — choose a side above each one.</span>`
+      ? `<span>⚠ ${remaining} unresolved conflict${remaining === 1 ? "" : "s"}${
+          sides ? ` — ${esc(sides.current)} vs ${esc(sides.incoming)}` : ""
+        } — choose a side above each one.</span>`
       : `<span>✓ No markers left in this file.</span>
          <button class="t-btn t-btn-primary js-resolve" type="button">save &amp; mark resolved</button>`;
     bar.querySelector(".js-resolve")?.addEventListener("click", () => void markResolved(path));
@@ -725,6 +775,25 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
   async function markResolved(path: string): Promise<void> {
     try {
+      const tab = tabForPath(path);
+      // Resolving writes this buffer over the conflicted file and tells git the
+      // result is the answer. If the buffer is known to have diverged from the
+      // file — the tab was open from before the conflict arrived — that answer
+      // would be the other side's work deleted without either side being shown.
+      if (tab?.stale) {
+        const ok = await modalConfirm({
+          title: `${path} changed on disk after this tab was opened.`,
+          detail:
+            "The buffer here does not include those changes — resolving now writes it over the conflicted file, and whatever git put in it is lost. Reload the file to see the conflict as it stands.",
+          okLabel: "resolve with this buffer anyway",
+          danger: true,
+        });
+        if (!ok) {
+          baselines.set(tab.id, ""); // past the isDirty guard in open()
+          await open(path, true);
+          return;
+        }
+      }
       if (isDirty(tabForPath(path))) await save();
       await agent.call("git.resolve", { paths: [path] });
       report("git resolve", `${path} marked resolved`);
@@ -798,15 +867,29 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
   const gitPanel = new GitPanel(host.querySelector<HTMLElement>('[data-pane="scm"]')!, agent, {
     openDiff: (path, kind) => void openDiff(path, kind),
-    openFile: (path) => void open(path),
+    // A conflicted row wants the markers on screen; an untracked one is just a
+    // file. Both go to the editor, and openConflict() falls back to a plain
+    // open when there is nothing to jump to.
+    openFile: (path) => void (conflicted.has(path) ? openConflict(path) : open(path)),
     toast: panelReport,
+    report: (summary, detail, opts) =>
+      report("git", summary, { detail: detail?.trim() || undefined, isError: opts?.isError, scope: opts?.scope }),
+    dismiss: (scope) => ctx.dismissScope(scope),
+    compareRefs: (left, right) => void compareRefs(left, right),
     afterChange: () => void afterGitChange(),
   });
 
   const history = new HistoryPanel(host.querySelector<HTMLElement>('[data-pane="history"]')!, agent, {
     openDiff: (path, kind, about) => void openDiff(path, kind, about),
     compareCommits: (a, b) => void compareCommits(a, b),
+    compareRefs: (left, right) => void compareRefs(left, right),
     toast: panelReport,
+    // A squash stages the work and hands the wording back to the user, so the
+    // panel that has the message box is also the panel to look at next.
+    prefillCommitMessage: (text) => {
+      showView("scm");
+      gitPanel.setMessage(text);
+    },
     afterChange: () => void afterGitChange(),
   });
 
@@ -893,7 +976,20 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     splitter.addEventListener("pointerup", onUp);
   });
 
-  splitter.addEventListener("dblclick", () => setCollapsed(true));
+  /** Widths the double-click cycles through, as a share of the window.
+   *
+   *  The history is the panel that wants room — a graph, ref badges, a subject
+   *  and an author on one line — and dragging the splitter every time you open
+   *  it is a chore. Wide is "read the history properly"; the third press puts
+   *  it away, which is what the double-click did before and what Ctrl+B does. */
+  const WIDE = 0.55;
+  splitter.addEventListener("dblclick", () => {
+    const wide = Math.round(window.innerWidth * WIDE);
+    if (side.width >= wide - 8) return setCollapsed(true);
+    side.width = wide;
+    sideEl.style.width = `${side.width}px`;
+    saveSide(side);
+  });
 
   // The keyboard, in one place. Every chord comes from a registered command
   // (see commands.ts), so nothing can be bound without also being findable in
@@ -1276,7 +1372,9 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         const title = t.kind === "file"
           ? t.missing
             ? `${t.path} — deleted on disk; the buffer is still open`
-            : t.path
+            : t.stale
+              ? `${t.path} — changed on disk after this tab was opened; the buffer has unsaved edits`
+              : t.path
           : t.title;
         return `<div class="${cls}" draggable="true" data-id="${esc(t.id)}" title="${esc(title)}">
           ${file ? "" : `<span class="code-tab-icon">${t.kind === "folder" ? "🗀" : "⇄"}</span>`}
@@ -1381,7 +1479,10 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     editor.state = state;
     swappingState = false;
     editorHost.classList.remove("is-empty");
-    pathLabel.textContent = tab.path + (tab.readOnly ? "  (read-only)" : "") + (tab.missing ? "  (deleted on disk)" : "");
+    pathLabel.textContent =
+      tab.path +
+      (tab.readOnly ? "  (read-only)" : "") +
+      (tab.missing ? "  (deleted on disk)" : tab.stale ? "  (changed on disk)" : "");
     updateSaveEnabled();
     showEditor();
     renderTabs();
@@ -1571,7 +1672,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   const opening = new Map<string, Promise<void>>();
 
   async function open(path: string, reload = false, preview = false): Promise<void> {
-    const already = tabForPath(path);
+    const already = reload ? tabForPathOrMissing(path) : tabForPath(path);
     if (already && !reload) {
       // Already open: a deliberate open (double click) pins whatever is there.
       if (!preview) pin(already.id);
@@ -1632,7 +1733,9 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       // A reload keeps the tab it is refreshing — its id, its place in the
       // strip and, if it is the active one, the screen.
       const tab: FileTab = already
-        ? { ...already, readOnly, eol, missing: false, window }
+        // A reload is the buffer catching up with the file, so whatever was
+        // said about the two having diverged no longer holds.
+        ? { ...already, readOnly, eol, missing: false, stale: false, window }
         : { kind: "file", id: newTabId(), path, readOnly, eol, window };
       placeTab(tab, preview && !reload);
       states.set(tab.id, editor.newState(path, text, readOnly));
@@ -1653,6 +1756,20 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     // Walking search results should not leave a tab behind for every hit.
     await open(path, false, true);
     if (openFile?.path === path) editor.revealPosition(line, col);
+  }
+
+  /** Open a conflicted file where the conflict is.
+   *
+   *  Clicking a row under "merge conflicts" is a request to deal with that
+   *  conflict, and in a file of any size the markers are nowhere near the top —
+   *  so landing at line 1 of a 400-line file is the same dead end as opening it
+   *  in a diff was. The accept buttons sit on the first region, so put the view
+   *  there. */
+  async function openConflict(path: string): Promise<void> {
+    await open(path);
+    if (openFile?.path !== path) return;
+    const first = findConflicts(editor.state.doc)[0];
+    if (first) editor.revealPosition(editor.state.doc.lineAt(first.from).number, 1);
   }
 
   // ── comparison ──
@@ -2347,11 +2464,37 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  is what makes the answer exact rather than "touched at some point": a file
    *  changed and changed back reports as identical, which is the truth.
    */
-  async function compareCommits(from: Commit, to: Commit): Promise<void> {
-    const a7 = from.oid.slice(0, 7);
-    const b7 = to.oid.slice(0, 7);
+  /** Two refs — branches, tags, anything git resolves — as a comparison.
+   *
+   *  Everything under it is the commit comparison below, because that is what
+   *  comparing two branches is; what was missing was a way to ask for it by
+   *  name. Before this, "what is on release/1.1.0 that is not on main" meant
+   *  finding both tips in the graph by eye and marking them one at a time.
+   */
+  async function compareRefs(left: string, right: string): Promise<void> {
+    try {
+      const [a, b] = await Promise.all([
+        agent.call<Commit[]>("git.log", { ref: left, limit: 1 }),
+        agent.call<Commit[]>("git.log", { ref: right, limit: 1 }),
+      ]);
+      if (!a[0] || !b[0]) throw new Error(`Could not resolve ${!a[0] ? left : right}`);
+      if (a[0].oid === b[0].oid) {
+        report("compare", `${left} and ${right} are the same commit — nothing to compare`);
+        return;
+      }
+      await compareCommits(a[0], b[0], { left, right });
+    } catch (e) {
+      reportError("compare", e);
+    }
+  }
+
+  async function compareCommits(from: Commit, to: Commit, names?: { left: string; right: string }): Promise<void> {
+    const a7 = names?.left ?? from.oid.slice(0, 7);
+    const b7 = names?.right ?? to.oid.slice(0, 7);
     const tab: FolderTab = {
       kind: "folder",
+      // Named by the commits either way: comparing two branches and comparing
+      // their tips by hash are the same comparison, and should not open twice.
       id: `revcmp:${from.oid}:${to.oid}`,
       label: `${a7} ↔ ${b7}`,
       title: `${a7} ${from.subject} ↔ ${b7} ${to.subject}`,
@@ -2492,10 +2635,17 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       <span class="dircmp-side"><b>−</b> ${esc(tab.leftName)}</span>
       <span class="dircmp-side"><b>+</b> ${esc(tab.rightName)}</span>
       <span class="t-spacer"></span>
-      <span class="dircmp-counts">${(["differs", "left", "right", "same"] as const)
-        .filter((s) => s !== "same" || counts.same)
-        .map((s) => `${counts[s]} ${countWord(tab, s)}`)
-        .join(" · ")}</span>
+      <span class="dircmp-counts">${
+        // Only the states that occur. "1 differ · 0 only left · 0 only right"
+        // spends two thirds of the line saying nothing happened, and the same
+        // header in the commit comparison read differently only because its
+        // zeroes happened to be elsewhere. A comparison where everything
+        // matches still has to say so, hence the fallback.
+        (["differs", "left", "right", "same"] as const)
+          .filter((s) => counts[s] > 0)
+          .map((s) => `${counts[s]} ${countWord(tab, s)}`)
+          .join(" · ") || "no differences"
+      }</span>
       ${counts.same ? `<label class="dircmp-toggle"><input type="checkbox" class="js-show-same"${tab.showSame ? " checked" : ""}> show identical</label>` : ""}
       <button class="t-btn js-dircmp-swap" type="button"${tab.mode === "folders" ? "" : " hidden"}>swap sides</button>
       <button class="t-btn js-dircmp-again" type="button">re-run</button>
@@ -2642,6 +2792,10 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       if (boundRoot) void dropDraft(boundRoot, path);
       conflictingTabs.delete(tab.id);
       tab.missing = false;
+      // The buffer is the file again, so it is no longer behind it — and the
+      // warning that it was gone is about a file that now exists.
+      tab.stale = false;
+      ctx.dismissScope(missingScope(path));
       updateSaveEnabled();
       onEditorChange();
       report("save", `saved ${path}`);
@@ -2661,11 +2815,20 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
       conflicted.clear();
       for (const e of st.entries) if (e.conflict) conflicted.add(e.path);
+      // Which branch is on which side of a conflict, for the accept buttons —
+      // and it is not the same mapping for a merge and a rebase.
+      conflictSidesNow = conflictSides(st);
+      editor.setConflictSides(conflictSidesNow);
       renderConflictBar();
 
+      // Behind first, then ahead — the same order as the sync button in the
+      // source-control panel, and the order the two are acted on: what is on
+      // the remote comes down before what is here goes up. The two readouts
+      // used to disagree, which is a small thing that costs a double-take
+      // every time the numbers are not equal.
       const parts: string[] = [];
-      if (st.ahead) parts.push(`↑${st.ahead}`);
       if (st.behind) parts.push(`↓${st.behind}`);
+      if (st.ahead) parts.push(`↑${st.ahead}`);
       if (st.upstream) parts.push(st.upstream);
       syncLabel.textContent = parts.join(" ");
 
@@ -2682,7 +2845,16 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   /** A git operation moved refs or the worktree: everything derived is stale. */
   async function afterGitChange(): Promise<void> {
     await refreshStatus();
+    // What was open before the tree is re-read, put back after.
+    //
+    // `refresh` re-lists the folders it knows are open and keeps their nodes,
+    // which is enough when nothing moved — but a checkout can take a folder
+    // away and bring it back, and the replacement node starts closed. The
+    // symptom is a tree that quietly shuts itself a few levels every time you
+    // change branch, in the middle of work that is mostly changing branches.
+    const wasOpen = tree.expandedPaths();
     await tree.refresh(["*"]);
+    await tree.restoreExpanded(wasOpen);
     void history.refresh();
     // The open file may have been rewritten by a checkout or reset.
     if (openFile && !isDirty(openFile)) void open(openFile.path, true);
@@ -2952,14 +3124,51 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     if (tab.missing) {
       // Something put it back — a git checkout, an editor elsewhere, an undo.
       tab.missing = false;
+      // The warning was about a state that has passed; see notify.ts.
+      ctx.dismissScope(missingScope(tab.path));
       renderTabs();
       if (tab.id === openFile?.id) {
         pathLabel.textContent = tab.path + (tab.readOnly ? "  (read-only)" : "");
         updateSaveEnabled();
       }
     }
-    // Reload only the tab on screen, and only when there is nothing to lose.
-    if (tab.id === openFile?.id && !isDirty(tab)) void open(tab.path, true);
+
+    if (isDirty(tab)) {
+      // Unsaved edits: nothing is reloaded over them, but the buffer is now
+      // known to be out of date with the file, and `save & mark resolved` must
+      // not write it over a conflict git has just put there.
+      tab.stale = true;
+      renderTabs();
+      if (tab.id === openFile?.id) pathLabel.textContent = `${tab.path}  (changed on disk)`;
+      return;
+    }
+
+    // A clean buffer is reloaded whether or not its tab is the one on screen.
+    // It used to be "only the tab on screen", which is the bug behind a tab
+    // that shows a file as it was before a branch switch: the file comes back
+    // with conflict markers in it, the buffer still holds the version from the
+    // other branch, and "save & mark resolved" would then resolve the conflict
+    // by writing that version over it.
+    if (tab.id === openFile?.id) void open(tab.path, true);
+    else void reloadQuietly(tab);
+  }
+
+  /** Re-read a tab that is not on screen, leaving the screen alone.
+   *
+   *  `open(path, true)` would activate it: correct for the tab someone is
+   *  looking at, and an ambush for the five others behind it. */
+  async function reloadQuietly(tab: FileTab): Promise<void> {
+    const file = await agent.call<FileRead>("fs.read", { path: tab.path }).catch(() => null);
+    // Windowed, binary and oversized tabs are read-only and are re-read the
+    // ordinary way when they are next opened; there is nothing to lose in them.
+    if (!file || file.text === null || file.binary || file.tooLarge || tab.window) return;
+    const text = file.text.replace(/\r\n/g, "\n");
+    if (baselines.get(tab.id) === text) return;
+    tab.eol = file.text.includes("\r\n") ? "\r\n" : "\n";
+    tab.stale = false;
+    states.set(tab.id, editor.newState(tab.path, text, tab.readOnly));
+    baselines.set(tab.id, text);
+    renderTabs();
   }
 
   /** The file behind a tab is gone. The buffer is not: it stays open, marked,
@@ -2971,9 +3180,20 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     if (tab.id === openFile?.id) {
       pathLabel.textContent = `${tab.path}  (deleted on disk)`;
       updateSaveEnabled();
-      report("watch", `${tab.path} is gone from disk — the tab keeps your copy`, { isError: true });
+      // Scoped per path: "this file is gone" is a statement about a state, and
+      // switching back to the branch that has it makes the statement false. It
+      // used to sit there red until closed by hand — which, during a run of
+      // branch switches, is most of the screen.
+      report("watch", `${tab.path} is gone from disk — the tab keeps your copy`, {
+        isError: true,
+        scope: missingScope(tab.path),
+      });
     }
   }
+
+  /** One scope per path, so a file coming back takes down its own warning and
+   *  not the one about the file next to it. */
+  const missingScope = (path: string): string => `missing:${path}`;
 
   /** The explorer moved something. Every tab under it follows: a rename is not
    *  a new document, and the tab that was open before it should be the tab that
@@ -2983,6 +3203,9 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     for (const tab of fileTabs()) {
       const under = tab.path === from || tab.path.startsWith(`${from}/`);
       if (!under) continue;
+      // The old path's "gone from disk" notice, if there is one, is about a
+      // file that was renamed rather than lost.
+      ctx.dismissScope(missingScope(tab.path));
       tab.path = to + tab.path.slice(from.length);
       tab.missing = false;
       moved++;

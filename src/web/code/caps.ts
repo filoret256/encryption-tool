@@ -94,10 +94,18 @@ export function applyRequirements(root: ParentNode, caps: Caps): void {
   for (const el of root.querySelectorAll<HTMLElement>("[data-requires]")) {
     const need = el.dataset.requires as keyof Caps;
     const has = Boolean(caps[need]);
+    // The control's own tooltip, remembered the first time it is seen and put
+    // back when the capability arrives.
+    //
+    // It used to be cleared instead — `el.title = ""` — which meant that
+    // connecting an agent silently stripped the labels off exactly the controls
+    // that have nothing but an icon: search, source control, history, reload.
+    // They are unlabelled only after everything starts working, which is why
+    // this was easy to miss and maddening to use.
+    if (el.dataset.capTitle === undefined && !el.title.startsWith("Requires")) el.dataset.capTitle = el.title;
     el.classList.toggle("needs-cap", !has);
     if (el instanceof HTMLButtonElement || el instanceof HTMLInputElement) el.disabled = !has;
-    if (!has) el.title = HINTS[need] ?? `Requires: ${need}`;
-    else if (el.title.startsWith("Requires")) el.title = "";
+    el.title = has ? (el.dataset.capTitle ?? "") : (HINTS[need] ?? `Requires: ${need}`);
   }
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "encryption-tool",
-  "version": "4.7.0",
+  "version": "4.8.0",
   "description": "Web app for Helm- and Ansible-Vault-compatible encryption plus a git-backed code editor",
   "type": "module",
   "module": "src/server.ts",

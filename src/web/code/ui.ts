@@ -278,6 +278,79 @@ function markDialog(form: HTMLElement, labelledBy: HTMLElement | null): void {
   }
 }
 
+/** One answer in a `modalChoice`. */
+export interface ChoiceOption<T extends string> {
+  value: T;
+  label: string;
+  /** One line on what this choice does to the repository. These dialogs are
+   *  asked at moments where the difference between the options is exactly what
+   *  the user is unsure about, so the explanation is part of the button. */
+  detail?: string;
+  danger?: boolean;
+}
+
+/** A question with more than two answers.
+ *
+ *  `modalConfirm` covers "do it / don't"; a merge strategy or a pull strategy is
+ *  a choice between three things that are all fine, and offering it as a pair of
+ *  yes/no dialogs (or, as before, not offering it at all and picking one
+ *  silently) is what put merge commits into branches that were supposed to stay
+ *  linear. Resolves to the chosen value, or null if the user backed out.
+ */
+export function modalChoice<T extends string>(opts: {
+  title: string;
+  detail?: string;
+  options: ChoiceOption<T>[];
+  cancelLabel?: string;
+}): Promise<T | null> {
+  return new Promise((resolve) => {
+    const back = document.createElement("div");
+    back.className = "modal-back";
+    back.innerHTML = `<div class="modal">
+      <p class="modal-title">${esc(opts.title)}</p>
+      ${opts.detail ? `<p class="modal-hint">${esc(opts.detail)}</p>` : ""}
+      <div class="modal-choices">
+        ${opts.options
+          .map(
+            (o) => `<button type="button" class="modal-choice${o.danger ? " danger" : ""}" data-value="${esc(o.value)}">
+              <span class="modal-choice-label">${esc(o.label)}</span>
+              ${o.detail ? `<span class="modal-choice-detail">${esc(o.detail)}</span>` : ""}
+            </button>`,
+          )
+          .join("")}
+      </div>
+      <div class="modal-row">
+        <button type="button" class="t-btn cancel">${esc(opts.cancelLabel ?? "cancel")}</button>
+      </div></div>`;
+
+    const dialog = back.querySelector<HTMLElement>(".modal")!;
+    markDialog(dialog, dialog.querySelector(".modal-title"));
+    const release = trapFocus(dialog);
+
+    const done = (v: T | null): void => {
+      back.remove();
+      document.removeEventListener("keydown", onKey, true);
+      release();
+      resolve(v);
+    };
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") done(null);
+    };
+
+    for (const btn of back.querySelectorAll<HTMLElement>(".modal-choice")) {
+      btn.addEventListener("click", () => done(btn.dataset.value as T));
+    }
+    back.querySelector(".cancel")!.addEventListener("click", () => done(null));
+    back.addEventListener("click", (e) => {
+      if (e.target === back) done(null);
+    });
+    document.addEventListener("keydown", onKey, true);
+
+    document.body.appendChild(back);
+    back.querySelector<HTMLButtonElement>(".modal-choice")!.focus();
+  });
+}
+
 export interface ConfirmOptions {
   /** The question. Shown at reading size, not as a field label — it is the one
    *  thing in the dialog the user has to actually read. */

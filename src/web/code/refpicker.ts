@@ -74,7 +74,9 @@ export function pickRef(opts: PickRefOptions): Promise<string | null> {
         b.time - a.time,
     )
     .map((b) => {
-      const track = [b.ahead ? `↑${b.ahead}` : "", b.behind ? `↓${b.behind}` : ""].filter(Boolean).join(" ");
+      // Behind, then ahead — as in the panel and the status bar. Three readouts
+      // of the same pair of numbers should not each pick their own order.
+      const track = [b.behind ? `↓${b.behind}` : "", b.ahead ? `↑${b.ahead}` : ""].filter(Boolean).join(" ");
       return {
         value: b.name,
         label: b.name,

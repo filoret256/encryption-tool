@@ -268,6 +268,7 @@ async function openCodeTab(): Promise<void> {
         isDark: () => isDark,
         notify,
         dismissNotices: () => notifier.dismissAll(),
+        dismissScope: (scope) => notifier.dismissScope(scope),
         onCapsChanged: () => refreshBadge?.(),
       getAgent: () => agentDownload?.open(),
       });

@@ -30,7 +30,7 @@ import {
 import { highlightSelectionMatches, search, searchKeymap } from "@codemirror/search";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import { grammarFor } from "./grammars.ts";
-import { conflictHighlighter } from "./conflicts.ts";
+import { conflictHighlighter, setConflictSides, type ConflictSides } from "./conflicts.ts";
 import { blameGutter, hasBlame, setBlame, type BlameLine } from "./blame.ts";
 import { cspNonce } from "../csp.ts";
 
@@ -136,6 +136,7 @@ export class CodeEditor {
   set state(state: EditorState) {
     this.view.setState(state);
     this.applyTheme();
+    this.applyConflictSides();
   }
 
   /** Build a fresh state for a file. Fresh rather than a big change
@@ -197,6 +198,26 @@ export class CodeEditor {
    *  than something the reader has to unpick line by line. */
   replaceAll(text: string): void {
     this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
+  }
+
+  /** Name the two sides of any conflict markers in this document, so the accept
+   *  buttons can say which branch each one is. Null while nothing is in
+   *  progress — the buttons then fall back to what git wrote in the markers.
+   *
+   *  Held here as well as in the document: every tab is its own EditorState, so
+   *  a state that was created after the last status refresh — which is every
+   *  file opened during a merge, including the conflicted one — would otherwise
+   *  start with no names and show "HEAD" instead of the branch. */
+  setConflictSides(sides: ConflictSides | null): void {
+    this.sides = sides;
+    this.view.dispatch({ effects: setConflictSides.of(sides) });
+  }
+
+  private sides: ConflictSides | null = null;
+
+  /** Push the current names into whatever document is now on screen. */
+  private applyConflictSides(): void {
+    if (this.sides) this.view.dispatch({ effects: setConflictSides.of(this.sides) });
   }
 
   /** Put the cursor on a 1-based line / 0-based column and scroll it into the

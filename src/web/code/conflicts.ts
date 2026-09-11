@@ -10,8 +10,37 @@
  *  Both marker styles are handled: the default one and diff3's, which inserts a
  *  `|||||||` base section between the two sides.
  */
-import { RangeSetBuilder, StateField, type EditorState, type Extension } from "@codemirror/state";
+import { RangeSetBuilder, StateEffect, StateField, type EditorState, type Extension } from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, WidgetType } from "@codemirror/view";
+
+/** What "current" and "incoming" are, in this repository, right now.
+ *
+ *  The words alone are a trap. In a merge, "current" is the branch you are on
+ *  and "incoming" is the one being merged; in a rebase git swaps them — your
+ *  own commit is replayed *onto* the other branch, so it arrives as "incoming"
+ *  and the branch you are rebasing onto is "current". Two buttons that say only
+ *  current/incoming therefore mean opposite things in the two cases, and the
+ *  editor is the one place where getting it backwards silently discards work.
+ *
+ *  The markers git writes carry names (`<<<<<<< HEAD`, `>>>>>>> feature/x`),
+ *  but "HEAD" is not an answer to "which branch is that", so the panel supplies
+ *  the names it knows from the operation in progress.
+ */
+export interface ConflictSides {
+  current: string;
+  incoming: string;
+}
+
+/** Tell the editor which branches the two sides belong to. */
+export const setConflictSides = StateEffect.define<ConflictSides | null>();
+
+const sidesField = StateField.define<ConflictSides | null>({
+  create: () => null,
+  update(value, tr) {
+    for (const e of tr.effects) if (e.is(setConflictSides)) return e.value;
+    return value;
+  },
+});
 
 export interface ConflictRegion {
   /** Document offsets covering the whole region, markers included. */
@@ -97,17 +126,23 @@ export function findConflicts(doc: { lines: number; line(n: number): { from: num
 }
 
 class ActionsWidget extends WidgetType {
-  constructor(private readonly region: ConflictRegion) {
+  constructor(
+    private readonly region: ConflictRegion,
+    private readonly sides: ConflictSides | null,
+  ) {
     super();
   }
 
-  /** Two widgets are equal when they resolve the same text, so CodeMirror can
-   *  reuse the DOM instead of rebuilding it on every keystroke elsewhere. */
+  /** Two widgets are equal when they resolve the same text and say the same
+   *  thing, so CodeMirror can reuse the DOM instead of rebuilding it on every
+   *  keystroke elsewhere. */
   eq(other: ActionsWidget): boolean {
     return (
       this.region.from === other.region.from &&
       this.region.ours === other.region.ours &&
-      this.region.theirs === other.region.theirs
+      this.region.theirs === other.region.theirs &&
+      this.sides?.current === other.sides?.current &&
+      this.sides?.incoming === other.sides?.incoming
     );
   }
 
@@ -131,9 +166,21 @@ class ActionsWidget extends WidgetType {
     };
 
     const { ours, theirs, oursLabel, theirsLabel } = this.region;
-    add("accept current", `Keep ${oursLabel}`, ours);
-    add("accept incoming", `Keep ${theirsLabel}`, theirs);
-    add("accept both", "Keep both sides, current first", ours + (ours && theirs ? "\n" : "") + theirs);
+    // The branch names from the operation in progress, falling back to what git
+    // wrote in the marker — which for the current side is usually "HEAD".
+    const currentName = this.sides?.current || oursLabel;
+    const incomingName = this.sides?.incoming || theirsLabel;
+    add(
+      currentName ? `accept current (${currentName})` : "accept current",
+      `Keep ${currentName || oursLabel}`,
+      ours,
+    );
+    add(
+      incomingName ? `accept incoming (${incomingName})` : "accept incoming",
+      `Keep ${incomingName || theirsLabel}`,
+      theirs,
+    );
+    add("accept both", `Keep both sides — ${currentName || "current"} first`, ours + (ours && theirs ? "\n" : "") + theirs);
     return bar;
   }
 
@@ -151,10 +198,11 @@ const lineDeco = {
 
 function build(state: EditorState): DecorationSet {
   const { doc } = state;
+  const sides = state.field(sidesField, false) ?? null;
   const builder = new RangeSetBuilder<Decoration>();
 
   for (const region of findConflicts(doc)) {
-    builder.add(region.from, region.from, Decoration.widget({ widget: new ActionsWidget(region), block: true, side: -1 }));
+    builder.add(region.from, region.from, Decoration.widget({ widget: new ActionsWidget(region, sides), block: true, side: -1 }));
 
     // Walk the region line by line so each one gets the colour of its side.
     let side: keyof typeof lineDeco = "marker";
@@ -189,9 +237,17 @@ function build(state: EditorState): DecorationSet {
  *  the middle of resolving, not a generated megabyte.
  */
 export function conflictHighlighter(): Extension {
-  return StateField.define<DecorationSet>({
-    create: (state) => build(state),
-    update: (deco, tr) => (tr.docChanged ? build(tr.state) : deco),
-    provide: (field) => EditorView.decorations.from(field),
-  });
+  return [
+    sidesField,
+    StateField.define<DecorationSet>({
+      create: (state) => build(state),
+      // Rebuilt on an edit, and on being told which branches the sides are:
+      // the names arrive from the status refresh, which is not an edit, and
+      // without this the buttons would keep whatever names they were built
+      // with — including none at all on the first paint.
+      update: (deco, tr) =>
+        tr.docChanged || tr.effects.some((e) => e.is(setConflictSides)) ? build(tr.state) : deco,
+      provide: (field) => EditorView.decorations.from(field),
+    }),
+  ];
 }

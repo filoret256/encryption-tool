@@ -591,6 +591,82 @@ async function mutations(
     await call("git.resolve", { paths: ["b.txt"] }).catch(() => {});
     check("git.mergeAbort / git.resolve answered", true, "recorded for comparison");
 
+    // ── an operation that stops half-way ──
+    //
+    // status.operation is what the panel's MERGING/REBASING banner is made of,
+    // and it has one failure mode worth a permanent test: it used to be read by
+    // asking git to resolve REBASE_HEAD, which *survives a finished rebase*, so
+    // a repository that had rebased once reported a rebase in progress forever
+    // and offered a "Continue" that could only answer "no rebase in progress".
+    // Every check below is therefore as much about the state being gone as
+    // about it being seen.
+    await call("fs.write", { path: "conflict.txt", text: "base\n" });
+    await call("git.stage", { paths: ["conflict.txt"] });
+    await call("git.commit", { message: "conflict base" });
+    await call("git.branchCreate", { name: "side", from: "HEAD" });
+    await call("fs.write", { path: "conflict.txt", text: "theirs\n" });
+    await call("git.commit", { message: "side change", all: true });
+    await call("git.checkout", { ref: "main" });
+    await call("fs.write", { path: "conflict.txt", text: "ours\n" });
+    await call("git.commit", { message: "our change", all: true });
+
+    const stoppedMerge = await call<{ conflict: boolean }>("git.merge", { ref: "side" });
+    const merging = await call<GitStatus>("git.status");
+    check("a conflicted merge is reported as one", stoppedMerge.conflict && merging.operation?.kind === "merge", JSON.stringify(merging.operation));
+    // The message git wrote for the commit that will finish this merge. The
+    // panel puts it in the box; before it did, the text had to be retyped.
+    check(
+      "MERGE_MSG is offered, comments stripped",
+      /^Merge branch 'side'/.test(merging.preparedMessage ?? "") && !(merging.preparedMessage ?? "").includes("#"),
+      JSON.stringify((merging.preparedMessage ?? "").split("\n")[0]),
+    );
+
+    await call("git.mergeAbort", {});
+    const afterAbort = await call<GitStatus>("git.status");
+    check("aborting clears it", afterAbort.operation === null, `operation=${JSON.stringify(afterAbort.operation)}`);
+
+    await call("git.checkout", { ref: "side" });
+    const rebasing = await call<{ conflict: boolean }>("git.rebase", { action: "start", ref: "main" });
+    const during = await call<GitStatus>("git.status");
+    check(
+      "a stopped rebase names the branch, the target and the step",
+      during.operation?.kind === "rebase" && during.operation.head === "side" && Boolean(during.operation.onto) && during.operation.step === 1,
+      JSON.stringify(during.operation),
+    );
+
+    await call("git.rebase", { action: "abort" });
+    const afterRebase = await call<GitStatus>("git.status");
+    // The regression guard proper: REBASE_HEAD is still there at this point.
+    check("a finished rebase is not still 'in progress'", afterRebase.operation === null, `operation=${JSON.stringify(afterRebase.operation)}`);
+
+    // cherry-pick and revert stop the same way, and until the sequencer op
+    // existed there was no way out of either except a terminal.
+    await call("git.checkout", { ref: "main" });
+    const sideHead = await call<Commit[]>("git.log", { ref: "side", limit: 1 });
+    await call("git.cherryPick", { oid: sideHead[0].oid }).catch(() => {});
+    const picking = await call<GitStatus>("git.status");
+    check("a stopped cherry-pick is reported", picking.operation?.kind === "cherry-pick", JSON.stringify(picking.operation));
+    await call("git.sequencer", { what: "cherry-pick", action: "abort" });
+    const afterPickAbort = await call<GitStatus>("git.status");
+    check("the sequencer gets out of it", afterPickAbort.operation === null, `operation=${JSON.stringify(afterPickAbort.operation)}`);
+
+    // --squash stages the branch and stops short of committing, which is the
+    // whole difference between it and a merge.
+    const beforeSquash = await call<GitStatus>("git.status");
+    await call("git.merge", { ref: "side", squash: true }).catch(() => {});
+    const afterSquash = await call<GitStatus>("git.status");
+    check("--squash leaves HEAD where it was", beforeSquash.oid === afterSquash.oid, `${String(beforeSquash.oid).slice(0, 7)} → ${String(afterSquash.oid).slice(0, 7)}`);
+    // SQUASH_MSG, not MERGE_MSG: a squash writes both, and the useful one is
+    // the list of commits being folded together.
+    check(
+      "SQUASH_MSG is offered after a squash",
+      /^Squashed commit of the following/.test(afterSquash.preparedMessage ?? ""),
+      JSON.stringify((afterSquash.preparedMessage ?? "").split("\n")[0]),
+    );
+    check("a squash is not an operation in progress", afterSquash.operation === null, JSON.stringify(afterSquash.operation));
+    await call("git.reset", { oid: "HEAD", mode: "hard" });
+    await call("git.branchDelete", { name: "side", force: true });
+
     // The other half of the watcher. Started by the read-only suite; stopping it
     // was never called anywhere.
     await call("watch.start");
@@ -1128,6 +1204,11 @@ async function hardening(
     await denied("git.reset mode is not a free string", "git.reset", { oid: "HEAD", mode: "output=x" }, /^Invalid reset mode:/);
     await denied("git.rebase action is not a free string", "git.rebase", { action: "exec=whoami" }, /^Invalid rebase action:/);
     await denied("git.stash action is not a free string", "git.stash", { action: "--fake" }, /^Invalid stash action:/);
+    // The two newest values that end up concatenated into a flag rather than
+    // passed as data, so screening for a leading "-" is not enough for either.
+    await denied("pull mode is not a free string", "git.remote", { action: "pull", mode: "-upload-pack=whoami" }, /^Invalid pull mode:/);
+    await denied("sequencer action is not a free string", "git.sequencer", { what: "cherry-pick", action: "exec=whoami" }, /^Invalid sequencer action:/);
+    await denied("sequencer command is not a free string", "git.sequencer", { what: "push --all", action: "abort" }, /^Invalid sequencer command:/);
     check("no file was written outside the workspace", await gone(canary), "canary.txt absent");
 
     // The same values, legitimately: a jail that refuses HEAD is not a fix.

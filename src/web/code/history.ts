@@ -4,10 +4,12 @@
  *  is fast, but shipping 50k commits through the socket and into the DOM is not.
  */
 import type { AgentClient } from "./agent.ts";
-import type { Commit, CommitDetail } from "../../agent/protocol.ts";
+import type { Branch, Commit, CommitDetail, GitStatus } from "../../agent/protocol.ts";
 import { copyToClipboard, esc, modalConfirm, modalPrompt, setHtmlKeepingScroll, showMenu, startTrimmed, type MenuItem } from "./ui.ts";
 import { computeGraph, continuationSvg, laneSvg, LANE_W, type GraphRow } from "./graph.ts";
 import { iconRefresh } from "./icons.ts";
+import { OP_SCOPE } from "./git-panel.ts";
+import { pickRef } from "./refpicker.ts";
 
 const PAGE = 100;
 /** How far `reveal` will page looking for one commit — a thousand back, which
@@ -27,10 +29,17 @@ export interface CommitAbout {
 
 export interface HistoryCallbacks {
   openDiff(path: string, kind: string, about?: CommitAbout): void;
-  toast(message: string, isError?: boolean): void;
+  /** `scope` marks a notice that describes a state rather than an event, so it
+   *  can come down when that state passes — see notify.ts. */
+  toast(message: string, isError?: boolean, scope?: string): void;
   afterChange(): void;
   /** List what differs between two commits. */
   compareCommits(a: Commit, b: Commit): void;
+  /** The same, for two named refs — branches or tags. */
+  compareRefs(left: string, right: string): void;
+  /** Put text in the source-control message box and show it — used after a
+   *  squash, which leaves the changes staged and the message to be written. */
+  prefillCommitMessage(text: string): void;
 }
 
 /** A parsed filter line. Everything here is matched against the commits already
@@ -150,6 +159,9 @@ export class HistoryPanel {
    *  explorer uses for files, so there is one gesture to learn, not two. */
   private compareBase: string | null = null;
   private details = new Map<string, CommitDetail>();
+  /** Which parent a merge commit is being read against, per commit — so a
+   *  refresh of the log does not silently put the list back to parent 1. */
+  private parentChoice = new Map<string, number>();
   /** Fingerprint of what is currently on screen; an unchanged log is not
    *  redrawn, so a click is never dropped because the row it landed on was
    *  replaced underneath it. */
@@ -365,7 +377,9 @@ export class HistoryPanel {
     this.reportCount(shown.length);
     const key = JSON.stringify([
       this.commits.map((c) => [c.oid, c.refs, c.subject]),
-      [...this.expanded].map((oid) => [oid, Boolean(this.details.get(oid))]),
+      // The parent a merge is read against is part of what is on screen: two
+      // renders of the same commit show different file lists.
+      [...this.expanded].map((oid) => [oid, Boolean(this.details.get(oid)), this.details.get(oid)?.parent ?? 0]),
       shown.length === this.commits.length ? null : shown.map((c) => c.oid),
       this.compareBase,
       withGraph,
@@ -432,10 +446,13 @@ export class HistoryPanel {
     });
   }
 
-  private async loadDetail(oid: string): Promise<void> {
-    if (this.details.has(oid)) return;
+  private async loadDetail(oid: string, parent?: number): Promise<void> {
+    // A parent asked for explicitly re-reads, because the answer is different.
+    if (this.details.has(oid) && parent === undefined) return;
+    const side = parent ?? this.parentChoice.get(oid) ?? 1;
     try {
-      this.details.set(oid, await this.agent.call<CommitDetail>("git.commitDetail", { oid }));
+      this.details.set(oid, await this.agent.call<CommitDetail>("git.commitDetail", { oid, parent: side }));
+      this.parentChoice.set(oid, side);
     } catch (err) {
       this.cb.toast(err instanceof Error ? err.message : String(err), true);
     }
@@ -488,9 +505,31 @@ export class HistoryPanel {
     if (!detail) return `<div class="hist-files">${gutter}<div class="hist-files-body">${who}<span class="gp-empty">loading…</span></div></div>`;
 
     const body = detail.body.trim();
+    // A merge has two answers to "what changed here", and the panel used to
+    // give only the first one without saying so. Against the first parent the
+    // list is what the merge brought into the branch; against the second it is
+    // what the branch looked like from the other side — the question a release
+    // merge is normally opened for.
+    const sides =
+      c.parents.length > 1
+        ? `<div class="hist-parents">
+             <span class="hist-parents-label">merge of ${c.parents.length} parents — showing changes against</span>
+             ${c.parents
+               .map(
+                 (p, i) =>
+                   `<button type="button" class="hist-parent${(detail.parent ?? 1) === i + 1 ? " active" : ""}"
+                      data-parent="${i + 1}" data-oid="${esc(c.oid)}"
+                      title="${esc(`Diff this merge against parent ${i + 1} (${p.slice(0, 8)})`)}">${
+                     i === 0 ? "parent 1 · the branch merged into" : `parent ${i + 1} · the branch merged in`
+                   }</button>`,
+               )
+               .join("")}
+           </div>`
+        : "";
     return `<div class="hist-files">${gutter}<div class="hist-files-body">
       ${who}
       ${body ? `<pre class="hist-body">${esc(body)}</pre>` : ""}
+      ${sides}
       ${detail.files
         .map(
           (f) => `<div class="hist-file" data-path="${esc(f.path)}" title="${esc(f.path)}">
@@ -511,8 +550,24 @@ export class HistoryPanel {
     if (!item) return;
     const oid = item.dataset.oid!;
 
+    // Switching which parent a merge is diffed against.
+    const side = target.closest<HTMLElement>(".hist-parent");
+    if (side) {
+      const want = Number(side.dataset.parent);
+      if (want !== (this.details.get(oid)?.parent ?? 1)) await this.loadDetail(oid, want);
+      return;
+    }
+
     const file = target.closest<HTMLElement>(".hist-file");
-    if (file) return this.cb.openDiff(file.dataset.path!, oid, this.about(oid));
+    if (file) {
+      // For a merge, name both ends: the file's own `<oid>^` is parent 1
+      // whichever side the list is currently showing.
+      const commit = this.commits.find((x) => x.oid === oid);
+      const parent = this.details.get(oid)?.parent ?? 1;
+      const kind =
+        commit && commit.parents.length > 1 ? `${commit.parents[parent - 1]}..${oid}` : oid;
+      return this.cb.openDiff(file.dataset.path!, kind, this.about(oid));
+    }
 
     // Only the header row toggles. The block below it is content to read, and
     // treating any click inside it as a toggle meant a click that missed a file
@@ -553,6 +608,20 @@ export class HistoryPanel {
       { label: "Copy full SHA", run: () => void copyToClipboard(oid, "Full SHA", this.cb.toast) },
     ];
 
+    // Right-clicking the branch or tag chip asks about that ref, not about the
+    // commit underneath it: "what is on release/1.1.0 that is not on main" is a
+    // question about two names, and answering it by hunting for both tips in
+    // the graph is how it had to be done before.
+    const chip = (e.target as HTMLElement).closest<HTMLElement>(".hist-ref");
+    const refName = chip?.dataset.ref;
+    if (refName) {
+      items.push({
+        label: `Compare ${refName} with…`,
+        separated: true,
+        run: () => void this.compareRefWith(refName),
+      });
+    }
+
     // The same two-step pick as files in the explorer, for the same reason:
     // "compare two commits" has no single-click gesture that is not a guess
     // about which two.
@@ -584,6 +653,17 @@ export class HistoryPanel {
 
     showMenu(e.clientX, e.clientY, [
       ...items,
+      // Tidying up your own commits before they go anywhere. `git rebase -i` is
+      // the usual home for this, and it needs an interactive editor the browser
+      // has no way to provide — so the two operations people actually reach for
+      // are offered directly, built out of commands that need no editor at all.
+      {
+        label: "Reword this commit…",
+        separated: true,
+        disabled: this.commits[0]?.oid !== oid,
+        run: () => void this.reword(oid),
+      },
+      { label: "Squash the commits from here to the tip…", run: () => void this.squashToHere(oid) },
       { label: "Checkout this commit", separated: true, run: () => void this.run("git.checkout", { ref: oid }, `checked out ${short} (detached)`) },
       ["Create branch here…", () => void this.branchHere(oid)],
       ["Revert this commit", () => void this.run("git.revert", { oid }, `reverted ${short}`)],
@@ -592,6 +672,91 @@ export class HistoryPanel {
       ["Reset — keep changes (mixed)", () => void this.reset(oid, "mixed")],
       ["Reset — discard changes (hard)", () => void this.reset(oid, "hard")],
     ]);
+  }
+
+  /** Change the message of the newest commit.
+   *
+   *  Only the newest: that one is `git commit --amend`, which needs nothing but
+   *  a message. Rewording an older commit is `git rebase -i`, which needs an
+   *  editor this page cannot give it — so the item is shown greyed on older
+   *  commits rather than missing, because "why can I not rename this one" is a
+   *  question worth answering in the menu.
+   */
+  private async reword(oid: string): Promise<void> {
+    const current = this.commits.find((c) => c.oid === oid);
+    const message = await modalPrompt({
+      title: "Reword the last commit",
+      hint: "Replaces the commit, so its hash changes. If it has been pushed, the remote will need a force-push.",
+      value: current?.subject ?? "",
+      okLabel: "reword",
+    });
+    if (!message || message === current?.subject) return;
+    await this.run("git.commit", { message, amend: true }, `reworded ${oid.slice(0, 7)}`);
+  }
+
+  /** Fold every commit from this one up to the tip into a single commit.
+   *
+   *  `git reset --soft <parent>` plus a commit: the same result as an
+   *  interactive rebase whose entries are all `squash`, reached without a todo
+   *  file. The changes are left staged and the message box is filled with the
+   *  subjects being folded together; the commit itself is the user's press, so
+   *  there is a step between "I meant to tidy up" and a rewritten branch.
+   */
+  private async squashToHere(oid: string): Promise<void> {
+    const short = oid.slice(0, 7);
+    let range: Commit[];
+    try {
+      range = await this.agent.call<Commit[]>("git.log", { ref: `${oid}~1..HEAD`, limit: 200 });
+    } catch {
+      // No parent — this is the root commit, and there is nothing to reset to.
+      this.cb.toast(`${short} has no parent, so there is nothing to squash it into.`, true);
+      return;
+    }
+    if (!range.some((c) => c.oid === oid)) {
+      this.cb.toast(`${short} is not on the current branch — switch to a branch that contains it first.`, true);
+      return;
+    }
+    if (range.length < 2) {
+      this.cb.toast(`${short} is already the only commit here — nothing to squash.`, true);
+      return;
+    }
+
+    // Anything already on the upstream is history other people may have. The
+    // status knows how far ahead the branch is; beyond that point, squashing
+    // rewrites commits that have been published.
+    const st = await this.agent.call<GitStatus>("git.status").catch(() => null);
+    const published = st?.upstream ? Math.max(0, range.length - (st.ahead ?? 0)) : 0;
+    const dirty = (st?.entries ?? []).filter((e) => !e.untracked && !e.ignored).length;
+
+    const ok = await modalConfirm({
+      title: `Squash ${range.length} commits into one?`,
+      detail: [
+        `Everything from ${short} to the tip of ${st?.branch ?? "this branch"} becomes a single commit.`,
+        "The changes are staged for you and the message box is filled in — nothing is committed until you press commit.",
+        dirty ? `${dirty} uncommitted change${dirty === 1 ? "" : "s"} in the working tree will be staged along with them.` : "",
+        published
+          ? `${published} of these commits ${published === 1 ? "is" : "are"} already on ${st?.upstream} — squashing them rewrites history others may have pulled.`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
+      okLabel: "squash",
+      danger: published > 0,
+    });
+    if (!ok) return;
+
+    try {
+      await this.agent.call("git.reset", { oid: `${oid}~1`, mode: "soft" });
+    } catch (e) {
+      this.cb.toast(e instanceof Error ? e.message : String(e), true);
+      return;
+    }
+    // Oldest first, so the folded message reads in the order the work happened.
+    const subjects = [...range].reverse().map((c) => c.subject);
+    this.cb.prefillCommitMessage([subjects[0], "", ...subjects.slice(1).map((s) => `* ${s}`)].join("\n"));
+    this.cb.toast(`${range.length} commits staged as one — write the message and commit`);
+    await this.refresh();
+    this.cb.afterChange();
   }
 
   private async branchHere(oid: string): Promise<void> {
@@ -612,12 +777,41 @@ export class HistoryPanel {
     await this.run("git.reset", { oid, mode }, `reset --${mode} to ${oid.slice(0, 7)}`);
   }
 
+  /** Pick the other side of a ref comparison.
+   *
+   *  The branch list is fetched here rather than held on the panel: it is one
+   *  call, made when a menu item is chosen, and a copy kept up to date through
+   *  every checkout and fetch for the sake of one menu would be the wrong
+   *  trade. */
+  private async compareRefWith(left: string): Promise<void> {
+    try {
+      const refs = await this.agent.call<Branch[]>("git.branches");
+      const right = await pickRef({
+        title: `Compare ${left} with which ref?`,
+        hint: "Lists what is on each side that is not on the other.",
+        refs,
+        current: left,
+        excludeCurrent: true,
+        okLabel: "compare",
+      });
+      if (right) this.cb.compareRefs(left, right);
+    } catch (e) {
+      this.cb.toast(e instanceof Error ? e.message : String(e), true);
+    }
+  }
+
   private async run(op: string, params: Record<string, unknown>, okMessage: string): Promise<void> {
     try {
       await this.agent.call(op, params);
       this.cb.toast(okMessage);
     } catch (e) {
-      this.cb.toast(e instanceof Error ? e.message : String(e), true);
+      const message = e instanceof Error ? e.message : String(e);
+      // A cherry-pick or revert that stops on a conflict leaves the repository
+      // in a state the source-control banner now owns; this notice describes
+      // that state, so it is tagged to come down with it rather than sit there
+      // red once the conflict has been dealt with.
+      const stopped = /conflict|could not apply|after resolving/i.test(message);
+      this.cb.toast(message, true, stopped ? OP_SCOPE : undefined);
     }
     await this.refresh();
     this.cb.afterChange();
@@ -647,7 +841,9 @@ function refsHtml(refs: string): string {
       // were the same green pill, and `v1.2.0` beside `main` was a shade of
       // difference on a release day. Tags get a square end and a marker.
       const mark = kind === "tag" ? `<span class="hist-ref-mark" aria-hidden="true">⌗</span>` : "";
-      return `<span class="hist-ref ref-${kind}" title="${esc(r)}">${mark}<span class="hist-ref-name">${esc(startTrimmed(label))}</span></span>`;
+      // The bare name — no "tag: ", no "HEAD -> " — is what git takes as a ref,
+      // and what the context menu compares against.
+      return `<span class="hist-ref ref-${kind}" data-ref="${esc(label)}" title="${esc(r)}">${mark}<span class="hist-ref-name">${esc(startTrimmed(label))}</span></span>`;
     });
   return `<span class="hist-refs">${chips.join("")}</span>`;
 }

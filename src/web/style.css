@@ -442,6 +442,16 @@ body {
   height: var(--head-h); padding: 0 8px; border-bottom: 1px solid var(--border);
 }
 .gp-sync { font-size: var(--fs-xs); color: var(--text-muted); }
+/* The pull strategy, on the pull button. Two characters in the corner rather
+   than a word: the row is icons, and the tag has to read as a property of the
+   arrow it sits on, not as another control. */
+.js-pull { position: relative; }
+.gp-pull-mode {
+  position: absolute; right: 1px; bottom: 0;
+  font-family: var(--mono); font-size: 9px; line-height: 1;
+  color: var(--text-muted); pointer-events: none;
+}
+.js-pull:hover .gp-pull-mode { color: var(--text); }
 .gp-commit { display: flex; flex-direction: column; gap: 6px; padding: 8px; border-bottom: 1px solid var(--border); }
 .gp-commit textarea {
   font-family: var(--mono); font-size: var(--fs-sm); resize: vertical; padding: 6px 8px;
@@ -459,7 +469,40 @@ body {
 .gp-len.is-long { color: var(--dec-modified); }
 .gp-len.is-over { color: var(--bad); }
 .gp-warn { margin: 0; font-size: var(--fs-xs); line-height: 1.45; color: var(--bad); }
+
+/* The unfinished-operation banner: a merge, rebase, cherry-pick or revert that
+   stopped and is waiting on the user.
+   It is deliberately loud and deliberately not a toast. The state it reports
+   outlives any notification — a rebase can sit half-applied for an afternoon —
+   and the way out of it has to be visible at the moment someone looks at the
+   panel, not in whatever scrolled past while they were reading the conflict. */
+.gp-op {
+  display: flex; flex-direction: column; gap: 6px; flex: 0 0 auto;
+  padding: 8px; border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel));
+  border-left: 3px solid var(--accent);
+}
+.gp-op-line { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.gp-op-verb {
+  flex: 0 0 auto; font-size: var(--fs-badge); font-weight: 600; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--accent);
+}
+.gp-op-what {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--mono); font-size: var(--fs-xs); color: var(--text);
+}
+.gp-op-next { margin: 0; font-size: var(--fs-xs); line-height: 1.45; color: var(--text-muted); }
+.gp-op-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+/* A continue that git would refuse is shown, greyed: the button is where the
+   sentence above it points, and hiding it until the last conflict is resolved
+   makes the panel look like it has no way forward at all. */
+.gp-op-actions .t-btn[disabled] { opacity: .5; cursor: default; }
 .gp-groups { flex: 1; min-height: 0; overflow: auto; }
+/* The files inside an opened stash: indented under it, and read-only — a stash
+   is a saved state, not a working set, so these rows show and diff but carry
+   none of the stage/discard actions the change rows have. */
+.gp-stash-files .gp-row { padding-left: 26px; }
+.gp-stash-files .gp-mark { font-family: var(--mono); font-size: var(--fs-badge); color: var(--text-muted); }
 .gp-empty { padding: 12px 10px; margin: 0; font-size: var(--fs-sm); color: var(--text-muted); }
 /* A sticky divider inside the list, holding "stage all" and "discard all". It
    sits between a header and a row in the hierarchy, and takes the button height
@@ -670,7 +713,11 @@ body {
    it keeps something to say. */
 .hist-refs { display: inline-flex; flex: 0 1 auto; min-width: 0; max-width: 45%; gap: 4px; }
 .hist-ref {
-  flex: 0 1 auto; min-width: 3ch; max-width: 24ch;
+  /* The cap grows with the panel. A fixed 24ch cut `origin/feature/vat-rework`
+     in a panel wide enough to show it twice over — and in gitflow the part that
+     identifies a ref is exactly the part past the twenty-fourth character. The
+     flex shrink below still yields to the subject line when space runs out. */
+  flex: 0 1 auto; min-width: 3ch; max-width: clamp(14ch, 45%, 60ch);
   overflow: hidden; white-space: nowrap;
   font-size: var(--fs-badge); padding: 1px 5px; border-radius: 999px;
   border: 1px solid var(--border); color: var(--text-muted);
@@ -698,6 +745,19 @@ body {
 .hist-gutter .g-cont { position: absolute; inset: 0; }
 .hist-files-body { flex: 1; min-width: 0; }
 .hist-body { margin: 0 0 6px; font-size: var(--fs-xs); color: var(--text-muted); white-space: pre-wrap; }
+
+/* Which side of a merge the file list belongs to. Shown only on merges, and
+   worded rather than numbered — "parent 2" is a fact about the commit object,
+   "the branch merged in" is the thing the reader is actually after. */
+.hist-parents { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 0 0 6px; }
+.hist-parents-label { font-size: var(--fs-badge); text-transform: uppercase; color: var(--text-muted); }
+.hist-parent {
+  padding: 1px 6px; font: inherit; font-size: var(--fs-xs); cursor: pointer;
+  border: 1px solid var(--border); border-radius: 999px;
+  background: transparent; color: var(--text-muted);
+}
+.hist-parent:hover { background: var(--btn-hover); color: var(--text); }
+.hist-parent.active { border-color: var(--accent); color: var(--accent); }
 /* Who and when, in full — the row above has space for a first name and "2h". */
 .hist-who {
   display: flex; flex-wrap: wrap; gap: 2px 10px; margin-bottom: 6px;
@@ -807,6 +867,24 @@ body {
 .modal-hint { margin: 0; font-size: var(--fs-xs); line-height: 1.5; color: var(--text-muted); white-space: pre-wrap; }
 .modal-hint.is-error { color: var(--bad); }
 .modal-row { display: flex; justify-content: flex-end; gap: 6px; }
+
+/* A question with three answers (pull strategy, merge strategy). Each option is
+   a full-width button carrying its own consequence, because the difference
+   between "merge" and "rebase" is the thing being asked about — a row of bare
+   verbs would put the explanation back in the user's head, which is where it
+   was not. */
+.modal-choices { display: flex; flex-direction: column; gap: 6px; }
+.modal-choice {
+  display: flex; flex-direction: column; gap: 2px; align-items: flex-start;
+  padding: 8px 10px; text-align: left; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--btn); color: var(--text); font: inherit;
+}
+.modal-choice:hover { background: var(--btn-hover); border-color: var(--accent); }
+.modal-choice:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.modal-choice.danger .modal-choice-label { color: var(--bad); }
+.modal-choice-label { font-size: var(--fs-sm); font-weight: 600; }
+.modal-choice-detail { font-size: var(--fs-xs); line-height: 1.45; color: var(--text-muted); }
 
 /* ── Capability badge ─────────────────────────────────────────────────── */
 .cap-badge { position: relative; }

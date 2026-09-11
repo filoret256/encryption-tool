@@ -58,7 +58,14 @@ var (
 	resetModes    = []string{"soft", "mixed", "hard"}
 	rebaseActions = []string{"start", "continue", "abort", "skip"}
 	stashActions  = []string{"push", "pop", "apply", "drop", "list", "clear"}
+	// cherry-pick and revert stop the same way a merge does, and are two clicks
+	// away in the history panel, so they need the same way out.
+	sequencerKinds   = []string{"cherry-pick", "revert"}
+	sequencerActions = []string{"continue", "abort", "skip"}
 	remoteActions = []string{"fetch", "pull", "push"}
+	// How `git pull` integrates: a merge commit, a rebase, or refusing anything
+	// that is not a fast-forward.
+	pullModes = []string{"merge", "rebase", "ff-only"}
 )
 
 func safeArgs(vs []string, what string) ([]string, error) {
@@ -256,13 +263,18 @@ var rebaseConflictRe = regexp.MustCompile(`(?i)conflict|could not apply`)
 // gitMerge expects to fail on conflict: git leaves conflict markers in the
 // worktree and a non-zero exit. That is reported as data, not as an error, so
 // the UI can open the conflict resolver instead of a toast.
-func gitMerge(ctx context.Context, cwd, ref string, noFf bool) (any, error) {
+func gitMerge(ctx context.Context, cwd, ref string, noFf, squash bool) (any, error) {
 	r, err := safeArg(ref, "ref")
 	if err != nil {
 		return nil, err
 	}
 	args := []string{"git", "merge", "--no-edit"}
-	if noFf {
+	// --squash stages the result and stops before committing; it is incompatible
+	// with --no-ff, and the two never arrive together because the UI asks for one
+	// strategy, not a set of flags.
+	if squash {
+		args = append(args, "--squash")
+	} else if noFf {
 		args = append(args, "--no-ff")
 	}
 	args = append(args, r)
@@ -315,6 +327,36 @@ func gitRebase(ctx context.Context, cwd, action, ref string) (any, error) {
 	return nil, &gitError{output}
 }
 
+// Finish or abandon a stopped cherry-pick or revert. `--continue` needs no
+// editor, so `--no-edit` keeps it from blocking on one that will never open.
+func gitSequencer(ctx context.Context, cwd, what, action string) (any, error) {
+	kind, err := oneOfArg(what, sequencerKinds, "sequencer command")
+	if err != nil {
+		return nil, err
+	}
+	step, err := oneOfArg(action, sequencerActions, "sequencer action")
+	if err != nil {
+		return nil, err
+	}
+	args := []string{"git", kind, "--" + step}
+	if step == "continue" {
+		args = append(args, "--no-edit")
+	}
+
+	res, err := run(ctx, args, cwd)
+	if err != nil {
+		return nil, err
+	}
+	output := strings.TrimSpace(res.stdout + res.stderr)
+	if res.code == 0 {
+		return mergeResult{Conflict: false, Output: output}, nil
+	}
+	if conflictRe.MatchString(output) {
+		return mergeResult{Conflict: true, Output: output}, nil
+	}
+	return nil, &gitError{output}
+}
+
 // ── stash ─────────────────────────────────────────────────────────────────
 
 func gitStash(ctx context.Context, cwd, action, message, ref string) (any, error) {
@@ -355,6 +397,9 @@ type remoteOpts struct {
 	ref         string
 	setUpstream bool
 	force       bool
+	// How a pull integrates what it fetched: "merge", "rebase" or "ff-only".
+	// Empty leaves it to the repository's own pull.rebase setting.
+	mode string
 }
 
 // gitRemote streams fetch/pull/push progress, which git writes to stderr, so
@@ -371,6 +416,23 @@ func gitRemote(ctx context.Context, cwd, action string, o remoteOpts, onProgress
 	}
 	if action == "push" && o.setUpstream {
 		args = append(args, "--set-upstream")
+	}
+	// Passed explicitly rather than left to `pull.rebase`, so the UI can say
+	// which one it is about to do — and so a trunk-based repository is not
+	// handed a merge commit because a config the page cannot see was not set.
+	if action == "pull" && o.mode != "" {
+		mode, err := oneOfArg(o.mode, pullModes, "pull mode")
+		if err != nil {
+			return nil, err
+		}
+		switch mode {
+		case "rebase":
+			args = append(args, "--rebase")
+		case "ff-only":
+			args = append(args, "--ff-only")
+		default:
+			args = append(args, "--no-rebase")
+		}
 	}
 	// --force-with-lease refuses to clobber commits this clone has not seen.
 	if action == "push" && o.force {

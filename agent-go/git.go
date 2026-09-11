@@ -8,9 +8,12 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type gitError struct{ msg string }
@@ -83,6 +86,189 @@ func repoRoot(ctx context.Context, cwd string) string {
 	return strings.TrimSpace(r.stdout)
 }
 
+// ── unfinished operations ─────────────────────────────────────────────────
+
+// Cached: status() wants it on every refresh — and the panel refreshes on every
+// watcher event — while the answer only changes if the folder stops being a
+// repository. A miss is not cached, so `git init` in an open folder is seen.
+var (
+	gitDirMu    sync.Mutex
+	gitDirCache = map[string]string{}
+)
+
+func gitDirOf(ctx context.Context, cwd string) string {
+	gitDirMu.Lock()
+	hit := gitDirCache[cwd]
+	gitDirMu.Unlock()
+	if hit != "" {
+		return hit
+	}
+	out, err := gitOut(ctx, cwd, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return ""
+	}
+	dir := strings.TrimSpace(out)
+	if dir != "" {
+		gitDirMu.Lock()
+		gitDirCache[cwd] = dir
+		gitDirMu.Unlock()
+	}
+	return dir
+}
+
+func stateFile(dir, name string) string {
+	b, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(name)))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func stateExists(dir, name string) bool {
+	_, err := os.Stat(filepath.Join(dir, filepath.FromSlash(name)))
+	return err == nil
+}
+
+// git writes the conflict list into MERGE_MSG as comments; the message a person
+// wants pre-filled is everything above them.
+func messageBody(raw string) string {
+	var keep []string
+	for _, l := range strings.Split(raw, "\n") {
+		if !strings.HasPrefix(l, "#") {
+			keep = append(keep, l)
+		}
+	}
+	return strings.TrimSpace(strings.Join(keep, "\n"))
+}
+
+// What operation, if any, is half-finished.
+//
+// Read from the directories git creates and removes, not from REBASE_HEAD: that
+// ref survives a *successful* rebase — it names the last commit applied — so
+// asking whether it resolves reports a rebase in progress for the rest of the
+// session, and offers a "Continue" that can only answer "no rebase in progress".
+func gitOperationOf(ctx context.Context, cwd string) *gitOperation {
+	dir := gitDirOf(ctx, cwd)
+	if dir == "" {
+		return nil
+	}
+
+	// Two rebase backends: "merge" is the default and every interactive rebase,
+	// "apply" is `--apply` and `git am`.
+	for _, backend := range []string{"rebase-merge", "rebase-apply"} {
+		stepFile, totalFile := "msgnum", "end"
+		if backend == "rebase-apply" {
+			stepFile, totalFile = "next", "last"
+		}
+		head := stateFile(dir, backend+"/head-name")
+		onto := stateFile(dir, backend+"/onto")
+		step, _ := strconv.Atoi(stateFile(dir, backend+"/"+stepFile))
+		total, _ := strconv.Atoi(stateFile(dir, backend+"/"+totalFile))
+		if head == "" && onto == "" && step == 0 {
+			continue
+		}
+		op := &gitOperation{Kind: "rebase", Step: step, Total: total}
+		op.Head = strings.TrimPrefix(head, "refs/heads/")
+		if onto != "" {
+			op.Onto = describeOid(ctx, cwd, onto)
+		}
+		return op
+	}
+
+	subject := messageBody(stateFile(dir, "MERGE_MSG"))
+	if i := strings.Index(subject, "\n"); i >= 0 {
+		subject = subject[:i]
+	}
+	for _, probe := range []struct{ file, kind string }{
+		{"MERGE_HEAD", "merge"},
+		{"CHERRY_PICK_HEAD", "cherry-pick"},
+		{"REVERT_HEAD", "revert"},
+	} {
+		if stateExists(dir, probe.file) {
+			return &gitOperation{Kind: probe.kind, Onto: subject}
+		}
+	}
+	return nil
+}
+
+// gitPreparedMessage returns the message git has written for the next commit,
+// if it has written one.
+//
+// SQUASH_MSG wins over MERGE_MSG: `merge --squash` writes both, and the squash
+// one is the useful text — the list of commits being folded in, which is
+// exactly what nobody wants to retype.
+func gitPreparedMessage(ctx context.Context, cwd string) *string {
+	dir := gitDirOf(ctx, cwd)
+	if dir == "" {
+		return nil
+	}
+	for _, name := range []string{"SQUASH_MSG", "MERGE_MSG"} {
+		if body := messageBody(stateFile(dir, name)); body != "" {
+			return &body
+		}
+	}
+	return nil
+}
+
+var fullOid = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// shortRev labels a revision. A full object id is cut to eight characters
+// because the rest is noise on a diff header; anything else is a name — a
+// branch, `stash@{0}^`, `HEAD~2` — and cutting those gives `stash@{0`, which is
+// no shorter in any useful sense and is no longer a ref.
+func shortRev(rev string) string {
+	if fullOid.MatchString(rev) {
+		return rev[:8]
+	}
+	return rev
+}
+
+// Names already worked out, by oid.
+//
+// A rebase is the one state where gitOperationOf needs a `git name-rev`, and
+// the status it belongs to is re-read on every watcher event — so a rebase that
+// sits half-applied was a git process per event to answer the same question
+// about the same commit. The answer is a property of the oid and cannot change.
+// Bounded, so a long session cannot accumulate a map of every commit touched.
+var (
+	describeMu    sync.Mutex
+	describeCache = map[string]string{}
+)
+
+const describeCacheMax = 64
+
+// A name for an oid — the branch or tag it sits on, else a short hash.
+func describeOid(ctx context.Context, cwd, oid string) string {
+	key := cwd + "\x00" + oid
+	describeMu.Lock()
+	hit, ok := describeCache[key]
+	describeMu.Unlock()
+	if ok {
+		return hit
+	}
+
+	safe, err := safeArg(oid, "commit")
+	if err != nil {
+		return oid
+	}
+	out, err := gitOut(ctx, cwd, "name-rev", "--name-only", "--refs=refs/heads/*", "--refs=refs/remotes/*", safe)
+	name := strings.TrimSpace(out)
+	answer := strings.TrimPrefix(name, "remotes/")
+	if err != nil || name == "" || name == "undefined" {
+		answer = oid
+		if len(oid) > 8 {
+			answer = oid[:8]
+		}
+	}
+	describeMu.Lock()
+	if len(describeCache) >= describeCacheMax {
+		describeCache = map[string]string{}
+	}
+	describeCache[key] = answer
+	describeMu.Unlock()
+	return answer
+}
+
 // ── status ────────────────────────────────────────────────────────────────
 
 var aheadBehind = regexp.MustCompile(`^\+(-?\d+) -(-?\d+)$`)
@@ -150,6 +336,12 @@ func gitStatusOf(ctx context.Context, cwd string) (*gitStatus, error) {
 			st.Entries = append(st.Entries, *e)
 		}
 	}
+	// Read from small files, so it costs no extra git process in the common
+	// case, and it has to arrive with the status it describes: a panel that
+	// learns about a stopped rebase one refresh later shows "(detached)" in
+	// between and invites exactly the wrong conclusion.
+	st.Operation = gitOperationOf(ctx, cwd)
+	st.PreparedMessage = gitPreparedMessage(ctx, cwd)
 	return st, nil
 }
 
@@ -377,7 +569,7 @@ func gitBranches(ctx context.Context, cwd string) ([]branch, error) {
 	return list, nil
 }
 
-func gitCommitDetail(ctx context.Context, cwd, oid string) (*commitDetail, error) {
+func gitCommitDetail(ctx context.Context, cwd, oid string, parent int) (*commitDetail, error) {
 	oid, err := safeArg(oid, "commit")
 	if err != nil {
 		return nil, err
@@ -399,22 +591,36 @@ func gitCommitDetail(ctx context.Context, cwd, oid string) (*commitDetail, error
 		return nil, err
 	}
 
-	args := []string{"show", "--no-color", "--format=", "--raw", "--numstat", "-z"}
-	// A merge shows no diff by default; compare against its first parent instead.
+	// Which side of a merge is being asked about. The first parent answers
+	// "what did this merge bring into the branch"; the second answers "what did
+	// the branch look like from the other side", which is the question a release
+	// merge is usually opened for. A plain commit has one parent and ignores it.
+	against := 1
+	var args []string
 	if len(c.Parents) > 1 {
-		args = append(args, "-m", "--first-parent")
+		if parent >= 1 && parent <= len(c.Parents) {
+			against = parent
+		}
+		// Diffed against the chosen parent by name: `show -m --first-parent` can
+		// only ever answer for the first one.
+		args = []string{"diff", "--no-color", "--raw", "--numstat", "-z", c.Parents[against-1], oid}
+	} else {
+		args = []string{"show", "--no-color", "--format=", "--raw", "--numstat", "-z", oid}
 	}
-	args = append(args, oid)
 	filesOut, err := gitOut(ctx, cwd, args...)
 	if err != nil {
 		return nil, err
 	}
 
-	return &commitDetail{
+	detail := &commitDetail{
 		Commit: c,
 		Body:   strings.TrimRight(bodyOut, "\n"),
 		Files:  parseFileList(filesOut),
-	}, nil
+	}
+	if len(c.Parents) > 1 {
+		detail.Parent = against
+	}
+	return detail, nil
 }
 
 type numstat struct {
@@ -560,6 +766,32 @@ func gitDiffPair(ctx context.Context, cwd, path, kind string, readWorktree func(
 		}, nil
 	}
 
+	// `a..b` — an explicit pair. A merge commit has two sides and `b^` names
+	// only one of them, so the file diff for the second parent has to say which
+	// two commits it means.
+	if a, b, found := strings.Cut(kind, ".."); found && a != "" && b != "" && !strings.Contains(b, ".") {
+		left, err := safeArg(a, "commit")
+		if err != nil {
+			return nil, err
+		}
+		right, err := safeArg(b, "commit")
+		if err != nil {
+			return nil, err
+		}
+		before, bBin, err := blobAt(ctx, cwd, left, path)
+		if err != nil {
+			return nil, err
+		}
+		after, aBin, err := blobAt(ctx, cwd, right, path)
+		if err != nil {
+			return nil, err
+		}
+		return &diffPair{
+			Path: path, Before: before, After: after,
+			BeforeLabel: shortRev(left), AfterLabel: shortRev(right), Binary: bBin || aBin,
+		}, nil
+	}
+
 	// Anything else is a commit-ish, which means it is client data reaching an
 	// argv — the one branch here that has to be checked.
 	rev, err := safeArg(kind, "commit")
@@ -607,6 +839,10 @@ func gitBlame(ctx context.Context, cwd, path string) ([]blameRow, error) {
 			cur.Author = line[len("author "):]
 		case strings.HasPrefix(line, "author-time "):
 			cur.Time, _ = strconv.ParseInt(line[len("author-time "):], 10, 64)
+		// `--line-porcelain` already carries the subject of the commit each line
+		// came from; sending it saves the UI a round trip per commit.
+		case strings.HasPrefix(line, "summary "):
+			cur.Summary = line[len("summary "):]
 		case strings.HasPrefix(line, "\t"):
 			rows = append(rows, *cur)
 			cur = nil

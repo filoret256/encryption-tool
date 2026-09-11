@@ -15,6 +15,24 @@ import { fileIcon } from "./file-icons.ts";
 const ROW = ROW_H;
 /** Rows rendered above and below the viewport to hide scroll tearing. */
 const OVERSCAN = 8;
+/** How far a run of single-child folders is followed in one go. */
+const CHAIN_MAX = 16;
+
+/** The run of folders starting at `n`, each holding exactly one folder.
+ *
+ *  Only over folders that are already listed and open: this reads what the tree
+ *  knows, and `openSingleChildChain` is what makes it know. A chain of one is
+ *  the ordinary case and means "draw this row as itself". */
+function chainOf(n: TreeNode): TreeNode[] {
+  const out = [n];
+  let cur = n;
+  while (cur.dir && cur.expanded && cur.loaded && cur.children.length === 1 && cur.children[0].dir && cur.children[0].loaded) {
+    cur = cur.children[0];
+    out.push(cur);
+    if (out.length > CHAIN_MAX) break;
+  }
+  return out;
+}
 
 interface TreeNode {
   path: string;
@@ -128,6 +146,9 @@ export class FileTree {
    *  and a field assigned from four call sites kept two of them wrong. */
   private compareBase: string | null = null;
   private compareBaseDir = false;
+  /** Rows that stand for a run of folders: the last folder's path -> the first
+   *  one (what collapsing the row folds away) and the joined label. */
+  private chains = new Map<string, { head: TreeNode; label: string }>();
   /** The last reversible file operation. One deep: this is a safety net for
    *  the drop that landed in the wrong folder, not an edit history. */
   private lastOp: Undoable | null = null;
@@ -312,10 +333,50 @@ export class FileTree {
       // when git has answered. A listing that waited for it would be a folder
       // that opens slowly to say the same thing.
       void this.markIgnored(node);
+      // A folder whose only entry is another folder is opened along with it, so
+      // the two can be drawn as one row (see chainOf). Without this the chain
+      // could not be collapsed at all: nothing knows a folder holds a single
+      // child until that folder has been listed, and `src/main/java/com/acme`
+      // is five clicks and five levels of indentation before the first file.
+      await this.openSingleChildChain(node);
     } catch (e) {
       this.cb.onError(e instanceof Error ? e.message : String(e));
     }
     this.rebuild();
+  }
+
+  /** Follow a run of folders that each hold exactly one folder, listing them.
+   *
+   *  Java packages are the reason this exists — `src/main/java/com/acme/billing`
+   *  is six rows of nothing before a single file — but it is the same shape in
+   *  `roles/common/tasks` and in any generated layout. Capped: a deep tree of
+   *  single folders should cost a bounded number of listings, not an unbounded
+   *  walk on one click.
+   */
+  private async openSingleChildChain(node: TreeNode): Promise<void> {
+    let cur = node;
+    for (let i = 0; i < CHAIN_MAX; i++) {
+      const only = cur.children.length === 1 ? cur.children[0] : null;
+      if (!only?.dir || only.loaded) return;
+      try {
+        const entries = await this.ops.readDir(only.path);
+        only.children = entries.map((e) => ({
+          path: join(only.path, e.name),
+          name: e.name,
+          dir: e.dir,
+          depth: only.depth + 1,
+          expanded: false,
+          loaded: false,
+          children: [],
+        }));
+        only.loaded = true;
+        only.expanded = true;
+        void this.markIgnored(only);
+      } catch {
+        return; // a folder that cannot be listed simply ends the chain
+      }
+      cur = only;
+    }
   }
 
   /** Ask git which of a listed folder's entries it ignores, and repaint if the
@@ -365,13 +426,21 @@ export class FileTree {
       return n.dir && n.children.some(keep);
     };
 
+    this.chains.clear();
     const walk = (n: TreeNode): void => {
       for (const c of n.children) {
         if (!keep(c)) continue;
-        this.rows.push(c);
+        // A run of folders that each hold one folder is drawn as one row —
+        // "main/java/com/acme/billing" — with the row standing for the last of
+        // them. Not while filtering: the filter matches names, and a joined
+        // label is not one of the names it matched against.
+        const chain = needle ? [c] : chainOf(c);
+        const last = chain[chain.length - 1];
+        if (chain.length > 1) this.chains.set(last.path, { head: c, label: chain.map((x) => x.name).join("/") });
+        this.rows.push(last);
         // A filter expands what it matches inside: the point is to see the
         // hits, not to be told a folder somewhere below has one.
-        if (c.dir && (c.expanded || (needle && c.loaded))) walk(c);
+        if (last.dir && (last.expanded || (needle && last.loaded))) walk(last);
       }
     };
     walk(this.root);
@@ -409,6 +478,19 @@ export class FileTree {
     this.filterBox.hidden = true;
     this.rebuild();
     this.viewport.focus();
+  }
+
+  /** Close a row, folding away the whole run it stands for.
+   *
+   *  Collapsing the *last* folder of a compacted row would leave the row on
+   *  screen with a closed caret and nothing under it — the folders above it in
+   *  the run are still open, and the row is all of them. */
+  private collapseRow(node: TreeNode): void {
+    const chain = this.chains.get(node.path);
+    for (let n: TreeNode | null = chain?.head ?? node; n; n = n.children.length === 1 && n.children[0].dir ? n.children[0] : null) {
+      n.expanded = false;
+      if (n === node) break;
+    }
   }
 
   /** Fold everything shut. The root stays open — it is the tree. */
@@ -484,10 +566,20 @@ export class FileTree {
     // shows as untracked is the pair of facts a build folder always has.
     if (this.isIgnored(n.path)) cls.push("dec-ignored");
 
-    return `<div class="${cls.join(" ")}" draggable="true" data-path="${esc(n.path)}" data-depth="${n.depth}">
+    // A compacted row sits at the depth of the first folder in its run and
+    // carries the whole run as its name; everything else about it — the path it
+    // acts on, its decorations — belongs to the last folder, which is the one
+    // that actually holds the files.
+    const chain = this.chains.get(n.path);
+    const depth = chain ? chain.head.depth : n.depth;
+    const label = chain ? chain.label : n.name;
+
+    return `<div class="${cls.join(" ")}" draggable="true" data-path="${esc(n.path)}" data-depth="${depth}"${
+      chain ? ` data-chain-head="${esc(chain.head.path)}" title="${esc(n.path)}"` : ""
+    }>
       <span class="tree-caret">${n.dir ? (n.expanded ? "▾" : "▸") : ""}</span>
       <span class="tree-icon">${fileIcon(n.name, n.dir)}</span>
-      <span class="tree-name">${esc(n.name)}</span>
+      <span class="tree-name">${esc(label)}</span>
       ${n.path === this.compareBase ? `<span class="tree-compare" title="Marked for comparison">⇄</span>` : ""}
       <span class="tree-mark">${mark}</span>
     </div>`;
@@ -530,7 +622,7 @@ export class FileTree {
       return;
     }
     if (node.expanded) {
-      node.expanded = false;
+      this.collapseRow(node);
       this.rebuild();
       return;
     }
@@ -809,7 +901,7 @@ export class FileTree {
       case "ArrowLeft": {
         const n = this.rows[i];
         if (n?.dir && n.expanded) {
-          n.expanded = false;
+          this.collapseRow(n);
           this.rebuild();
         } else if (n) {
           this.selected = dirname(n.path);

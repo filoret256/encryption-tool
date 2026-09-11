@@ -67,8 +67,58 @@ function parseGo(source: string): Map<string, string[]> {
   return out;
 }
 
+// ── the op tables ─────────────────────────────────────────────────────────
+//
+// Types matching is not enough, and this is not theoretical: `git.remote` grew
+// a `mode` parameter, it was wired into the Go agent and forgotten in the
+// TypeScript one, every type still lined up, and the symptom was a pull that
+// silently went on merging. The op names and the parameter names each agent
+// reads are the other half of the wire contract.
+
+const TS_OPS_FILE = "src/agent/main.ts";
+const GO_OPS_FILE = "agent-go/server.go";
+
+/** An op name -> the parameter names that implementation reads for it. */
+type OpTable = Map<string, Set<string>>;
+
+/** Split a table body into `name -> the source text of its handler`.
+ *
+ *  Both files are one flat table of `"op.name": <handler>`, so the text of a
+ *  handler is everything up to the next op name. That is cruder than parsing
+ *  the language and it is enough: the parameter reads are inside it either way.
+ */
+function opBodies(source: string, from: string): Map<string, string> {
+  const body = decomment(source.slice(source.indexOf(from)));
+  const re = /"([a-z]+\.[A-Za-z]+)"\s*:/g;
+  const found: { name: string; at: number }[] = [];
+  for (let m = re.exec(body); m; m = re.exec(body)) found.push({ name: m[1], at: m.index + m[0].length });
+  const out = new Map<string, string>();
+  for (const [i, entry] of found.entries()) {
+    out.set(entry.name, body.slice(entry.at, found[i + 1]?.at ?? body.length));
+  }
+  return out;
+}
+
+/** `str(p.ref)`, `Boolean(p.noFf)`, `p.limit` — all of them are `p.<name>`. */
+function tsParams(handler: string): Set<string> {
+  return new Set([...handler.matchAll(/\bp\.([A-Za-z_]\w*)/g)].map((m) => m[1]));
+}
+
+/** `p.str("ref")`, `p.truthy("noFf")`, `p.number("limit", 0)`, `p.strs(…)`. */
+function goParams(handler: string): Set<string> {
+  return new Set([...handler.matchAll(/\bp\.(?:str|strs|truthy|number|value)\("([^"]+)"/g)].map((m) => m[1]));
+}
+
+function opTable(source: string, from: string, params: (h: string) => Set<string>): OpTable {
+  const out: OpTable = new Map();
+  for (const [name, handler] of opBodies(source, from)) out.set(name, params(handler));
+  return out;
+}
+
 const ts = parseTs(await readFile(TS_FILE, "utf8"));
 const go = parseGo(await readFile(GO_FILE, "utf8"));
+const tsOps = opTable(await readFile(TS_OPS_FILE, "utf8"), "agent.info", tsParams);
+const goOps = opTable(await readFile(GO_OPS_FILE, "utf8"), "agent.info", goParams);
 
 if (ts.size === 0) throw new Error(`${TS_FILE} parsed to zero interfaces — the format changed`);
 if (go.size === 0) throw new Error(`${GO_FILE} parsed to zero structs — the format changed`);
@@ -108,6 +158,38 @@ for (const [name, tsFields] of ts) {
 
 // A Go struct with no TypeScript interface is fine — blameRow, for one, mirrors
 // an inline return type — so only the other direction is an error.
+
+// ── ops ───────────────────────────────────────────────────────────────────
+
+if (tsOps.size === 0) throw new Error(`${TS_OPS_FILE} parsed to zero ops — the table format changed`);
+if (goOps.size === 0) throw new Error(`${GO_OPS_FILE} parsed to zero ops — the table format changed`);
+
+const onlyIn = (a: Iterable<string>, b: { has(v: string): boolean }): string[] => [...a].filter((v) => !b.has(v));
+
+const missingOps = onlyIn(tsOps.keys(), goOps);
+const extraOps = onlyIn(goOps.keys(), tsOps);
+if (missingOps.length) problems.push(`ops only in ${TS_OPS_FILE}: ${missingOps.join(", ")}`);
+if (extraOps.length) problems.push(`ops only in ${GO_OPS_FILE}: ${extraOps.join(", ")}`);
+
+let opsCompared = 0;
+for (const [name, tsP] of tsOps) {
+  const goP = goOps.get(name);
+  if (!goP) continue; // already reported above
+  opsCompared++;
+  // Only parameters *read from the request* are compared. A handler is free to
+  // call whatever it likes internally; what has to agree is the set of names
+  // the two agents will look for in the same frame.
+  const missing = onlyIn(tsP, goP);
+  const extra = onlyIn(goP, tsP);
+  if (missing.length || extra.length) {
+    problems.push(
+      `${name}:` +
+        (missing.length ? `\n    params read only by ${TS_OPS_FILE}: ${missing.join(", ")}` : "") +
+        (extra.length ? `\n    params read only by ${GO_OPS_FILE}: ${extra.join(", ")}` : ""),
+    );
+  }
+}
+console.log(`  ok    ${String(opsCompared).padStart(3)} op(s), same names, same parameters`);
 
 console.log("");
 if (problems.length) {

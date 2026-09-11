@@ -118,6 +118,20 @@ type statusEntry struct {
 	Conflict  bool   `json:"conflict,omitempty"`
 }
 
+// A git operation that stopped part-way and is waiting to be finished: merge,
+// rebase, cherry-pick or revert. During a rebase HEAD is detached, so without
+// this the UI can only report "(detached)".
+type gitOperation struct {
+	Kind string `json:"kind"`
+	// Branch the operation started on; absent for a merge, where HEAD stays put.
+	Head string `json:"head,omitempty"`
+	// What the work is replayed onto (rebase) or the prepared subject line.
+	Onto string `json:"onto,omitempty"`
+	// Position in a multi-commit rebase.
+	Step  int `json:"step,omitempty"`
+	Total int `json:"total,omitempty"`
+}
+
 type gitStatus struct {
 	Branch *string `json:"branch"`
 	// null for a detached HEAD or an unborn branch.
@@ -126,6 +140,13 @@ type gitStatus struct {
 	Behind   int           `json:"behind"`
 	Oid      *string       `json:"oid"`
 	Entries  []statusEntry `json:"entries"`
+	// Set while a merge/rebase/cherry-pick/revert is half-finished.
+	Operation *gitOperation `json:"operation"`
+	// The commit message git has already written for the next commit, comment
+	// lines stripped: MERGE_MSG after a stopped merge or cherry-pick, SQUASH_MSG
+	// after `merge --squash`. A squash leaves no half-finished operation, so this
+	// cannot live on Operation.
+	PreparedMessage *string `json:"preparedMessage"`
 }
 
 type commit struct {
@@ -183,13 +204,19 @@ type commitDetail struct {
 	Commit commit       `json:"commit"`
 	Body   string       `json:"body"`
 	Files  []commitFile `json:"files"`
+	// For a merge: which parent the file list was diffed against, 1-based.
+	// Absent for an ordinary commit, which has only one side to compare with.
+	Parent int `json:"parent,omitempty"`
 }
 
+// One line of `git blame`. Mirrors BlameRow in src/agent/protocol.ts.
 type blameRow struct {
 	Oid    string `json:"oid"`
 	Author string `json:"author"`
 	Time   int64  `json:"time"`
 	Line   int    `json:"line"`
+	// Subject of the commit this line came from, as git's porcelain reports it.
+	Summary string `json:"summary"`
 }
 
 type searchHit struct {

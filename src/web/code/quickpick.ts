@@ -156,9 +156,33 @@ export function quickPick(opts: QuickPickOptions): Promise<string | null> {
       active = 0;
       render();
     });
+    // A click selects; it does not act.
+    //
+    // It used to do both, in a dialog that also carries a "switch" / "go"
+    // button — so the button was a lie, and clicking a branch in "Switch to…"
+    // started the checkout before the user had looked at what else was on the
+    // list. Worse, the confirmation that sometimes follows (stash these changes
+    // first?) then looked like the *first* step, and dismissing it left no
+    // trace of an operation having been started at all.
+    //
+    // Where there is no button — the command palette, quick open — a click is
+    // the only gesture available and still acts immediately.
+    const clickActs = opts.buttons === false;
     list.addEventListener("click", (e) => {
       const row = (e.target as HTMLElement).closest<HTMLElement>(".pick-row");
       if (!row) return;
+      active = Number(row.dataset.i);
+      if (clickActs) return choose();
+      render();
+      // Keep the keyboard where the typing happens: after picking a row with
+      // the mouse, Enter should still confirm it.
+      filter.focus();
+    });
+    // Double-click is the shortcut for people who know what they want, and the
+    // gesture the old single click was standing in for.
+    list.addEventListener("dblclick", (e) => {
+      const row = (e.target as HTMLElement).closest<HTMLElement>(".pick-row");
+      if (!row || clickActs) return;
       active = Number(row.dataset.i);
       choose();
     });
@@ -168,7 +192,15 @@ export function quickPick(opts: QuickPickOptions): Promise<string | null> {
     });
     back.querySelector(".cancel")?.addEventListener("click", () => done(null));
     back.addEventListener("click", (e) => {
-      if (e.target === back) done(null);
+      if (e.target !== back) return;
+      // Backdrop click closes the palette, where there is nothing to lose and
+      // no button to press instead. In a dialog that is about to merge or check
+      // out something, it does not: a stray click outside used to cancel the
+      // whole thing with no message anywhere, which is indistinguishable from
+      // the app having ignored you. Escape and "cancel" are still there, and
+      // both are unambiguous.
+      if (clickActs) return done(null);
+      filter.focus();
     });
     document.addEventListener("keydown", onKey, true);
 

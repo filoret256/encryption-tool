@@ -305,7 +305,7 @@ const OPS: Record<string, (ctx: Ctx, p: Req) => Promise<unknown>> = {
   "git.branches": (c) => git.branches(c.cwd),
   "git.checkIgnore": (c, p) => git.checkIgnore(c.cwd, strs(p.paths)),
   "git.reflog": (c, p) => git.reflog(c.cwd, num(p.limit) || 50),
-  "git.commitDetail": (c, p) => git.commitDetail(c.cwd, str(p.oid)),
+  "git.commitDetail": (c, p) => git.commitDetail(c.cwd, str(p.oid), num(p.parent) || 1),
   "git.blob": (c, p) => git.blobAt(c.cwd, str(p.rev), str(p.path)),
   "git.blame": (c, p) => git.blame(c.cwd, str(p.path)),
   "git.diff": (c, p) =>
@@ -341,10 +341,16 @@ const OPS: Record<string, (ctx: Ctx, p: Req) => Promise<unknown>> = {
   "git.tagDelete": (c, p) => gw.tagDelete(c.cwd, str(p.name)),
 
   // ── git: merge / rebase / stash ──
-  "git.merge": (c, p) => gw.merge(c.cwd, str(p.ref), Boolean(p.noFf)),
+  "git.merge": (c, p) => gw.merge(c.cwd, str(p.ref), Boolean(p.noFf), Boolean(p.squash)),
   "git.mergeAbort": (c) => gw.mergeAbort(c.cwd),
   "git.rebase": (c, p) =>
     gw.rebase(c.cwd, (str(p.action) || "start") as "start" | "continue" | "abort" | "skip", p.ref ? str(p.ref) : undefined),
+  "git.sequencer": (c, p) =>
+    gw.sequencer(
+      c.cwd,
+      (str(p.what) || "cherry-pick") as "cherry-pick" | "revert",
+      (str(p.action) || "abort") as "continue" | "abort" | "skip",
+    ),
   "git.stash": (c, p) =>
     gw.stash(c.cwd, (str(p.action) || "list") as "push" | "pop" | "apply" | "drop" | "list" | "clear", {
       message: p.message ? str(p.message) : undefined,
@@ -368,6 +374,7 @@ const OPS: Record<string, (ctx: Ctx, p: Req) => Promise<unknown>> = {
         ref: p.ref ? str(p.ref) : undefined,
         setUpstream: Boolean(p.setUpstream),
         force: Boolean(p.force),
+        mode: p.mode ? str(p.mode) : undefined,
       },
       (line) => c.send({ id: c.id, chunk: { progress: line } }),
     ),
