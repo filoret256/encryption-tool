@@ -14,6 +14,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -28,6 +29,80 @@ func (e *jailError) errCode() string { return "EPATH" }
 func escapes(p string) *jailError { return &jailError{"Path escapes the workspace", p} }
 
 func insideGitDir(p string) *jailError { return &jailError{"Path is inside the git directory", p} }
+
+// errUnreadableLink is returned when a path component is a reparse point whose
+// target cannot be read. It is not "the path does not exist" and must never be
+// treated as one: an unreadable link is a link this code cannot vouch for, and
+// the containment check exists precisely to refuse what it cannot vouch for.
+var errUnreadableLink = errors.New("cannot resolve link")
+
+// resolveLinks canonicalises a path, following every kind of link.
+//
+// filepath.EvalSymlinks is not enough on Windows. An NTFS *junction* — which
+// any unprivileged process can create with `mklink /J` — is a reparse point
+// that Go reports from os.Lstat as ModeIrregular rather than ModeSymlink, and
+// that EvalSymlinks hands back unchanged instead of resolving. Both halves of
+// the containment check were therefore blind to it: a junction inside the
+// workspace pointing anywhere on the disk let a write land outside, while every
+// string involved stayed inside and every lexical check passed. The TypeScript
+// agent refuses these, because Node's lstat reports a junction as a symlink and
+// realpath resolves it; the two implementations disagreed, and the
+// cross-implementation smoke test is what surfaced it.
+//
+// os.Readlink *does* read a junction's target, so reparse points are expanded
+// here first and EvalSymlinks is left to finish the job on ordinary symlinks.
+func resolveLinks(p string) (string, error) {
+	// The cap mirrors what the kernel does for symlink chains: a loop of links
+	// must terminate as an error rather than as a hang.
+	for i := 0; i < 40; i++ {
+		next, expanded, err := expandReparse(p)
+		if err != nil {
+			return "", err
+		}
+		if !expanded {
+			return filepath.EvalSymlinks(p)
+		}
+		p = next
+	}
+	return "", errUnreadableLink
+}
+
+// expandReparse replaces the first reparse point on the path with its target.
+//
+// Component by component from the volume root, because any directory on the way
+// may be a link out — not just the last one.
+func expandReparse(p string) (string, bool, error) {
+	vol := filepath.VolumeName(p)
+	rest := strings.Trim(filepath.ToSlash(strings.TrimPrefix(p, vol)), "/")
+	if rest == "" {
+		return p, false, nil
+	}
+	parts := strings.Split(rest, "/")
+	prefix := vol + string(filepath.Separator)
+	for i, seg := range parts {
+		prefix = filepath.Join(prefix, seg)
+		fi, err := os.Lstat(prefix)
+		if err != nil {
+			// This component does not exist yet, so neither it nor anything
+			// below it can be a link. Callers that care about non-existence
+			// handle it themselves.
+			return p, false, nil
+		}
+		// ModeIrregular as well as ModeSymlink: that is how a junction arrives.
+		if fi.Mode()&(os.ModeSymlink|os.ModeIrregular) == 0 {
+			continue
+		}
+		target, rerr := os.Readlink(prefix)
+		if rerr != nil {
+			return "", false, errUnreadableLink
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(prefix), target)
+		}
+		return filepath.Join(append([]string{target}, parts[i+1:]...)...), true, nil
+	}
+	return p, false, nil
+}
 
 // isGitDirName reports whether a path segment names the git directory.
 //
@@ -55,7 +130,7 @@ func openJail(dir string) (*jail, error) {
 	if err != nil {
 		return nil, err
 	}
-	real, err := filepath.EvalSymlinks(abs)
+	real, err := resolveLinks(abs)
 	if err != nil {
 		return nil, err
 	}
@@ -117,10 +192,14 @@ func (j *jail) toAbsExisting(wire string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	real, err := filepath.EvalSymlinks(abs)
+	real, err := resolveLinks(abs)
 	if err != nil {
-		// ENOENT and friends surface from the actual operation, with the message
-		// the operation itself would have produced.
+		// A link we cannot read is refused; anything else (ENOENT and friends)
+		// surfaces from the actual operation, with the message the operation
+		// itself would have produced.
+		if errors.Is(err, errUnreadableLink) {
+			return "", escapes(wire)
+		}
 		return abs, nil
 	}
 	if !contains(j.root, real) {
@@ -161,8 +240,11 @@ func (j *jail) toAbsForWrite(wire string) (string, error) {
 		return "", err
 	}
 
-	if info, lerr := os.Lstat(abs); lerr == nil && info.Mode()&os.ModeSymlink != 0 {
-		real, rerr := filepath.EvalSymlinks(abs)
+	// ModeIrregular as well as ModeSymlink — see resolveLinks: that is how a
+	// Windows junction arrives, and it was the half of this check that a
+	// junction walked straight past.
+	if info, lerr := os.Lstat(abs); lerr == nil && info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 {
+		real, rerr := resolveLinks(abs)
 		if rerr != nil || !contains(j.root, real) {
 			return "", escapes(wire)
 		}
@@ -170,7 +252,7 @@ func (j *jail) toAbsForWrite(wire string) (string, error) {
 	}
 
 	for dir := filepath.Dir(abs); ; {
-		if real, rerr := filepath.EvalSymlinks(dir); rerr == nil {
+		if real, rerr := resolveLinks(dir); rerr == nil {
 			if !contains(j.root, real) {
 				return "", escapes(wire)
 			}

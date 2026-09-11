@@ -79,6 +79,29 @@ type fileRead struct {
 	Mtime    int64   `json:"mtime"`
 	Binary   bool    `json:"binary"`
 	TooLarge bool    `json:"tooLarge"`
+	// Byte offset Text starts at. 0 for an ordinary whole-file read.
+	//
+	// A read with a length is a window onto a file too big to open whole: the
+	// editor shows that slice read-only rather than the "too large" placeholder
+	// that used to be the only answer. The offset is where the agent actually
+	// started, which is not always where it was asked to — a window must not
+	// begin in the middle of a UTF-8 character.
+	Offset int64 `json:"offset"`
+	// Whether Text runs to the end of the file.
+	Eof bool `json:"eof"`
+}
+
+// One line of `git reflog`: where a ref has been, and how it got there.
+type reflogEntry struct {
+	// "HEAD@{3}" — what to pass back to reset onto this point.
+	Selector string `json:"selector"`
+	Oid      string `json:"oid"`
+	// The verb git recorded: "commit", "reset", "checkout", "merge"…
+	Action string `json:"action"`
+	// The rest of the line: a commit subject, "moving to main", and so on.
+	Message string `json:"message"`
+	// Unix seconds.
+	Time int64 `json:"time"`
 }
 
 // One row of `git status --porcelain=v2`.

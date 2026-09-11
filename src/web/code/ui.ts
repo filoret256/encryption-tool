@@ -111,6 +111,10 @@ export interface MenuItem {
   hint?: string;
   /** A rule above this item. Use it to break a long menu into groups. */
   separated?: boolean;
+  /** Shown, greyed, and not clickable. For an action that belongs in this menu
+   *  but is not available yet: the label says why, which an item that simply
+   *  is not there cannot. */
+  disabled?: boolean;
 }
 
 /** Anything callers may hand to showMenu: the old pair form still works. */
@@ -134,6 +138,7 @@ export function showMenu(x: number, y: number, entries: MenuEntry[]): void {
   const close = (restoreFocus: boolean): void => {
     menu.remove();
     document.removeEventListener("keydown", onKey, true);
+    document.removeEventListener("contextmenu", onOutsideContext, true);
     if (restoreFocus) opener?.focus?.();
   };
 
@@ -144,6 +149,9 @@ export function showMenu(x: number, y: number, entries: MenuEntry[]): void {
     b.setAttribute("role", "menuitem");
     if (item.danger) b.classList.add("danger");
     if (item.separated) b.classList.add("separated");
+    // `disabled` also takes it out of the arrow-key walk below, which reads
+    // the same list the focus trap does.
+    if (item.disabled) b.disabled = true;
     const label = document.createElement("span");
     label.textContent = item.label;
     b.appendChild(label);
@@ -161,10 +169,15 @@ export function showMenu(x: number, y: number, entries: MenuEntry[]): void {
     menu.appendChild(b);
   }
 
+  // A disabled button cannot take focus, so stepping onto one would leave the
+  // arrow keys doing nothing at all: they are stepped over instead.
+  const live = (): HTMLButtonElement[] => buttons.filter((b) => !b.disabled);
   const move = (delta: number): void => {
-    const at = buttons.indexOf(document.activeElement as HTMLButtonElement);
-    const next = (at + delta + buttons.length) % buttons.length;
-    buttons[at === -1 ? (delta > 0 ? 0 : buttons.length - 1) : next]?.focus();
+    const usable = live();
+    if (!usable.length) return;
+    const at = usable.indexOf(document.activeElement as HTMLButtonElement);
+    const next = (at + delta + usable.length) % usable.length;
+    usable[at === -1 ? (delta > 0 ? 0 : usable.length - 1) : next]?.focus();
   };
 
   // Captured, so the tree's own key handling does not act on keys meant for
@@ -174,20 +187,43 @@ export function showMenu(x: number, y: number, entries: MenuEntry[]): void {
       case "Escape": e.preventDefault(); return close(true);
       case "ArrowDown": e.preventDefault(); return move(1);
       case "ArrowUp": e.preventDefault(); return move(-1);
-      case "Home": e.preventDefault(); return buttons[0]?.focus();
-      case "End": e.preventDefault(); return buttons[buttons.length - 1]?.focus();
+      case "Home": e.preventDefault(); return live()[0]?.focus();
+      case "End": e.preventDefault(); return live().at(-1)?.focus();
       case "Tab": e.preventDefault(); return move(e.shiftKey ? -1 : 1);
     }
   }
   document.addEventListener("keydown", onKey, true);
 
   document.body.appendChild(menu);
-  // Keep it on screen when opened near the right or bottom edge.
   const r = menu.getBoundingClientRect();
   if (r.right > innerWidth) menu.style.left = `${innerWidth - r.width - 4}px`;
-  if (r.bottom > innerHeight) menu.style.top = `${innerHeight - r.height - 4}px`;
-  buttons[0]?.focus();
-  setTimeout(() => document.addEventListener("click", () => close(false), { once: true }));
+  // Near the bottom, hang the menu *above* the cursor instead of sliding it up
+  // the screen. Sliding put it over the row that was clicked — the one piece of
+  // context the reader needs while choosing — and left it nowhere near the
+  // pointer. Growing upwards keeps the clicked row visible and the menu under
+  // the hand.
+  if (r.bottom > innerHeight) {
+    const above = y - r.height;
+    menu.style.top = above >= 4 ? `${above}px` : `${Math.max(4, innerHeight - r.height - 4)}px`;
+  }
+  live()[0]?.focus();
+  setTimeout(() => {
+    // A right-click elsewhere should move the menu, not leave two of them
+    // behind: showMenu removes the old element, but its key handler would stay
+    // registered and keep answering Escape and the arrows.
+    document.addEventListener("click", () => close(false), { once: true });
+    document.addEventListener("contextmenu", onOutsideContext, true);
+  });
+
+  function onOutsideContext(e: Event): void {
+    if (menu.contains(e.target as Node)) {
+      // Inside the menu: a right-click here is a miss, not a command.
+      e.preventDefault();
+      return;
+    }
+    document.removeEventListener("contextmenu", onOutsideContext, true);
+    close(false);
+  }
 }
 
 /** Hold the keyboard inside a dialog, and give it back when the dialog goes.
@@ -305,12 +341,35 @@ export function modalConfirm(opts: ConfirmOptions): Promise<boolean> {
   });
 }
 
+/** Text destined for an element that truncates at its *start*.
+ *
+ *  Those elements get that behaviour from `direction: rtl`, which is a
+ *  presentation trick with a real consequence: in an RTL paragraph the bidi
+ *  algorithm moves neutral characters at the edges to the other end. A string
+ *  beginning with `$`, `.` or `/` is therefore reordered — `.gitignore` renders
+ *  as `gitignore.` and `$ANSIBLE_VAULT;…` puts its `$` after the last word.
+ *
+ *  A leading U+200E (LEFT-TO-RIGHT MARK) is a strong LTR character, so the
+ *  neutrals after it join the Latin run and stay put. It has to be part of the
+ *  text node — a `::before` carrying it fixes the order but reverts the
+ *  truncation to the end, which is the thing these elements exist to avoid.
+ */
+export const startTrimmed = (text: string): string => `‎${text}`;
+
 export interface PromptOptions {
   title: string;
   value?: string;
   placeholder?: string;
   hint?: string;
   okLabel?: string;
+  /** Masks the field and turns off autocomplete and spellcheck. Used for
+   *  vault passwords, which are typed in front of whoever is standing behind
+   *  the person typing them. */
+  password?: boolean;
+  /** A second field that has to match the first. Only makes sense with
+   *  `password`: an encryption password is not checked against anything, so a
+   *  typo in it is discovered when the file can no longer be opened. */
+  confirm?: boolean;
 }
 
 export function modalPrompt(opts: PromptOptions): Promise<string | null> {
@@ -319,15 +378,22 @@ export function modalPrompt(opts: PromptOptions): Promise<string | null> {
     back.className = "modal-back";
     back.innerHTML = `<form class="modal">
       <label>${esc(opts.title)}</label>
-      <input class="t-input" value="${esc(opts.value ?? "")}" placeholder="${esc(opts.placeholder ?? "")}"
-             autocomplete="off" spellcheck="false" />
+      <div class="modal-field">
+        <input class="t-input js-value" type="${opts.password ? "password" : "text"}"
+               value="${esc(opts.value ?? "")}" placeholder="${esc(opts.placeholder ?? "")}"
+               autocomplete="off" spellcheck="false" />
+        ${opts.password ? `<button class="t-icon js-reveal" type="button" aria-label="Show what is typed" title="Show">👁</button>` : ""}
+      </div>
+      ${opts.confirm ? `<input class="t-input js-confirm" type="password" placeholder="repeat it" autocomplete="off" spellcheck="false" />` : ""}
       ${opts.hint ? `<p class="modal-hint">${esc(opts.hint)}</p>` : ""}
+      <p class="modal-hint is-error js-err" hidden></p>
       <div class="modal-row">
         <button type="button" class="t-btn cancel">cancel</button>
         <button type="submit" class="t-btn t-btn-primary">${esc(opts.okLabel ?? "ok")}</button>
       </div></form>`;
 
-    const input = back.querySelector("input")!;
+    const input = back.querySelector<HTMLInputElement>(".js-value")!;
+    const confirm = back.querySelector<HTMLInputElement>(".js-confirm");
     const form = back.querySelector<HTMLElement>("form")!;
     markDialog(form, form.querySelector("label"));
     const release = trapFocus(form);
@@ -344,7 +410,22 @@ export function modalPrompt(opts: PromptOptions): Promise<string | null> {
 
     back.querySelector("form")!.addEventListener("submit", (e) => {
       e.preventDefault();
-      done(input.value.trim() || null);
+      // A password is taken as typed: trailing spaces are part of it, and
+      // trimming one away would produce a file nothing can open again.
+      const value = opts.password ? input.value : input.value.trim();
+      if (confirm && value !== confirm.value) {
+        const err = back.querySelector<HTMLElement>(".js-err")!;
+        err.hidden = false;
+        err.textContent = "The two passwords are different.";
+        confirm.focus();
+        confirm.select();
+        return;
+      }
+      done(value || null);
+    });
+    back.querySelector(".js-reveal")?.addEventListener("click", () => {
+      input.type = input.type === "password" ? "text" : "password";
+      input.focus();
     });
     back.querySelector(".cancel")!.addEventListener("click", () => done(null));
     back.addEventListener("click", (e) => {

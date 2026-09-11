@@ -12,6 +12,7 @@
 import { readFile } from "node:fs/promises";
 import { iter, run } from "./proc.ts";
 import { isBinary } from "./fs-ops.ts";
+import { readOnly } from "./git.ts";
 import type { SearchHit, SearchSummary } from "./protocol.ts";
 
 export interface SearchOpts {
@@ -129,7 +130,7 @@ interface RgMessage {
 // ── fallback ──────────────────────────────────────────────────────────────
 
 async function* jsSearch(root: string, o: SearchOpts, cap: number, signal: Signal): AsyncGenerator<SearchHit, SearchSummary> {
-  const listed = await run(["git", "ls-files", "-co", "--exclude-standard", "-z"], root);
+  const listed = await run(readOnly(["ls-files", "-co", "--exclude-standard", "-z"]), root);
   const paths = listed.code === 0 ? listed.stdout.split("\0").filter(Boolean) : [];
 
   let src = o.regex ? o.query : escapeRe(o.query);

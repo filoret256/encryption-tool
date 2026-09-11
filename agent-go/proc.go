@@ -57,7 +57,17 @@ func exitCode(err error) (int, error) {
 }
 
 func run(ctx context.Context, argv []string, cwd string) (runResult, error) {
+	return runStdin(ctx, argv, cwd, "")
+}
+
+// runStdin feeds the process and closes the pipe. `git apply` reads its patch
+// that way and has no other way in — a patch is not an argv. An empty string
+// leaves stdin closed from the start, which is what every other caller wants.
+func runStdin(ctx context.Context, argv []string, cwd, stdin string) (runResult, error) {
 	cmd := command(ctx, argv, cwd)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb

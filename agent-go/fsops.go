@@ -8,6 +8,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -53,7 +54,11 @@ func readDir(j *jail, path string) ([]dirEntry, error) {
 		if isGitDirName(d.Name()) {
 			continue
 		}
-		link := d.Type()&fs.ModeSymlink != 0
+		// ModeIrregular as well as ModeSymlink — see resolveLinks in jail.go: a
+		// Windows junction arrives as the former, and reporting it as an
+		// ordinary directory hid from the explorer the one kind of entry whose
+		// contents may not be where they look.
+		link := d.Type()&(fs.ModeSymlink|fs.ModeIrregular) != 0
 		e := dirEntry{Name: d.Name(), Dir: d.IsDir(), Link: link}
 
 		// Stat follows symlinks, so a link to a directory sorts with directories.
@@ -79,7 +84,55 @@ func readDir(j *jail, path string) ([]dirEntry, error) {
 	return out, nil
 }
 
-func readTextFile(j *jail, path string) (*fileRead, error) {
+// alignUTF8 trims a byte range so it holds only whole UTF-8 characters.
+//
+// A window onto a large file starts and ends wherever the caller asked, which
+// is very unlikely to be a character boundary — and decoding a half character
+// puts U+FFFD at each end of every page. So the start walks forward off any
+// continuation byte, and the end walks back off a lead byte whose sequence the
+// slice does not contain.
+//
+// Both agents must trim identically, or the same window returns different text
+// depending on which one is running. This mirrors alignUtf8 in
+// src/agent/fs-ops.ts byte for byte.
+func alignUTF8(b []byte, from, to int) (int, int) {
+	start := from
+	// 0b10xxxxxx is a continuation byte: it cannot begin a character.
+	for start < to && b[start]&0xc0 == 0x80 {
+		start++
+	}
+	end := to
+	// Walk back to the last lead byte and keep it only if its whole sequence fits.
+	i := end - 1
+	for i >= start && b[i]&0xc0 == 0x80 {
+		i--
+	}
+	if i >= start {
+		c := b[i]
+		need := 1
+		switch {
+		case c >= 0xf0:
+			need = 4
+		case c >= 0xe0:
+			need = 3
+		case c >= 0xc0:
+			need = 2
+		}
+		if i+need > end {
+			end = i
+		}
+	}
+	return start, end
+}
+
+// readTextFile reads a file, or a window of one.
+//
+// Without a length this is the whole file, and anything over the cap comes back
+// as TooLarge with no text — the editor cannot hold it and the socket cannot
+// carry it. With a length the cap does not apply to the file, only to the
+// window: a 300 MB log is readable a page at a time, read-only, which is the
+// difference between "cannot be opened" and "can be looked at".
+func readTextFile(j *jail, path string, offset, length int64) (*fileRead, error) {
 	abs, err := j.toAbsExisting(path)
 	if err != nil {
 		return nil, err
@@ -89,6 +142,52 @@ func readTextFile(j *jail, path string) (*fileRead, error) {
 		return nil, nodeFsError(err, "stat", abs)
 	}
 	mtime := st.ModTime().UnixMilli()
+
+	if length > 0 {
+		if length > maxTextBytes {
+			return nil, fmt.Errorf("Length is too large: %d bytes (limit %d)", length, maxTextBytes)
+		}
+		from := offset
+		if from < 0 {
+			from = 0
+		}
+		if from > st.Size() {
+			from = st.Size()
+		}
+		to := from + length
+		if to > st.Size() {
+			to = st.Size()
+		}
+		// Only the window is read. Reading the file and slicing it would make a
+		// 300 MB log cost 300 MB per page, which is the thing this exists to avoid.
+		f, err := os.Open(abs)
+		if err != nil {
+			return nil, nodeFsError(err, "open", abs)
+		}
+		buf := make([]byte, to-from)
+		got, rerr := f.ReadAt(buf, from)
+		f.Close()
+		if rerr != nil && rerr != io.EOF {
+			return nil, nodeFsError(rerr, "read", abs)
+		}
+		buf = buf[:got]
+		// Sniffed over the window, not the file: a window of a file whose binary
+		// bytes are elsewhere is text, and refusing it would be refusing the page
+		// the user asked for because of a page they did not.
+		if isBinary(buf) {
+			return &fileRead{Text: nil, Size: st.Size(), Mtime: mtime, Binary: true, Offset: from, Eof: from+int64(got) >= st.Size()}, nil
+		}
+		s, e := alignUTF8(buf, 0, got)
+		text := string(buf[s:e])
+		return &fileRead{
+			Text:   &text,
+			Size:   st.Size(),
+			Mtime:  mtime,
+			Offset: from + int64(s),
+			Eof:    from+int64(e) >= st.Size(),
+		}, nil
+	}
+
 	if st.Size() > maxTextBytes {
 		return &fileRead{Text: nil, Size: st.Size(), Mtime: mtime, Binary: false, TooLarge: true}, nil
 	}
@@ -97,10 +196,10 @@ func readTextFile(j *jail, path string) (*fileRead, error) {
 		return nil, nodeFsError(err, "open", abs)
 	}
 	if isBinary(b) {
-		return &fileRead{Text: nil, Size: st.Size(), Mtime: mtime, Binary: true, TooLarge: false}, nil
+		return &fileRead{Text: nil, Size: st.Size(), Mtime: mtime, Binary: true, TooLarge: false, Eof: true}, nil
 	}
 	text := string(b)
-	return &fileRead{Text: &text, Size: st.Size(), Mtime: mtime, Binary: false, TooLarge: false}, nil
+	return &fileRead{Text: &text, Size: st.Size(), Mtime: mtime, Binary: false, TooLarge: false, Eof: true}, nil
 }
 
 func writeTextFile(j *jail, path, text string) (map[string]int64, error) {

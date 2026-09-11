@@ -7,7 +7,7 @@
  */
 import { run, runBytes } from "./proc.ts";
 import { isBinary } from "./fs-ops.ts";
-import type { Branch, Commit, CommitDetail, CommitFile, DiffPair, GitStatus, StatusEntry } from "./protocol.ts";
+import type { Branch, Commit, CommitDetail, CommitFile, DiffPair, GitStatus, ReflogEntry, StatusEntry } from "./protocol.ts";
 
 export class GitError extends Error {
   readonly code = "EGIT";
@@ -53,8 +53,24 @@ const REC = "\x1e";
 const FLD = "\x1f";
 const LOG_FMT = `%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s`;
 
+/** Argv for a git command that only reads.
+ *
+ *  `git status` is not a pure read: it refreshes the index and writes the
+ *  updated stat cache back to `.git/index`. The watcher sees a write under
+ *  `.git`, the UI refreshes status, branches and history, those run `git status`
+ *  again — and the three panels rebuild once a second forever, with no user
+ *  action anywhere in the loop. `--no-optional-locks` tells git to skip exactly
+ *  the writes it performs only as an optimisation, so a read stays a read; the
+ *  same flag is why other editors do not sit in this loop. git 2.15 and newer.
+ *
+ *  Writes must not use it: they need the lock they are taking.
+ */
+export function readOnly(args: string[]): string[] {
+  return ["git", "--no-optional-locks", ...args];
+}
+
 async function git(cwd: string, args: string[]): Promise<string> {
-  const r = await run(["git", ...args], cwd);
+  const r = await run(readOnly(args), cwd);
   if (r.code !== 0) throw new GitError(r.stderr || r.stdout);
   return r.stdout;
 }
@@ -76,7 +92,7 @@ function splitN(s: string, sep: string, n: number): string[] {
 
 /** Absolute path of the repository containing `cwd`, or null if there is none. */
 export async function repoRoot(cwd: string): Promise<string | null> {
-  const r = await run(["git", "rev-parse", "--show-toplevel"], cwd);
+  const r = await run(readOnly(["rev-parse", "--show-toplevel"]), cwd);
   return r.code === 0 ? r.stdout.trim() : null;
 }
 
@@ -161,14 +177,72 @@ function parseCommits(out: string): Commit[] {
 
 export async function log(
   cwd: string,
-  opts: { ref?: string; limit?: number; all?: boolean; path?: string } = {},
+  opts: { ref?: string; limit?: number; all?: boolean; path?: string; skip?: number } = {},
 ): Promise<Commit[]> {
   const args = ["log", "--date-order", `--format=${LOG_FMT}`, `-n${opts.limit ?? 200}`];
+  // `skip` is what makes "load more" a page rather than a bigger request: the
+  // history view used to raise its limit and re-ask for the whole window, so
+  // the tenth page walked the first nine again and parsed them again. A number,
+  // never a string, so there is nothing here for `safe()` to screen.
+  if (opts.skip && opts.skip > 0) args.push(`--skip=${Math.floor(opts.skip)}`);
   if (opts.all) args.push("--all");
   else if (opts.ref) args.push(safe(opts.ref, "ref"));
   // `--` keeps a path that looks like a flag from being parsed as one.
   if (opts.path) args.push("--", opts.path);
   return parseCommits(await git(cwd, args));
+}
+
+/** Which of `paths` git would ignore.
+ *
+ *  Asked a directory at a time: the explorer dims a folder's contents, and one
+ *  call per file would be one spawn per row.
+ *
+ *  The paths go in on stdin rather than in the argv. `-z` is what makes the
+ *  answer parseable for a path containing a newline, and git accepts `-z` only
+ *  together with `--stdin` — but stdin is also the only inlet with no length
+ *  limit, and a directory of ten thousand entries would otherwise be an argv
+ *  too long for the platform to spawn.
+ *
+ *  No `--no-index`: a tracked file is not ignored however well it matches a
+ *  pattern, and that is precisely the distinction the explorer is drawing.
+ */
+export async function checkIgnore(cwd: string, paths: string[]): Promise<string[]> {
+  if (!paths.length) return [];
+  const p = paths.map((x) => safe(x, "path"));
+  const r = await run(readOnly(["check-ignore", "-z", "--stdin"]), cwd, p.join("\0"));
+  // 0 = some are ignored, 1 = none are. Anything else is a real failure.
+  if (r.code !== 0 && r.code !== 1) throw new GitError(r.stderr || r.stdout);
+  return r.stdout.split("\0").filter(Boolean);
+}
+
+/** Where HEAD has been — the undo list.
+ *
+ *  Every ref movement git makes is recorded here, including the ones with no
+ *  other way back: a `reset --hard` that threw away a commit leaves the commit
+ *  itself intact and only this remembers its name. So the UI's "undo the last
+ *  operation" is a reflog entry plus the reset onto it, and this is the half
+ *  that has to exist first.
+ */
+export async function reflog(cwd: string, limit = 50): Promise<ReflogEntry[]> {
+  // No `--date`: it rewrites `%gd` from the ordinal `HEAD@{0}` into a timestamp
+  // form, and the ordinal is the half that can be passed back to reset. The
+  // time comes from `%ct`, which `--date` does not touch.
+  const out = await git(cwd, ["reflog", `-n${Math.max(1, Math.floor(limit))}`, `--format=%gd%x1f%H%x1f%gs%x1f%ct`]);
+  const entries: ReflogEntry[] = [];
+  for (const line of out.split("\n")) {
+    if (!line.trim()) continue;
+    const p = line.split(FLD);
+    // "commit: subject", "reset: moving to …", "checkout: moving from a to b"
+    const [action, rest] = splitN(p[2] ?? "", ": ", 1);
+    entries.push({
+      selector: p[0] ?? "",
+      oid: p[1] ?? "",
+      action: rest === undefined ? "" : action,
+      message: rest === undefined ? (p[2] ?? "") : rest,
+      time: Number(p[3] ?? 0),
+    });
+  }
+  return entries;
 }
 
 export async function branches(cwd: string): Promise<Branch[]> {
@@ -270,7 +344,7 @@ function parseFileList(out: string): CommitFile[] {
 export async function blobAt(cwd: string, rev: string, path: string): Promise<{ text: string | null; binary: boolean }> {
   rev = safeOpt(rev, "revision");
   const spec = rev === "" ? `:${path}` : `${rev}:${path}`;
-  const r = await runBytes(["git", "show", spec], cwd);
+  const r = await runBytes(readOnly(["show", spec]), cwd);
   if (r.code !== 0) return { text: null, binary: false };
   const binary = isBinary(r.bytes);
   return { text: binary ? null : new TextDecoder().decode(r.bytes), binary };

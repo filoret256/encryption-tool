@@ -56,14 +56,53 @@ function pw(tab: Tab): string {
   return (document.getElementById(`${tab}-password`) as HTMLInputElement).value;
 }
 
+/** The result pane, when the tab is in two-pane mode. */
+const results = {} as Record<Tab, TabEditor>;
+const twoPane = { ansible: false, helm: false } as Record<Tab, boolean>;
+
+/** Source on the left, result on the right.
+ *
+ *  In one pane the result replaces what you typed, which is recoverable but
+ *  still means the plaintext and the ciphertext are never on screen together —
+ *  and checking that an envelope decrypts back to what you meant took two
+ *  operations and a memory. */
+function toggleTwoPane(tab: Tab, btn: HTMLElement): void {
+  twoPane[tab] = !twoPane[tab];
+  btn.classList.toggle("is-active", twoPane[tab]);
+  const host = document.getElementById(`${tab}-editor2`)!;
+  host.hidden = !twoPane[tab];
+  if (twoPane[tab]) {
+    // Built on first use: a second CodeMirror per tab is not worth creating for
+    // the people who never turn this on.
+    results[tab] ??= new TabEditor(tab, host, "the result appears here", true);
+    results[tab].setTheme(isDark);
+    results[tab].refresh();
+  }
+}
+
 async function cryptoAction(tab: Tab, action: "encrypt" | "decrypt"): Promise<void> {
   const password = pw(tab);
-  const text = editors[tab].value;
+  // A selection means "this part", the way it does in every other editor. With
+  // nothing selected it is the whole buffer, which is what it always was — so
+  // the gesture is an addition, not a change of meaning.
+  const selected = editors[tab].selectedText;
+  const text = selected || editors[tab].value;
   if (!text.trim()) return toast("Text is required", true);
   if (!password) return toast("Password is required", true);
   try {
-    editors[tab].value = await SCHEMES[tab][action](text, password);
-    toast(`${action}ed`);
+    const out = await SCHEMES[tab][action](text.trim(), password);
+    if (twoPane[tab]) {
+      // The source is left exactly as it is; the result goes beside it.
+      results[tab].value = out;
+      toast(`${action}ed ${selected ? "the selection" : "the buffer"} → right pane`);
+      return;
+    }
+    if (selected) editors[tab].replaceSelection(out);
+    else editors[tab].value = out;
+    // The result replaces what was there. That is recoverable — Ctrl+Z — and
+    // saying so is the difference between a tool that overwrote your text and
+    // one that transformed it.
+    toast(`${action}ed ${selected ? "the selection" : "the buffer"} · Ctrl+Z puts it back`);
   } catch (e) {
     toast(e instanceof Error ? e.message : String(e), true);
   }
@@ -230,6 +269,7 @@ async function openCodeTab(): Promise<void> {
         notify,
         dismissNotices: () => notifier.dismissAll(),
         onCapsChanged: () => refreshBadge?.(),
+      getAgent: () => agentDownload?.open(),
       });
       codeTab.setTheme(isDark);
     } catch (e) {
@@ -328,7 +368,8 @@ function expandTabs(): void {
     const node = tpl.content.cloneNode(true) as DocumentFragment;
     node.querySelectorAll<HTMLElement>("[data-action]").forEach((b) => (b.dataset.tab = tab));
     const map: Record<string, string> = {
-      "js-password": `${tab}-password`, "js-editor": `${tab}-editor`,
+      "js-password": `${tab}-password`, "js-editor": `${tab}-editor`, "js-editor2": `${tab}-editor2`,
+      "js-two": `${tab}-two-btn`,
       "js-badge": `${tab}-yaml-badge`, "js-beautify": `${tab}-beautify-btn`,
       "js-lnum": `${tab}-lnum-btn`, "js-ws": `${tab}-ws-btn`, "js-wrap": `${tab}-wrap-btn`, "js-fold": `${tab}-fold-btn`,
       "js-lines": `${tab}-lines`, "js-chars": `${tab}-chars`,
@@ -437,6 +478,7 @@ function init(): void {
         case "wrap": toggleView(tab, "wrap", `${tab}-wrap-btn`); break;
         case "fold": toggleView(tab, "fold", `${tab}-fold-btn`); break;
         case "find": case "replace": editors[tab].openFind(); break;
+        case "two": toggleTwoPane(tab, el); break;
         case "togglePw": {
           const inp = document.getElementById(`${tab}-password`) as HTMLInputElement;
           inp.type = inp.type === "password" ? "text" : "password";
@@ -445,6 +487,22 @@ function init(): void {
       }
     });
   });
+
+  // The two operations this tab exists for had no keyboard at all: you typed a
+  // password, then reached for the mouse. Captured, because CodeMirror's own
+  // keymap would otherwise take Ctrl+D (select-next-occurrence) first.
+  document.addEventListener(
+    "keydown",
+    (e) => {
+      if (currentTab === "code" || !(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+      const action = e.code === "KeyE" ? "encrypt" : e.code === "KeyD" ? "decrypt" : null;
+      if (!action) return;
+      e.preventDefault();
+      e.stopPropagation();
+      void cryptoAction(currentTab, action);
+    },
+    true,
+  );
 }
 
 if (document.readyState === "loading") {

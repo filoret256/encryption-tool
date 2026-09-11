@@ -4,7 +4,7 @@
  *  the Jail first and that reads classify binary/oversized content instead of
  *  handing the editor a mangled string.
  */
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { DirEntry, FileRead } from "./protocol.ts";
 import { isGitDirName, type Jail } from "./jail.ts";
@@ -50,11 +50,86 @@ export async function readDir(jail: Jail, path: string): Promise<DirEntry[]> {
   return out;
 }
 
-export async function readTextFile(jail: Jail, path: string): Promise<FileRead> {
+/** Trim a byte range so it holds only whole UTF-8 characters.
+ *
+ *  A window onto a large file starts and ends wherever the caller asked, which
+ *  is very unlikely to be a character boundary — and decoding a half character
+ *  puts U+FFFD at each end of every page. So the start walks forward off any
+ *  continuation byte, and the end walks back off a lead byte whose sequence the
+ *  slice does not contain.
+ *
+ *  Both agents must trim identically, or the same window returns different text
+ *  depending on which one is running. This is the definition the other copy in
+ *  agent-go/fsops.go mirrors.
+ */
+export function alignUtf8(bytes: Uint8Array, from: number, to: number): [number, number] {
+  let start = from;
+  // 0b10xxxxxx is a continuation byte: it cannot begin a character.
+  while (start < to && (bytes[start] & 0xc0) === 0x80) start++;
+  let end = to;
+  // Walk back to the last lead byte and keep it only if its whole sequence fits.
+  let i = end - 1;
+  while (i >= start && (bytes[i] & 0xc0) === 0x80) i--;
+  if (i >= start) {
+    const b = bytes[i];
+    const need = b < 0x80 ? 1 : b >= 0xf0 ? 4 : b >= 0xe0 ? 3 : b >= 0xc0 ? 2 : 1;
+    if (i + need > end) end = i;
+  }
+  return [start, end];
+}
+
+/** Read a file, or a window of one.
+ *
+ *  Without `length` this is the whole file, and anything over the cap comes back
+ *  as `tooLarge` with no text — the editor cannot hold it and the socket cannot
+ *  carry it. With `length` the cap does not apply to the file, only to the
+ *  window: a 300 MB log is readable a page at a time, read-only, which is the
+ *  difference between "cannot be opened" and "can be looked at".
+ */
+export async function readTextFile(
+  jail: Jail,
+  path: string,
+  range?: { offset?: number; length?: number },
+): Promise<FileRead> {
   const abs = await jail.toAbsExisting(path);
   const st = await stat(abs);
+
+  const wantLength = Math.floor(range?.length ?? 0);
+  if (wantLength > 0) {
+    if (wantLength > MAX_TEXT) throw new Error(`Length is too large: ${wantLength} bytes (limit ${MAX_TEXT})`);
+    const from = Math.min(Math.max(0, Math.floor(range?.offset ?? 0)), st.size);
+    const to = Math.min(from + wantLength, st.size);
+    // Only the window is read. Reading the file and slicing it would make a
+    // 300 MB log cost 300 MB per page, which is the thing this exists to avoid.
+    const buf = Buffer.alloc(to - from);
+    const fh = await open(abs, "r");
+    let got = 0;
+    try {
+      got = (await fh.read(buf, 0, buf.length, from)).bytesRead;
+    } finally {
+      await fh.close();
+    }
+    const bytes = new Uint8Array(buf.buffer, buf.byteOffset, got);
+    // Sniffed over the window, not the file: a window of a file whose binary
+    // bytes are elsewhere is text, and refusing it would be refusing the page
+    // the user asked for because of a page they did not.
+    if (isBinary(bytes)) {
+      return { text: null, size: st.size, mtime: st.mtimeMs, binary: true, tooLarge: false, offset: from, eof: from + got >= st.size };
+    }
+    const [s, e] = alignUtf8(bytes, 0, got);
+    return {
+      text: new TextDecoder().decode(bytes.subarray(s, e)),
+      size: st.size,
+      mtime: st.mtimeMs,
+      binary: false,
+      tooLarge: false,
+      offset: from + s,
+      eof: from + e >= st.size,
+    };
+  }
+
   if (st.size > MAX_TEXT) {
-    return { text: null, size: st.size, mtime: st.mtimeMs, binary: false, tooLarge: true };
+    return { text: null, size: st.size, mtime: st.mtimeMs, binary: false, tooLarge: true, offset: 0, eof: false };
   }
   const bytes = await readFile(abs);
   const binary = isBinary(bytes);
@@ -64,6 +139,8 @@ export async function readTextFile(jail: Jail, path: string): Promise<FileRead> 
     mtime: st.mtimeMs,
     binary,
     tooLarge: false,
+    offset: 0,
+    eof: true,
   };
 }
 

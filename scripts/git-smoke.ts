@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { Text } from "@codemirror/state";
 import { git, startAgent, type Harness } from "./harness.ts";
 import { findConflicts } from "../src/web/code/conflicts.ts";
+import { hunkPatches } from "../src/web/code/hunkpatch.ts";
 import type { Branch, Commit, CommitDetail, DiffPair, FileRead, GitStatus } from "../src/agent/protocol.ts";
 
 const PORT = 5097;
@@ -202,6 +203,76 @@ try {
   // ── blame ──
   const blame = await call<{ oid: string; author: string; line: number }[]>("git.blame", { path: "README.md" });
   check("blame", blame.length > 0 && /^[0-9a-f]{40}$/.test(blame[0]?.oid ?? ""), `${blame.length} line(s), author=${blame[0]?.author}`);
+
+  // ── staging one hunk at a time ──
+  //
+  // hunkPatches() writes unified diffs by hand, and the only opinion that
+  // counts about a unified diff is git's. So every case below is applied for
+  // real, through the agent, and the index is read back: a patch git rejects
+  // fails here rather than in front of someone trying to stage line 40.
+  //
+  // The reverse direction is checked with the same patch, because unstaging is
+  // not a second patch — it is this one read backwards, and a hunk that stages
+  // but will not unstage leaves the user stuck.
+  await call("git.checkout", { ref: "main" });
+  await git(root, "reset", "-q", "--hard");
+
+  const hunkCases: { name: string; before: string; after: string }[] = [
+    { name: "one line changed in the middle", before: "a\nb\nc\nd\ne\nf\ng\n", after: "a\nb\nc\nD\ne\nf\ng\n" },
+    { name: "insertion at the very top", before: "a\nb\nc\n", after: "new\na\nb\nc\n" },
+    { name: "deletion at the very bottom", before: "a\nb\nc\n", after: "a\nb\n" },
+    { name: "two separate changes", before: "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n", after: "1\nX\n3\n4\n5\n6\n7\n8\n9\n10\nY\n12\n" },
+    { name: "into an empty file", before: "", after: "first\n" },
+    { name: "emptying a file", before: "only\n", after: "" },
+    { name: "no trailing newline on the new side", before: "a\nb\n", after: "a\nB" },
+    { name: "no trailing newline on the old side", before: "a\nB", after: "a\nb\n" },
+    { name: "a trailing newline appearing", before: "a\nb", after: "a\nb\n" },
+    { name: "everything replaced", before: "x\ny\nz\n", after: "1\n2\n3\n4\n" },
+  ];
+
+  for (const [i, c] of hunkCases.entries()) {
+    const file = `hunk-${i}.txt`;
+    // The committed content is the "before" side; the worktree holds "after".
+    // That is exactly the situation a user is in when they press "stage".
+    await w(file, c.before);
+    await call("git.stage", { paths: [file] });
+    await call("git.commit", { message: `hunk case ${i}` });
+    await w(file, c.after);
+
+    const patches = hunkPatches(file, c.before, c.after);
+    if (!patches.length) {
+      check(`hunk: ${c.name}`, false, "no hunks were produced for a file that differs");
+      continue;
+    }
+
+    let applied = true;
+    let failure = "";
+    for (const patch of patches) {
+      try {
+        await call("git.applyPatch", { patch });
+      } catch (e) {
+        applied = false;
+        failure = e instanceof Error ? e.message.split("\n")[0] : String(e);
+        break;
+      }
+    }
+    if (!applied) {
+      check(`hunk: ${c.name}`, false, failure);
+      continue;
+    }
+
+    // Every hunk staged means the index now holds the "after" side exactly.
+    const staged = await call<{ text: string | null }>("git.blob", { rev: "", path: file });
+    const indexed = staged.text ?? "";
+    check(`hunk: ${c.name}`, indexed === c.after, indexed === c.after ? `${patches.length} hunk(s)` : `index has ${JSON.stringify(indexed)}`);
+
+    // And reversing the same patches puts the index back where it started.
+    for (const patch of [...patches].reverse()) await call("git.applyPatch", { patch, reverse: true });
+    const back = await call<{ text: string | null }>("git.blob", { rev: "", path: file });
+    check(`hunk reversed: ${c.name}`, (back.text ?? "") === c.before, JSON.stringify((back.text ?? "").slice(0, 40)));
+
+    await git(root, "reset", "-q", "--hard");
+  }
 } catch (e) {
   check("unexpected error", false, e instanceof Error ? `${e.message}\n${e.stack}` : String(e));
 } finally {

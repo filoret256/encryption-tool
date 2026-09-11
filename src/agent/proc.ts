@@ -29,8 +29,17 @@ function env(): Record<string, string> {
   return { ...(process.env as Record<string, string>), ...DEFAULT_ENV };
 }
 
-export async function run(argv: string[], cwd: string): Promise<RunResult> {
-  const proc = Bun.spawn(argv, { cwd, env: env(), stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+/** `stdin` feeds the process and closes the pipe; without it stdin is closed
+ *  from the start, which is what every other caller wants. `git apply` reads
+ *  its patch this way and has no other way in — a patch is not an argv. */
+export async function run(argv: string[], cwd: string, stdin?: string): Promise<RunResult> {
+  const proc = Bun.spawn(argv, {
+    cwd,
+    env: env(),
+    stdout: "pipe",
+    stderr: "pipe",
+    stdin: stdin === undefined ? "ignore" : new TextEncoder().encode(stdin),
+  });
   const [stdout, stderr, code] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),

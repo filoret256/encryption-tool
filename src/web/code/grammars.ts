@@ -74,6 +74,47 @@ const FILENAMES: [RegExp, Factory][] = [
  *  browsing a project and each parser build is not free. */
 const cache = new Map<string, Extension | null>();
 
+/** The languages by name, for the status bar's picker.
+ *
+ *  The map above is keyed by extension because that is how a file announces
+ *  itself; a person choosing a language wants its name. One representative
+ *  extension per language, so `grammarFor` stays the single place that builds
+ *  one. */
+export const LANGUAGES: { name: string; ext: string }[] = [
+  { name: "Plain text", ext: "" },
+  { name: "Bash", ext: "sh" },
+  { name: "C / C++", ext: "cpp" },
+  { name: "CSS", ext: "css" },
+  { name: "Dockerfile", ext: "Dockerfile" },
+  { name: "Go", ext: "go" },
+  { name: "HTML", ext: "html" },
+  { name: "INI / properties", ext: "ini" },
+  { name: "Java", ext: "java" },
+  { name: "JavaScript", ext: "js" },
+  { name: "JSON", ext: "json" },
+  { name: "Markdown", ext: "md" },
+  { name: "PHP", ext: "php" },
+  { name: "Python", ext: "py" },
+  { name: "Rust", ext: "rs" },
+  { name: "SQL", ext: "sql" },
+  { name: "TOML", ext: "toml" },
+  { name: "TypeScript", ext: "ts" },
+  { name: "XML", ext: "xml" },
+  { name: "YAML", ext: "yaml" },
+];
+
+/** What `grammarFor` would pick for this path, by name. */
+export function languageOf(path: string): string {
+  const name = path.split("/").pop() ?? "";
+  const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+  // Compare by the factory, not the extension: `mjs`, `cjs` and `js` are one
+  // language and should not read as three.
+  const factory = EXTENSIONS[ext] ?? FILENAMES.find(([re]) => re.test(name))?.[1];
+  if (!factory) return "Plain text";
+  const hit = LANGUAGES.find((l) => l.ext && (EXTENSIONS[l.ext] ?? FILENAMES.find(([re]) => re.test(l.ext))?.[1]) === factory);
+  return hit?.name ?? "Plain text";
+}
+
 export function grammarFor(path: string): Extension | null {
   const name = path.split("/").pop() ?? "";
   const ext = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";

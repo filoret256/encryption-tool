@@ -149,6 +149,9 @@ type opCtx struct {
 	info *agentInfo
 	conn *connection
 	id   int64
+	// The server itself, for the one op that changes the workspace out from
+	// under every other one: agent.setRoot.
+	srv *server
 }
 
 func (c *opCtx) chunk(v any) { c.conn.send(chunkFrame{ID: c.id, Chunk: v}) }
@@ -164,10 +167,14 @@ var ops map[string]opFunc
 func init() {
 	ops = map[string]opFunc{
 		"agent.info": func(c *opCtx, _ *req) (any, error) { return c.info, nil },
+		// See (*server).setRoot for why the boundary is where it is.
+		"agent.setRoot": func(c *opCtx, p *req) (any, error) { return c.srv.setRoot(c.ctx, p.str("path")) },
 
 		// ── filesystem ──
 		"fs.readdir": func(c *opCtx, p *req) (any, error) { return readDir(c.jail, p.str("path")) },
-		"fs.read":    func(c *opCtx, p *req) (any, error) { return readTextFile(c.jail, p.str("path")) },
+		"fs.read": func(c *opCtx, p *req) (any, error) {
+			return readTextFile(c.jail, p.str("path"), int64(p.number("offset", 0)), int64(p.number("length", 0)))
+		},
 		"fs.write": func(c *opCtx, p *req) (any, error) {
 			return writeTextFile(c.jail, p.str("path"), p.str("text"))
 		},
@@ -193,9 +200,16 @@ func init() {
 				limit: p.number("limit", 0),
 				all:   p.truthy("all"),
 				path:  p.str("path"),
+				skip:  p.number("skip", 0),
 			})
 		},
-		"git.branches":     func(c *opCtx, _ *req) (any, error) { return gitBranches(c.ctx, c.cwd) },
+		"git.branches": func(c *opCtx, _ *req) (any, error) { return gitBranches(c.ctx, c.cwd) },
+		"git.checkIgnore": func(c *opCtx, p *req) (any, error) {
+			return gitCheckIgnore(c.ctx, c.cwd, p.strs("paths"))
+		},
+		"git.reflog": func(c *opCtx, p *req) (any, error) {
+			return gitReflog(c.ctx, c.cwd, p.number("limit", 50))
+		},
 		"git.commitDetail": func(c *opCtx, p *req) (any, error) { return gitCommitDetail(c.ctx, c.cwd, p.str("oid")) },
 		"git.blob": func(c *opCtx, p *req) (any, error) {
 			text, binary, err := blobAt(c.ctx, c.cwd, p.str("rev"), p.str("path"))
@@ -208,7 +222,7 @@ func init() {
 		"git.diff": func(c *opCtx, p *req) (any, error) {
 			path := p.str("path")
 			return gitDiffPair(c.ctx, c.cwd, path, p.str("kind"), func() *string {
-				f, err := readTextFile(c.jail, path)
+				f, err := readTextFile(c.jail, path, 0, 0)
 				if err != nil || f == nil {
 					return nil
 				}
@@ -221,6 +235,9 @@ func init() {
 		"git.unstage": func(c *opCtx, p *req) (any, error) { return gitUnstage(c.ctx, c.cwd, p.strs("paths")) },
 		"git.discard": func(c *opCtx, p *req) (any, error) { return gitDiscard(c.ctx, c.cwd, p.strs("paths")) },
 		"git.resolve": func(c *opCtx, p *req) (any, error) { return gitMarkResolved(c.ctx, c.cwd, p.strs("paths")) },
+		"git.applyPatch": func(c *opCtx, p *req) (any, error) {
+			return gitApplyPatch(c.ctx, c.cwd, p.str("patch"), p.truthy("reverse"))
+		},
 		"git.commit": func(c *opCtx, p *req) (any, error) {
 			return gitCommit(c.ctx, c.cwd, p.str("message"), p.truthy("amend"), p.truthy("all"))
 		},
@@ -246,6 +263,10 @@ func init() {
 		},
 		"git.revert":     func(c *opCtx, p *req) (any, error) { return gitRevert(c.ctx, c.cwd, p.str("oid")) },
 		"git.cherryPick": func(c *opCtx, p *req) (any, error) { return gitCherryPick(c.ctx, c.cwd, p.str("oid")) },
+		"git.tagCreate": func(c *opCtx, p *req) (any, error) {
+			return gitTagCreate(c.ctx, c.cwd, p.str("name"), p.str("ref"), p.str("message"), p.truthy("force"))
+		},
+		"git.tagDelete": func(c *opCtx, p *req) (any, error) { return gitTagDelete(c.ctx, c.cwd, p.str("name")) },
 
 		// ── git: merge / rebase / stash ──
 		"git.merge": func(c *opCtx, p *req) (any, error) {
@@ -269,6 +290,13 @@ func init() {
 
 		// ── git: remotes (streams progress) ──
 		"git.remotes": func(c *opCtx, _ *req) (any, error) { return gitRemotes(c.ctx, c.cwd) },
+		"git.remoteAdmin": func(c *opCtx, p *req) (any, error) {
+			action := p.str("action")
+			if action == "" {
+				action = "add"
+			}
+			return gitRemoteAdmin(c.ctx, c.cwd, action, p.str("name"), p.str("url"), p.str("to"))
+		},
 		"git.remote": func(c *opCtx, p *req) (any, error) {
 			action := p.str("action")
 			if action == "" {
@@ -383,11 +411,17 @@ type server struct {
 	allowMultiple bool
 	// Whether the workspace is a git repository; git ops are refused when not.
 	isRepo bool
+	// Folders agent.setRoot may move the workspace into. The startup root is
+	// always the first; --allow-root adds the rest. See setRoot below.
+	rerootBases []string
 
 	// Connections held right now. The lock in the /ws branch reads it, and the
 	// startup banner promises what it will do.
 	mu      sync.Mutex
 	clients int
+	// Live connections, so a reroot can re-aim watchers that are running on a
+	// folder this agent has left.
+	conns map[*connection]bool
 	// Whether the current lock has already been reported. Reset when it lifts:
 	// a refused tab keeps reconnecting on a backoff, and a line every few
 	// seconds would bury the one event worth seeing.
@@ -433,6 +467,86 @@ func (s *server) held() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.clients
+}
+
+// setRoot moves the workspace to another folder without a restart.
+//
+// The path is absolute and native — this is the one op whose whole purpose is to
+// leave the current workspace, so it does not go through the jail. It goes
+// through rerootBases instead, which is the operator's boundary rather than the
+// page's: by default only the folder the agent was started on and what is under
+// it, which cannot reach anything the agent could not already read. Widening
+// that is a --allow-root flag and therefore a decision made at the terminal,
+// never by the page asking nicely.
+//
+// Every connection's watcher is re-aimed, because a watcher left on the old
+// folder reports changes the client can no longer resolve to a path — a tree
+// that refreshes on edits to a folder it is not showing.
+func (s *server) setRoot(ctx context.Context, dir string) (any, error) {
+	if dir == "" {
+		return nil, errors.New("A folder is required")
+	}
+	opened, err := openJail(dir)
+	if err != nil {
+		return nil, fmt.Errorf("Cannot open folder: %s", dir)
+	}
+	if !s.mayRoot(opened.root) {
+		return nil, &jailError{"Folder is outside what this agent may open", opened.root}
+	}
+	// Snapping happens after the check, never before: the repository root of an
+	// allowed folder can be above it, and that is a folder nobody allowed.
+	next := opened
+	top := repoRoot(ctx, opened.root)
+	if top != "" {
+		snapped, serr := openJail(top)
+		if serr != nil {
+			return nil, fmt.Errorf("Cannot open folder: %s", top)
+		}
+		if !s.mayRoot(snapped.root) {
+			return nil, &jailError{"Repository root is outside what this agent may open", snapped.root}
+		}
+		next = snapped
+	}
+
+	s.jail = next
+	s.isRepo = top != ""
+	s.info.Root = next.root
+	if top != "" {
+		dot := "."
+		s.info.Repo = &dot
+	} else {
+		s.info.Repo = nil
+	}
+
+	s.mu.Lock()
+	live := make([]*connection, 0, len(s.conns))
+	for c := range s.conns {
+		live = append(live, c)
+	}
+	s.mu.Unlock()
+	for _, c := range live {
+		c.mu.Lock()
+		if c.watcher != nil {
+			c.watcher.close()
+			conn := c
+			c.watcher = startWatcher(next.root, func(paths []string) {
+				conn.send(pushFrame{Event: "fs.change", Data: map[string]any{"paths": paths}})
+			})
+		}
+		c.mu.Unlock()
+	}
+	lifecycle("workspace is now " + next.root)
+	return s.info, nil
+}
+
+// mayRoot reports whether a resolved folder is inside one the operator allowed.
+func (s *server) mayRoot(abs string) bool {
+	for _, base := range s.rerootBases {
+		if contains(base, abs) {
+			return true
+		}
+	}
+	return false
 }
 
 // lifecycle reports a connection coming or going, on stderr rather than stdout.
@@ -591,7 +705,16 @@ func (s *server) serveConn(ws *wsConn, origin string) {
 		slots:    make(chan struct{}, maxConcurrentProcs),
 		inflight: map[int64]context.CancelFunc{},
 	}
+	s.mu.Lock()
+	if s.conns == nil {
+		s.conns = map[*connection]bool{}
+	}
+	s.conns[conn] = true
+	s.mu.Unlock()
 	defer func() {
+		s.mu.Lock()
+		delete(s.conns, conn)
+		s.mu.Unlock()
 		left := s.release()
 		if s.allowMultiple {
 			lifecycle(fmt.Sprintf("client disconnected — %s (%d connected)", origin, left))
@@ -665,7 +788,7 @@ func (s *server) dispatch(conn *connection, r *req) {
 			defer func() { <-conn.slots }()
 		}
 
-		c := &opCtx{ctx: ctx, jail: s.jail, cwd: s.jail.root, info: s.info, conn: conn, id: r.id}
+		c := &opCtx{ctx: ctx, jail: s.jail, cwd: s.jail.root, info: s.info, conn: conn, id: r.id, srv: s}
 		data, err := handler(c, r)
 		if err != nil {
 			conn.send(resErr{ID: r.id, Error: err.Error(), Code: errCodeOf(err)})

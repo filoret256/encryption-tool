@@ -32,7 +32,11 @@
 
   --mono: 'Cascadia Code', 'Consolas', 'Menlo', 'Monaco', monospace;
   --bg: #f7f8fa; --panel: #fff; --border: #e2e5ea; --text: #1f2430;
-  --text-muted: #8a93a3; --accent: #2563eb; --accent-fg: #fff;
+  /* #8a93a3 measured about 2.9:1 against this background — under the 4.5:1 an
+     11px label needs, which is why "EXPLORER", "BRANCH" and the toolbar labels
+     were on the edge of legible in daylight. This is ~4.6:1 and still reads as
+     secondary next to --text. The dark theme's muted tone already passed. */
+  --text-muted: #6b7280; --accent: #2563eb; --accent-fg: #fff;
   --btn: #f0f2f5; --btn-hover: #e4e8ee; --active: #dbeafe;
   --ok: #15803d; --bad: #b91c1c;
 }
@@ -166,8 +170,17 @@ body {
 .yaml-badge.ok { color: var(--ok); }
 .yaml-badge.bad { color: var(--bad); }
 
-.editor-wrap { flex: 1; min-height: 0; }
-.editor-host { width: 100%; height: 100%; }
+/* One pane normally; two side by side when the result pane is shown. Flex
+   rather than a grid so the single-pane case needs no second rule. */
+.editor-wrap { flex: 1; min-height: 0; display: flex; }
+.editor-host { flex: 1 1 0; min-width: 0; height: 100%; }
+.editor-wrap .js-editor2 { border-left: 1px solid var(--border); }
+/* Below this there is no room for two columns of monospace text, so the result
+   pane goes under the source instead of beside it. */
+@media (max-width: 820px) {
+  .editor-wrap { flex-direction: column; }
+  .editor-wrap .js-editor2 { border-left: 0; border-top: 1px solid var(--border); }
+}
 .editor-host .cm-editor { height: 100%; }
 
 .statusbar {
@@ -251,7 +264,9 @@ body {
   border-bottom: 1px solid var(--border);
 }
 .code-tree { flex: 1; min-height: 0; }
-.code-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+/* `relative` so the welcome overlay can cover the editor area and nothing
+   else — the toolbar and the status bar stay usable behind it. */
+.code-main { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
 .code-editor-host { flex: 1; min-height: 0; }
 .code-editor-host .cm-editor { height: 100%; }
 .code-dirty.is-dirty { color: var(--dec-modified); }
@@ -282,14 +297,39 @@ body {
 .tree-row.dec-untracked .tree-name, .tree-row.dec-untracked .tree-mark { color: var(--dec-added); }
 .tree-row.dec-conflict .tree-name, .tree-row.dec-conflict .tree-mark { color: var(--dec-conflict); }
 .tree-row.dec-dirty .tree-mark { color: var(--dec-modified); }
+/* Ignored by git: dimmed rather than recoloured, and last so it wins over the
+   status colours above — a build folder is both untracked and ignored, and the
+   useful half of that is "git is not watching this". Opacity, not a colour, so
+   the file icon fades with the name instead of staying at full strength. */
+.tree-row.dec-ignored { opacity: 0.45; }
 /* Drag & drop: the row that would receive the drop. */
 .tree-row.drop-into { background: var(--active); outline: 1px solid var(--accent); outline-offset: -1px; }
 
 /* ── Open-file tabs ───────────────────────────────────────────────────── */
+/* The strip and the overflow button share a row, so the button stays reachable
+   while the tabs themselves scroll under it. */
+.code-tabstrip { display: flex; flex: 0 0 auto; align-items: stretch; background: var(--bg); border-bottom: 1px solid var(--border); }
+.code-tabstrip .js-tab-list { flex: 0 0 auto; width: var(--head-h); border-left: 1px solid var(--border); }
 .code-tabs {
-  display: flex; flex: 0 0 auto; overflow-x: auto; overflow-y: hidden;
-  background: var(--bg); border-bottom: 1px solid var(--border);
+  display: flex; flex: 1 1 auto; min-width: 0; overflow-x: auto; overflow-y: hidden;
+  background: var(--bg);
 }
+/* Where a dragged tab would land. */
+.code-tab.drop-before { box-shadow: inset 2px 0 0 var(--accent); }
+/* The path of the open file, one segment per folder. Each one is a target: the
+   folders reveal themselves in the explorer, the file offers its neighbours. */
+.code-crumbs {
+  display: flex; align-items: center; gap: 2px; flex: 0 0 auto; flex-wrap: wrap;
+  padding: 2px 10px; font-size: var(--fs-xs);
+  background: var(--panel); border-bottom: 1px solid var(--border);
+}
+.code-crumbs .crumb {
+  background: none; border: 0; padding: 1px 4px; border-radius: 3px; cursor: pointer;
+  color: var(--text-muted); font-family: inherit; font-size: inherit;
+}
+.code-crumbs .crumb:hover { background: var(--btn); color: var(--text); }
+.code-crumbs .crumb.is-file { color: var(--text); }
+.crumb-sep { color: var(--text-muted); opacity: .6; }
 /* Same height as .side-head, which sits directly to its left: the two make one
    unbroken rule across the top of the workspace instead of a four-pixel step. */
 .code-tab {
@@ -354,6 +394,23 @@ body {
 
 /* No file open: recessed, dimmed and inert, so an empty editor does not look
    like a document waiting to be typed into. */
+/* The first screen: three steps instead of an empty editor telling someone to
+   select a file from an explorer that has nothing in it. Overlays the editor
+   host rather than replacing it, so no layout depends on which is showing. */
+.code-welcome { position: absolute; inset: 0; overflow: auto; background: var(--bg); z-index: 2; }
+.code-editor-host.is-welcome { visibility: hidden; }
+.welcome { max-width: 46rem; padding: 32px 28px; }
+.welcome h2 { margin: 0 0 8px; font-size: var(--fs-lg, 16px); font-weight: 600; }
+.welcome p { margin: 0 0 16px; font-size: var(--fs-sm); color: var(--text-muted); line-height: 1.55; }
+.welcome ol { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 14px; }
+.welcome li { font-size: var(--fs-sm); line-height: 1.6; }
+.welcome li b { font-weight: 600; }
+.welcome code {
+  font-family: var(--mono); font-size: var(--fs-xs);
+  background: var(--btn); padding: 1px 5px; border-radius: 3px;
+}
+.welcome .t-btn { margin-left: 6px; vertical-align: baseline; }
+.welcome-note { margin: 20px 0 0; font-size: var(--fs-xs); }
 .code-editor-host.is-empty { background: color-mix(in srgb, var(--text) 5%, var(--bg)); }
 .code-editor-host.is-empty .cm-editor { background: transparent; }
 .code-editor-host.is-empty .cm-gutters { background: transparent; opacity: .5; }
@@ -390,8 +447,17 @@ body {
   font-family: var(--mono); font-size: var(--fs-sm); resize: vertical; padding: 6px 8px;
   border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--text);
 }
-.gp-commit-row { display: flex; gap: 6px; }
-.gp-commit-row .js-commit { flex: 1; }
+/* The box grows with the message (height is set from script), so a body no
+   longer has to be typed into a two-line scrolling slot. The floor keeps the
+   empty box the size it always was. */
+.gp-commit textarea { min-height: calc(var(--row) * 2); overflow-y: auto; }
+.gp-commit-row { display: flex; align-items: center; gap: 6px; }
+.gp-commit-row .js-commit { flex: 0 1 auto; }
+/* Subject length, shown only once it is worth mentioning. Reported, not
+   enforced: 50/72 is a convention, and some repositories do not keep it. */
+.gp-len { flex: 0 0 auto; font-size: var(--fs-badge); font-family: var(--mono); color: var(--text-muted); }
+.gp-len.is-long { color: var(--dec-modified); }
+.gp-len.is-over { color: var(--bad); }
 .gp-warn { margin: 0; font-size: var(--fs-xs); line-height: 1.45; color: var(--bad); }
 .gp-groups { flex: 1; min-height: 0; overflow: auto; }
 .gp-empty { padding: 12px 10px; margin: 0; font-size: var(--fs-sm); color: var(--text-muted); }
@@ -413,6 +479,21 @@ body {
   font-size: var(--fs-sm); cursor: pointer; white-space: nowrap;
 }
 .gp-row:hover { background: var(--btn); }
+/* Tree mode: the directory is a heading above its files, and the files are
+   indented under it instead of repeating the path on every row. */
+.gp-dirhead {
+  padding: 4px 8px 2px; font-size: var(--fs-xs); color: var(--text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left;
+}
+.gp-row.nested { padding-left: 20px; }
+/* A stash is not a pending change, so its row says when and on what branch
+   rather than carrying a status letter. */
+/* `flex-basis: 0` for the same reason the commit subject uses it: with `auto`
+   the message's own width counts as overflow and the deficit is split with the
+   branch-and-age column, so "experiment B: probes" came out as "experime…"
+   while the row still had space. */
+.gp-stash .gp-name { flex: 1 1 0; min-width: 0; }
+.gp-stash .gp-dir { flex: 0 1 auto; min-width: 0; direction: ltr; }
 .gp-name { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; }
 .gp-dir { flex: 1 1 auto; min-width: 0; font-size: var(--fs-xs); color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
 /* Row actions stay hidden until hover, like VS Code, so the list reads cleanly. */
@@ -503,6 +584,17 @@ body {
 .sp-lineno { flex: 0 0 auto; width: 38px; padding-left: 14px; text-align: right; font-size: var(--fs-xs); color: var(--text-muted); }
 .sp-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .sp-text mark { background: color-mix(in srgb, var(--accent) 34%, transparent); color: inherit; border-radius: 2px; }
+/* Replace preview: what is there, then what it becomes. Struck through and
+   tinted by direction, so the pair reads as one substitution rather than as two
+   separate matches. */
+.sp-text mark.from {
+  background: color-mix(in srgb, var(--dec-deleted) 24%, transparent);
+  text-decoration: line-through; opacity: .75;
+}
+.sp-text mark.to { background: color-mix(in srgb, var(--dec-added) 26%, transparent); }
+/* The progress line during a replace, which has a stop button in it. */
+.sp-summary { display: flex; align-items: center; gap: 8px; }
+.sp-summary .t-btn { height: var(--ctl-xs); font-size: var(--fs-badge); }
 /* Row actions appear on hover, as in the source-control list — and, as there,
    they keep their place in the layout so the result text does not shift. */
 .sp-acts { display: inline-flex; flex: 0 0 auto; visibility: hidden; }
@@ -510,12 +602,37 @@ body {
 .sp-file:focus-within .sp-acts, .sp-hit:focus-within .sp-acts { visibility: visible; }
 
 /* ── History ──────────────────────────────────────────────────────────── */
-.hist { display: flex; flex-direction: column; min-height: 0; }
+/* The panel is a query container so the log row can drop its least useful
+   columns when the panel is narrow, rather than dividing a fixed set of
+   columns into slices too thin to read. At the default 260px every commit
+   subject used to be cut to "add aut…". */
+.hist { display: flex; flex-direction: column; min-height: 0; container-type: inline-size; }
 .hist-head {
   display: flex; align-items: center; gap: 6px; flex: 0 0 auto;
   height: var(--head-h); padding: 0 8px; border-bottom: 1px solid var(--border);
 }
 .hist-toggle { display: inline-flex; align-items: center; gap: 4px; font-size: var(--fs-xs); color: var(--text-muted); cursor: pointer; }
+/* Scope ("history of <path>") and the comparison mark. Both say what the list
+   below is currently restricted to, which a list cannot say about itself. */
+.hist-scope, .hist-compare {
+  display: flex; align-items: center; gap: 6px; flex: 0 0 auto;
+  padding: 4px 8px; font-size: var(--fs-xs);
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+  border-bottom: 1px solid var(--border);
+}
+.hist-scope-label { color: var(--text-muted); text-transform: uppercase; font-size: var(--fs-badge); }
+.hist-scope-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The filter searches what is loaded, not the whole repository — so the count
+   beside it is part of the control, not decoration. */
+.hist-filter { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; padding: 4px 8px; }
+.hist-filter input {
+  flex: 1 1 auto; min-width: 0; height: var(--ctl-xs);
+  padding: 0 6px; font-size: var(--fs-xs);
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+}
+.hist-filter input:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.hist-filter-count { flex: 0 0 auto; color: var(--text-muted); font-size: var(--fs-badge); white-space: nowrap; }
 .hist-list { flex: 1; min-height: 0; overflow: auto; }
 .hist-item { border-bottom: 1px solid var(--border); }
 /* Fixed height: the lane SVG is drawn per row and must match it exactly, or
@@ -523,9 +640,26 @@ body {
 .hist-row { display: flex; align-items: center; gap: 6px; height: var(--row); padding: 0 8px; font-size: var(--fs-sm); cursor: pointer; }
 .hist-item:hover > .hist-row, .hist-item.open > .hist-row { background: var(--btn); }
 .hist-dot { color: var(--accent); flex: 0 0 auto; font-size: var(--fs-badge); }
-.hist-subject { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.hist-meta { flex: 0 0 auto; font-size: var(--fs-xs); color: var(--text-muted); }
-.hist-oid { flex: 0 0 auto; font-size: var(--fs-xs); color: var(--text-muted); }
+/* `flex-basis: 0`, not `auto`: with `auto` the subject's own content width
+   counts towards the row's overflow, and flexbox then takes the deficit out of
+   every shrinkable item in proportion — so a long message squeezed the ref
+   pills beside it down to "…n". At zero the subject never causes overflow and
+   simply takes whatever the row has left, which is the intended behaviour. */
+.hist-subject { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The subject is what the row is for, so it shrinks last. A shrink factor a
+   hundred times the subject's means the deficit comes out of the metadata
+   first — the author and the time are a gloss on the message, not a
+   replacement for it. */
+.hist-meta, .hist-oid {
+  flex: 0 100 auto; min-width: 0; overflow: hidden; white-space: nowrap;
+  font-size: var(--fs-xs); color: var(--text-muted);
+}
+/* Below these widths the columns stop being short and start being unreadable:
+   "J…" and "04b…" say nothing the tooltip and the context menu do not say
+   better, and the space they cost is the difference between seeing the commit
+   message and not. */
+@container (max-width: 340px) { .hist-oid { display: none; } }
+@container (max-width: 250px) { .hist-meta { display: none; } }
 /* Refs must yield to the subject. A tip commit can carry HEAD, its branch and
    two remote refs, and at `flex: 0 0 auto` those pushed the commit message out
    of the row entirely — the newest commit was the one you could not read. */
@@ -534,16 +668,29 @@ body {
    with no ellipsis and no way to tell it had been cut. Each pill now truncates
    on its own, and the group takes less of the row so the commit subject beside
    it keeps something to say. */
-.hist-refs { display: inline-flex; flex: 0 1 auto; min-width: 0; max-width: 55%; gap: 4px; }
+.hist-refs { display: inline-flex; flex: 0 1 auto; min-width: 0; max-width: 45%; gap: 4px; }
 .hist-ref {
-  flex: 0 1 auto; min-width: 0; max-width: 18ch;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 0 1 auto; min-width: 3ch; max-width: 24ch;
+  overflow: hidden; white-space: nowrap;
   font-size: var(--fs-badge); padding: 1px 5px; border-radius: 999px;
   border: 1px solid var(--border); color: var(--text-muted);
 }
+/* A ref that has to be cut is cut at the *front*: "origin/release/2026-03" is
+   told apart from its neighbours by its end, and the 18ch cap used to keep the
+   half that every ref on the commit shares — "origin/rele…" three times over.
+   Same trick the diff column headers use. */
+.hist-ref-name { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
 .hist-ref.ref-head { border-color: var(--accent); color: var(--accent); }
 .hist-ref.ref-remote { color: var(--dec-modified); border-color: var(--dec-modified); }
-.hist-ref.ref-tag { color: var(--ok); border-color: var(--ok); }
+/* A tag is a different kind of thing from a branch, so it is a different shape:
+   square ends and a marker, not another shade of pill. On a release day the
+   only difference between `v1.2.0` and `main` used to be a hue. */
+.hist-ref.ref-tag {
+  color: var(--ok); border-color: var(--ok);
+  border-radius: 3px; border-style: dashed;
+  display: inline-flex; align-items: center; gap: 3px;
+}
+.hist-ref-mark { flex: 0 0 auto; font-size: 0.9em; opacity: 0.8; }
 .hist-files { display: flex; gap: 6px; padding: 2px 8px 8px; background: var(--bg); }
 /* Width comes from the lane count, set inline; the SVG is taken out of flow so
    its intrinsic height cannot inflate the block. */
@@ -551,6 +698,13 @@ body {
 .hist-gutter .g-cont { position: absolute; inset: 0; }
 .hist-files-body { flex: 1; min-width: 0; }
 .hist-body { margin: 0 0 6px; font-size: var(--fs-xs); color: var(--text-muted); white-space: pre-wrap; }
+/* Who and when, in full — the row above has space for a first name and "2h". */
+.hist-who {
+  display: flex; flex-wrap: wrap; gap: 2px 10px; margin-bottom: 6px;
+  font-size: var(--fs-xs); color: var(--text-muted);
+}
+.hist-who-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hist-who-when { flex: 0 0 auto; font-family: var(--mono); }
 
 /* ── Commit graph ─────────────────────────────────────────────────────── */
 :root {
@@ -591,8 +745,16 @@ body {
 }
 .diff-labels { color: var(--text-muted); font-size: var(--fs-xs); }
 .diff-body { flex: 1; min-height: 0; overflow: auto; }
-.diff-body .cm-mergeView, .diff-body .cm-merge-a, .diff-body .cm-merge-b { height: 100%; }
+/* The full chain down to the editors. Stopping at .cm-mergeView left the
+   editors sized to their content, so a diff whose unchanged regions had all
+   collapsed ended a third of the way down with a grey rectangle below it — it
+   read as a panel that had failed to load. */
+.diff-body .cm-mergeView, .diff-body .cm-mergeViewEditors,
+.diff-body .cm-merge-a, .diff-body .cm-merge-b { height: 100%; min-height: 0; }
+.diff-body .cm-mergeViewEditor { height: 100%; min-height: 0; }
 .diff-body .cm-editor { height: 100%; }
+/* The mode button while the window, not the reader, is choosing inline. */
+.diff-head .js-mode.is-forced { border-style: dashed; color: var(--text-muted); }
 .diff-note { padding: 16px; color: var(--text-muted); font-size: var(--fs-sm); }
 /* One-sided diffs: a banner over the file's own content, tinted by direction. */
 .diff-note-added, .diff-note-removed {
@@ -635,8 +797,15 @@ body {
   background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
 }
 .modal label { font-size: var(--fs-xs); text-transform: uppercase; color: var(--text-muted); }
+/* A masked field and its reveal button on one row. */
+.modal-field { display: flex; gap: 6px; align-items: stretch; }
+.modal-field .t-input { flex: 1 1 auto; min-width: 0; }
+.modal-field .t-icon { flex: 0 0 auto; width: var(--ctl-h); }
 .modal .t-input { width: 100%; padding: 0 8px; }
-.modal-hint { margin: 0; font-size: var(--fs-xs); line-height: 1.5; color: var(--text-muted); }
+/* `pre-wrap` so a hint can hand over a command on its own line: a terminal
+   command folded into a paragraph is a command nobody can read back. */
+.modal-hint { margin: 0; font-size: var(--fs-xs); line-height: 1.5; color: var(--text-muted); white-space: pre-wrap; }
+.modal-hint.is-error { color: var(--bad); }
 .modal-row { display: flex; justify-content: flex-end; gap: 6px; }
 
 /* ── Capability badge ─────────────────────────────────────────────────── */
@@ -809,6 +978,14 @@ body {
 }
 .sb-button:hover, .sb-button.is-active { color: var(--text); }
 .sb-button.has-errors { color: var(--bad); }
+/* The document segments — cursor, indentation, line endings, language. They sit
+   between the spacer and the sync indicator and each one is also the control
+   for what it reports, so hovering them has to look like something happens. */
+.sb-item.js-sb-lang { cursor: pointer; }
+.sb-item.js-sb-lang:hover { color: var(--text); }
+/* A language chosen by hand rather than read off the file name. */
+.sb-item.js-sb-lang.is-forced { color: var(--dec-modified); }
+.statusbar .sb-item[hidden] { display: none; }
 
 /* ── Keyboard focus ───────────────────────────────────────────────────────
    One ring, stated once, for everything that can hold focus.
@@ -1041,6 +1218,10 @@ body {
 .ctx-menu button.separated { margin-top: 4px; border-top: 1px solid var(--border); padding-top: 6px; }
 .ctx-menu button.danger { color: var(--bad); }
 .ctx-menu button.danger:hover { background: color-mix(in srgb, var(--bad) 15%, transparent); }
+/* An item that is here to say why it cannot be used. Without the dimming it
+   reads as an ordinary action that silently does nothing when clicked. */
+.ctx-menu button:disabled { color: var(--text-muted); cursor: default; font-style: italic; }
+.ctx-menu button:disabled:hover { background: none; }
 /* The key that does the same thing without opening this menu. */
 .ctx-hint { color: var(--text-muted); font-size: var(--fs-xs); }
 
@@ -1125,3 +1306,76 @@ body {
 .diff-count { font-size: var(--fs-xs); color: var(--text-muted); white-space: nowrap; }
 .diff-head .t-icon { flex: 0 0 auto; }
 .diff-head .t-icon:disabled { opacity: .4; cursor: default; }
+
+/* ── Comparison ────────────────────────────────────────────────────────────
+   The bar that says what is marked. "Select for compare" used to change
+   nothing visible at all, so the mark existed only in the mind of whoever set
+   it — and outlived the workspace it belonged to. */
+.compare-bar {
+  display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
+  padding: 5px 12px; font-size: var(--fs-sm);
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+  border-bottom: 1px solid var(--border);
+}
+.compare-label { color: var(--text-muted); font-size: var(--fs-xs); text-transform: uppercase; }
+.compare-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.compare-bar .t-btn { height: var(--ctl-xs); font-size: var(--fs-xs); }
+/* Blame against an edited buffer still describes the last commit, so the bar
+   changes colour rather than letting the gutter imply it kept up. */
+.compare-bar.is-warn { background: color-mix(in srgb, var(--dec-modified) 16%, var(--panel)); }
+/* The marked row in the tree. */
+.tree-row.compare-base { outline: 1px dashed var(--accent); outline-offset: -1px; }
+.tree-compare { flex: 0 0 auto; color: var(--accent); font-size: var(--fs-xs); }
+/* Column headings over a side-by-side diff, held in place while it scrolls. */
+.diff-columns {
+  display: flex; flex: 0 0 auto;
+  border-bottom: 1px solid var(--border); background: var(--panel);
+}
+.diff-col {
+  flex: 1 1 0; min-width: 0; padding: 3px 10px;
+  font-size: var(--fs-xs); color: var(--text-muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left;
+}
+.diff-col + .diff-col { border-left: 1px solid var(--border); }
+
+/* ── folder comparison ──────────────────────────────────────────────────────
+   The answer to "what is different between these two folders", which the tool
+   could not be asked before: the only way to find out was to expand both trees
+   and read them side by side. A list, not a document — every differing row
+   opens that pair in the ordinary diff view. */
+.code-folder-host { flex: 1; min-height: 0; overflow: auto; }
+.dircmp { display: flex; flex-direction: column; }
+.dircmp-head {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  position: sticky; top: 0; z-index: 1;
+  padding: 6px 12px; font-size: var(--fs-xs);
+  background: var(--panel); border-bottom: 1px solid var(--border);
+}
+/* Which side is which, by name: "left" and "right" mean nothing an hour later
+   with the tab still open. */
+.dircmp-side { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dircmp-side b { color: var(--text); font-family: var(--mono); }
+.dircmp-counts { color: var(--text-muted); }
+.dircmp-toggle { display: flex; align-items: center; gap: 4px; color: var(--text-muted); cursor: pointer; }
+.dircmp-head .t-btn { height: var(--ctl-xs); font-size: var(--fs-xs); }
+.dircmp-note { margin: 0; padding: 12px; color: var(--text-muted); font-size: var(--fs-sm); }
+.dircmp-note.is-error { color: var(--bad); }
+.dircmp-note.is-warn { color: var(--dec-modified); }
+.dircmp-list { display: flex; flex-direction: column; }
+.dircmp-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 0 12px; height: var(--row); font-size: var(--fs-sm);
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+}
+.dircmp-row.openable { cursor: pointer; }
+.dircmp-row.openable:hover { background: var(--btn); }
+.dircmp-row:focus-visible { background: var(--btn); outline: none; box-shadow: inset 2px 0 0 var(--accent); }
+.dircmp-badge { flex: 0 0 1em; font-family: var(--mono); text-align: center; }
+.dircmp-path { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dircmp-word { flex: 0 0 auto; color: var(--text-muted); font-size: var(--fs-xs); }
+/* The states carry the colours git decoration already uses in this tool, so a
+   reader does not have to learn a second palette for the same three ideas. */
+.dircmp-row.differs .dircmp-badge { color: var(--dec-modified); }
+.dircmp-row.right .dircmp-badge { color: var(--dec-added); }
+.dircmp-row.left .dircmp-badge { color: var(--dec-deleted); }
+.dircmp-row.same { color: var(--text-muted); }

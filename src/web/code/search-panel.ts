@@ -9,13 +9,15 @@
 import type { AgentClient } from "./agent.ts";
 import type { FileRead, SearchHit, SearchSummary } from "../../agent/protocol.ts";
 import { VirtualList } from "./vlist.ts";
-import { esc, modalConfirm } from "./ui.ts";
+import { esc, modalConfirm, showMenu } from "./ui.ts";
 import { iconClose, iconReplace } from "./icons.ts";
 import { ROW_H as SHARED_ROW_H } from "./ui.ts";
 
 export interface SearchCallbacks {
   openAt(path: string, line: number, col: number): void;
   toast(message: string, isError?: boolean): void;
+  /** Something worth keeping happened; `detail` is for the output log. */
+  report(summary: string, detail?: string): void;
   /** Files on disk changed — the tree and git status are stale. */
   afterReplace(): void;
 }
@@ -32,6 +34,29 @@ export interface Options {
 }
 
 const OPTS_KEY = "enc-search-opts";
+const RECENT_KEY = "enc-search-recent";
+/** Enough to get back to this morning's query, short enough to stay a list a
+ *  person can read rather than scroll. */
+const MAX_RECENT = 10;
+
+const loadRecent = (): string[] => {
+  try {
+    const v = JSON.parse(localStorage.getItem(RECENT_KEY) ?? "[]") as unknown;
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+};
+
+const rememberQuery = (q: string): void => {
+  if (!q.trim()) return;
+  try {
+    const next = [q, ...loadRecent().filter((x) => x !== q)].slice(0, MAX_RECENT);
+    localStorage.setItem(RECENT_KEY, JSON.stringify(next));
+  } catch {
+    /* private mode */
+  }
+};
 const ROW_H = SHARED_ROW_H;
 const DEBOUNCE_MS = 300;
 /** Results are repainted on a timer, not per hit: a broad query can stream
@@ -42,6 +67,7 @@ const SHELL = `
   <div class="sp-form">
     <div class="sp-line">
       <input class="t-input js-query" placeholder="Search" spellcheck="false" autocomplete="off" />
+      <button class="sp-tog js-recent" type="button" title="Recent searches">↺</button>
       <button class="sp-tog js-case" type="button" title="Match case">Aa</button>
       <button class="sp-tog js-word" type="button" title="Match whole word">ab</button>
       <button class="sp-tog js-regex" type="button" title="Use regular expression">.*</button>
@@ -65,6 +91,14 @@ export class SearchPanel {
   private collapsed = new Set<string>();
   private dismissed = new Set<string>();
   private rows: Row[] = [];
+  /** Where F4 is in the result list. */
+  private at = -1;
+  /** The last summary from the agent, kept so the line can be recomputed as
+   *  matches are dismissed — it used to keep claiming the original number
+   *  after half the hits had been waved away. */
+  private summary: SearchSummary | null = null;
+  /** Set by the stop button while a replace is running. */
+  private cancelReplace = false;
   private list: VirtualList<Row>;
 
   private opts: Options;
@@ -109,13 +143,70 @@ export class SearchPanel {
     this.$(".js-query").addEventListener("keydown", (e) => {
       if ((e as KeyboardEvent).key === "Enter") void this.run();
     });
+    // Typing a replacement changes what the rows say, not what was found: the
+    // list is repainted, the scan is not repeated.
+    this.$(".js-replace").addEventListener("input", () => this.list.refresh());
     this.$(".js-replace-all").addEventListener("click", () => void this.replace([...this.results.keys()]));
+    this.$(".js-recent").addEventListener("click", (e) => this.recentMenu(e as MouseEvent));
 
     this.paintToggles();
   }
 
   focus(): void {
     this.$<HTMLInputElement>(".js-query").focus();
+    this.$<HTMLInputElement>(".js-query").select();
+  }
+
+  /** Put a query in the box and run it — used by the palette and by "search in
+   *  this folder" from the explorer. */
+  searchFor(query: string, include?: string): void {
+    this.$<HTMLInputElement>(".js-query").value = query;
+    if (include !== undefined) {
+      this.$<HTMLInputElement>(".js-include").value = include;
+      // The include field lives in a collapsed <details>; setting it silently
+      // would scope the search to something the reader cannot see.
+      this.host.querySelector<HTMLDetailsElement>(".sp-globs")?.setAttribute("open", "");
+    }
+    this.focus();
+    void this.run();
+  }
+
+  /** The replacement settings, or undefined while the replace box is empty —
+   *  in which case the rows are just results and nothing is previewed. */
+  private previewOpts(): { replacement: string; regex: RegExp | null; preserveCase: boolean } | undefined {
+    const replacement = this.$<HTMLInputElement>(".js-replace").value;
+    if (!replacement) return undefined;
+    const query = this.$<HTMLInputElement>(".js-query").value;
+    if (!query) return undefined;
+    let regex: RegExp | null = null;
+    if (this.opts.regex) {
+      if (!isValidRegex(query, this.opts)) return undefined;
+      regex = new RegExp(patternSource(query, this.opts), this.opts.matchCase ? "" : "i");
+    }
+    return { replacement, regex, preserveCase: this.opts.preserveCase };
+  }
+
+  private recentMenu(e: MouseEvent): void {
+    const recent = loadRecent();
+    if (!recent.length) return this.cb.toast("No searches yet in this browser.");
+    showMenu(
+      e.clientX,
+      e.clientY,
+      recent.map((q) => ({
+        label: q.length > 48 ? `${q.slice(0, 47)}…` : q,
+        run: () => this.searchFor(q),
+      })),
+    );
+  }
+
+  /** Walk the hits from the keyboard. F4 is what every editor binds to it, and
+   *  without it a long result list is a mouse-only object. */
+  step(delta: number): void {
+    const hits = this.rows.filter((r): r is Extract<Row, { kind: "hit" }> => r.kind === "hit");
+    if (!hits.length) return;
+    this.at = (this.at + delta + hits.length) % hits.length;
+    const row = hits[this.at];
+    this.cb.openAt(row.path, row.hit.line, row.hit.col);
   }
 
   /** Called when the panel becomes visible or files changed underneath it. */
@@ -160,6 +251,10 @@ export class SearchPanel {
       return;
     }
     this.setSummary("searching…");
+    this.at = -1;
+    // Remembered once the query is known to be runnable, so a half-typed
+    // regular expression does not end up in the list.
+    rememberQuery(query);
 
     const { id, promise } = this.agent.callTracked<SearchSummary>(
       "search",
@@ -191,14 +286,9 @@ export class SearchPanel {
       // final summary and leave the panel looking stuck.
       if (this.paintTimer) clearTimeout(this.paintTimer);
       this.paintTimer = null;
+      this.summary = summary;
       this.rebuild();
-      this.setSummary(
-        summary.matches === 0
-          ? "no results"
-          : `${summary.matches} result${summary.matches === 1 ? "" : "s"} in ${summary.files} file${summary.files === 1 ? "" : "s"}` +
-              (summary.truncated ? " (truncated)" : "") +
-              ` · ${summary.engine}`,
-      );
+      this.renderSummary();
     } catch (e) {
       if (this.paintTimer) clearTimeout(this.paintTimer);
       this.paintTimer = null;
@@ -217,7 +307,37 @@ export class SearchPanel {
   }
 
   private setSummary(text: string): void {
+    this.summary = null;
     this.$(".js-summary").textContent = text;
+  }
+
+  /** The count as it stands now.
+   *
+   *  Counted off the rows rather than off the agent's total, so dismissing a
+   *  match changes the number. Reporting what the scan found while the list
+   *  shows something else is the summary disagreeing with the thing it
+   *  summarises; the scan's own total is still named when the two differ, since
+   *  "3 of 57" is the useful shape of that sentence. */
+  private renderSummary(): void {
+    const s = this.summary;
+    if (!s) return;
+    let matches = 0;
+    let files = 0;
+    for (const row of this.rows) {
+      if (row.kind !== "file") continue;
+      files++;
+      matches += row.count;
+    }
+    const el = this.$(".js-summary");
+    if (matches === 0) {
+      el.textContent = s.matches === 0 ? "no results" : `all ${s.matches} results dismissed`;
+      return;
+    }
+    el.textContent =
+      `${matches}${matches < s.matches ? ` of ${s.matches}` : ""} result${matches === 1 ? "" : "s"}` +
+      ` in ${files} file${files === 1 ? "" : "s"}` +
+      (s.truncated ? " (truncated)" : "") +
+      ` · ${s.engine}`;
   }
 
   // ── rows ────────────────────────────────────────────────────────────────
@@ -232,6 +352,7 @@ export class SearchPanel {
       for (const hit of live) this.rows.push({ kind: "hit", path, hit, key: hitKey(path, hit) });
     }
     this.list.setItems(this.rows);
+    this.renderSummary();
   }
 
   private rowHtml(row: Row): string {
@@ -255,7 +376,7 @@ export class SearchPanel {
     // ends. The title carries the line as it actually is.
     return `<div class="sp-hit" data-path="${esc(row.path)}" data-key="${esc(row.key)}" title="${esc(hitTitle(row.path, row.hit))}">
       <span class="sp-lineno">${row.hit.line}</span>
-      <span class="sp-text">${hitHtml(row.hit)}</span>
+      <span class="sp-text">${hitHtml(row.hit, this.previewOpts())}</span>
       <span class="sp-acts"><button class="t-icon" data-act="dismiss-hit" title="Dismiss match">${iconClose}</button></span>
     </div>`;
   }
@@ -303,8 +424,26 @@ export class SearchPanel {
     let files = 0;
     let done = 0;
     let skipped = 0;
+    const written: string[] = [];
+
+    // A replace across a monorepo is a sequence of writes with no upper bound
+    // on how long it takes, and it used to happen behind a silent panel. Now it
+    // says where it is and can be stopped — between files, so a file is never
+    // left half written.
+    this.cancelReplace = false;
+    const bar = this.$(".js-summary");
+    const showProgress = (): void => {
+      bar.innerHTML = `<span>replacing… ${files}/${live.length} files</span>
+        <button class="t-btn js-stop-replace" type="button">stop</button>`;
+      bar.querySelector(".js-stop-replace")!.addEventListener("click", () => {
+        this.cancelReplace = true;
+        bar.textContent = "stopping…";
+      });
+    };
+    showProgress();
 
     for (const [path, hits] of live) {
+      if (this.cancelReplace) break;
       try {
         const file = await this.agent.call<FileRead>("fs.read", { path });
         if (file.text === null) {
@@ -335,13 +474,24 @@ export class SearchPanel {
           await this.agent.call("fs.write", { path, text: parts.join("") });
           files++;
           done += touched;
+          written.push(`${path} — ${touched}`);
+          showProgress();
         }
       } catch (e) {
         this.cb.toast(`${path}: ${e instanceof Error ? e.message : String(e)}`, true);
       }
     }
 
-    this.cb.toast(`replaced ${done} in ${files} file${files === 1 ? "" : "s"}${skipped ? `, ${skipped} skipped (changed on disk)` : ""}`);
+    const stopped = this.cancelReplace;
+    this.cancelReplace = false;
+    const headline =
+      `replaced ${done} in ${files} file${files === 1 ? "" : "s"}` +
+      (skipped ? `, ${skipped} skipped (changed on disk)` : "") +
+      (stopped ? " — stopped early" : "");
+    // The file list goes to the output log rather than a toast: twenty paths
+    // are not something to read in two seconds, and after a replace across a
+    // project "which files did that touch" is the next question.
+    this.cb.report(headline, written.join("\n") || undefined);
     this.cb.afterReplace();
     void this.run();
   }
@@ -378,6 +528,17 @@ export function replaceInLine(
     count++;
   }
   return { line: out, count };
+}
+
+/** What one matched fragment becomes — the same two steps `replaceInLine` takes,
+ *  so the preview cannot drift from what the write will do. */
+function renderReplacement(
+  matched: string,
+  o: { replacement: string; regex: RegExp | null; preserveCase: boolean },
+): string {
+  let rep = o.regex ? matched.replace(o.regex, o.replacement) : o.replacement;
+  if (o.preserveCase) rep = preserveCase(matched, rep);
+  return rep;
 }
 
 /** The regex source the agent searched with, rebuilt here so replace behaves
@@ -425,7 +586,14 @@ function hitTitle(path: string, hit: SearchHit): string {
 
 /** One result line, with the matches marked and long lines trimmed around the
  *  first hit so the interesting part is visible without scrolling. */
-function hitHtml(hit: SearchHit): string {
+/** One result line, with the matches marked — and, when a replacement is being
+ *  typed, with what each match is about to become.
+ *
+ *  "Replace all" writes to files that are not open, so the only chance to see
+ *  what it does is before it does it. A capture group in a regular expression
+ *  is exactly where that matters most: `$1` is a promise the box cannot keep
+ *  until it is applied to the line. */
+function hitHtml(hit: SearchHit, preview?: { replacement: string; regex: RegExp | null; preserveCase: boolean }): string {
   const MAX = 200;
   let text = hit.text;
   let ranges = hit.ranges.map(([s, e]) => [s, e] as [number, number]);
@@ -453,7 +621,19 @@ function hitHtml(hit: SearchHit): string {
   for (const [s, e] of ranges) {
     if (s >= text.length || e <= s) continue;
     const end = Math.min(e, text.length);
-    out += esc(text.slice(pos, s)) + `<mark>${esc(text.slice(s, end))}</mark>`;
+    const matched = text.slice(s, end);
+    out += esc(text.slice(pos, s));
+    if (preview) {
+      const to = renderReplacement(matched, preview);
+      // Both halves, so the reader compares them instead of taking the new one
+      // on trust. An unchanged match shows once, not twice.
+      out +=
+        to === matched
+          ? `<mark>${esc(matched)}</mark>`
+          : `<mark class="from">${esc(matched)}</mark><mark class="to">${esc(to)}</mark>`;
+    } else {
+      out += `<mark>${esc(matched)}</mark>`;
+    }
     pos = end;
   }
   return prefix + out + esc(text.slice(pos)) + suffix;

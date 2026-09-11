@@ -152,7 +152,9 @@ export class TabEditor {
   private cDark = new Compartment();
   private changeCb: (() => void) | null = null;
 
-  constructor(private readonly tab: Tab, parent: HTMLElement, placeholderText: string) {
+  /** `readOnly` is for the result pane in two-pane mode: it holds output, and
+   *  typing into it would produce something neither side accounts for. */
+  constructor(private readonly tab: Tab, parent: HTMLElement, placeholderText: string, readOnly = false) {
     const p = prefs[tab];
     // Same answer main.ts starts from, including "no choice yet — ask the
     // system"; reading the key directly meant this editor built itself light
@@ -181,6 +183,7 @@ export class TabEditor {
           this.cWrap.of(TabEditor.extensionFor("wrap", p.wrap)),
           this.cFold.of(TabEditor.extensionFor("fold", p.fold)),
           this.cLint.of([]),
+          ...(readOnly ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []),
           // closeBrackets first: it owns Backspace over an auto-inserted pair,
           // which the default keymap would otherwise take.
           keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
@@ -204,6 +207,20 @@ export class TabEditor {
   }
   selectionLength(): number {
     return this.view.state.selection.ranges.reduce((n, r) => n + (r.to - r.from), 0);
+  }
+
+  /** The selected text, or "" when nothing is selected. One range: encrypting
+   *  several disjoint selections into one envelope would produce something
+   *  that decrypts to a concatenation nobody asked for. */
+  get selectedText(): string {
+    const r = this.view.state.selection.main;
+    return r.empty ? "" : this.view.state.sliceDoc(r.from, r.to);
+  }
+
+  /** Put text where the selection is, leaving the rest of the document alone. */
+  replaceSelection(text: string): void {
+    const r = this.view.state.selection.main;
+    this.view.dispatch({ changes: { from: r.from, to: r.to, insert: text } });
   }
 
   focus(): void {

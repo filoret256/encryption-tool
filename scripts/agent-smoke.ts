@@ -38,12 +38,13 @@ interface Impl {
   exe: string[];
 }
 
-const argvFor = (impl: Impl, root: string, port: number): string[] => [
+const argvFor = (impl: Impl, root: string, port: number, extra: string[] = []): string[] => [
   ...impl.exe,
   "--root",
   root,
   "--port",
   String(port),
+  ...extra,
   // This harness is not a browser and sends no Origin, which the agent now
   // refuses by default. Saying so explicitly is the point: the flag is the
   // only way in for a non-browser client, and these tests are one.
@@ -87,7 +88,12 @@ function canonical(value: unknown): unknown {
     for (const key of Object.keys(rec).sort()) {
       const v = rec[key];
       out[key] =
-        key === "mtime" && typeof v === "number" ? Math.floor(v)
+        // Also the clock. The two agents run one after the other against one
+        // shared workspace, and the suite writes to it — so a file listed by
+        // the first run and rewritten before the second is listed carries two
+        // different timestamps for one identical behaviour. Zeroed rather than
+        // dropped, so "reports an mtime" and "omits one" still differ.
+        key === "mtime" && typeof v === "number" ? 0
         : key === "time" && uncommitted ? 0
         : canonical(v);
     }
@@ -104,6 +110,9 @@ type Call = <T>(op: string, params?: Record<string, unknown>, track?: boolean) =
 
 interface Client {
   call: Call;
+  /** Every `fs.change` push received so far, oldest first. The watcher suite
+   *  asserts on what the agent volunteered, not only on what it was asked. */
+  pushes: string[][];
   close: () => Promise<void>;
 }
 
@@ -111,10 +120,24 @@ interface Client {
  *
  *  `tag` namespaces the recorded replies: a run drives two agents — one on this
  *  repository, one on a throwaway workspace — and the same op with the same
- *  params means different things in each. */
-async function connect(argv: string[], label: string, answers: Map<string, string>, tag: string): Promise<Client> {
+ *  params means different things in each.
+ *
+ *  `env` is added to the agent's environment, and through it to every git the
+ *  agent runs. The mutation suite uses it to pin commit dates: a revert makes a
+ *  commit of its own, and a commit stamped with the wall clock has a different
+ *  oid in each of the two runs — which the comparison would report as the
+ *  implementations disagreeing about a hash they both merely inherited from the
+ *  second hand. */
+async function connect(
+  argv: string[],
+  label: string,
+  answers: Map<string, string>,
+  tag: string,
+  env: Record<string, string> = {},
+): Promise<Client> {
   const proc = Bun.spawn(argv, {
     cwd: process.cwd(),
+    env: { ...process.env, ...env },
     stdout: "pipe",
     stderr: "inherit",
     stdin: "ignore",
@@ -138,11 +161,18 @@ async function connect(argv: string[], label: string, answers: Map<string, strin
 
   const ws = new WebSocket(url);
   const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; chunks: unknown[] }>();
+  const pushes: string[][] = [];
   let nextId = 1;
 
   ws.addEventListener("message", (ev) => {
     const frame = JSON.parse(String(ev.data)) as Record<string, unknown>;
-    if (typeof frame.event === "string") return; // push (fs.change)
+    if (typeof frame.event === "string") {
+      if (frame.event === "fs.change") {
+        const paths = (frame.data as { paths?: unknown })?.paths;
+        if (Array.isArray(paths)) pushes.push(paths.map(String));
+      }
+      return;
+    }
     const entry = pending.get(frame.id as number);
     if (!entry) return;
     if ("chunk" in frame) return void entry.chunks.push(frame.chunk);
@@ -182,6 +212,7 @@ async function connect(argv: string[], label: string, answers: Map<string, strin
 
   return {
     call,
+    pushes,
     async close(): Promise<void> {
       ws.close();
       proc.kill();
@@ -228,6 +259,12 @@ async function makeSandbox(): Promise<Sandbox> {
   await git("config", "user.name", "Smoke");
   await writeFile(join(root, "app.ts"), "export const v = 1;\n");
   await writeFile(join(root, "real.txt"), "a real file\n");
+  // A neighbour of .git that is ordinary content. Created here rather than by
+  // the suite, because the sandbox is shared between the two runs: a directory
+  // the first run brings into being is a directory the second run's `readdir`
+  // sees and the first run's did not, and the byte-for-byte comparison would
+  // report that as the implementations disagreeing.
+  await mkdir(join(root, ".github"), { recursive: true });
   await git("add", ".");
   await git("commit", "-qm", "init");
   // A configured remote, so "only a configured name" has something to accept.
@@ -391,7 +428,552 @@ async function suite(impl: Impl, sandbox: Sandbox): Promise<{ results: Result[];
   }
 
   await hardening(impl, sandbox, answers, check);
+  await mutations(impl, answers, check);
+  await newOps(impl, answers, check);
+  await watcherQuiet(impl, answers, check);
   return { results, answers };
+}
+
+// ── mutations: the ops that change the repository ─────────────────────────
+//
+// Twelve ops were reached by neither suite above, because neither could run
+// them: the read-only suite works on this repository, and the hardening suite
+// shares one workspace between the two agents, so anything that writes history
+// would leave the second agent looking at a repository the first had already
+// changed. They are exactly the ops that stage, unstage, discard, branch,
+// merge, revert and cherry-pick — the ones that do something irreversible to a
+// user's work, and the ones whose replies nothing was comparing.
+//
+// That is the same silence the junction escape lived in: a hole in the Go jail
+// survived because the only test that would have caught it was never run.
+//
+// Each agent gets its own workspace, built to the same recipe with fixed dates
+// and a fixed identity, so the commit oids come out identical and the two runs
+// remain comparable field for field.
+
+/** Fixed so two separately built repositories hash to the same commits. */
+const FIXED_DATE = "2020-01-01T00:00:00Z";
+
+async function makeRepo(tag: string, parent = tmpdir()): Promise<string> {
+  const root = await mkdtemp(join(parent, `enc-agent-mut-${tag}-`));
+  const git = async (...args: string[]): Promise<void> => {
+    const p = Bun.spawn(["git", ...args], {
+      cwd: root,
+      stdout: "ignore",
+      stderr: "ignore",
+      stdin: "ignore",
+      env: { ...process.env, GIT_AUTHOR_DATE: FIXED_DATE, GIT_COMMITTER_DATE: FIXED_DATE },
+    });
+    await p.exited;
+  };
+  await git("init", "-q", "-b", "main");
+  await git("config", "user.email", "smoke@example.invalid");
+  await git("config", "user.name", "Smoke");
+  // Off, so a checkout hands back the bytes that were committed. With Windows'
+  // default the file comes back with CRLF, which makes a byte-for-byte
+  // assertion about discarded content platform-dependent — and would put the
+  // two platforms' commit oids out of step with each other as well.
+  await git("config", "core.autocrlf", "false");
+  await writeFile(join(root, "a.txt"), "one\n");
+  await writeFile(join(root, "b.txt"), "two\n");
+  await git("add", "-A");
+  await git("commit", "-qm", "first");
+  // A second commit, so revert and cherry-pick have something with a parent.
+  await writeFile(join(root, "a.txt"), "one changed\n");
+  await git("add", "-A");
+  await git("commit", "-qm", "second");
+  return root;
+}
+
+async function mutations(
+  impl: Impl,
+  answers: Map<string, string>,
+  check: (name: string, ok: boolean, note?: string) => void,
+): Promise<void> {
+  const root = await makeRepo(impl.id);
+  const client = await connect(
+    argvFor(impl, root, impl.port + 20),
+    `${impl.label} — mutations`,
+    answers,
+    "mut ",
+    { GIT_AUTHOR_DATE: FIXED_DATE, GIT_COMMITTER_DATE: FIXED_DATE },
+  );
+  const { call } = client;
+
+  try {
+    // Staging, in both directions, and the status that must reflect it. The
+    // reply to git.status is what carries the parity: a porcelain-v2 field read
+    // differently by one implementation shows up here and nowhere else.
+    await writeFile(join(root, "a.txt"), "one edited\n");
+    await writeFile(join(root, "new.txt"), "fresh\n");
+    await call("git.stage", { paths: ["a.txt", "new.txt"] });
+    const staged = await call<GitStatus>("git.status");
+    check(
+      "git.stage",
+      staged.entries.filter((e) => e.index !== ".").length === 2,
+      staged.entries.map((e) => `${e.path}:${e.index}${e.work}`).join(" "),
+    );
+
+    await call("git.unstage", { paths: ["new.txt"] });
+    const unstaged = await call<GitStatus>("git.status");
+    check("git.unstage", unstaged.entries.some((e) => e.path === "new.txt" && e.untracked), "new.txt back to untracked");
+
+    // Discard throws work away, which is why it is worth knowing the two agents
+    // agree on exactly which work. On a path that is modified but *not* staged:
+    // discard restores from the index, so discarding something staged a moment
+    // ago restores the staged copy and proves nothing.
+    await writeFile(join(root, "b.txt"), "two edited\n");
+    await call("git.discard", { paths: ["b.txt"] });
+    const afterDiscard = await readFile(join(root, "b.txt"), "utf8");
+    check("git.discard", afterDiscard === "two\n", JSON.stringify(afterDiscard));
+
+    // Branches: create, rename, delete — and the listing after each, which is
+    // the for-each-ref parser both implementations have their own copy of.
+    //
+    // branchCreate is `switch -c`, so it moves HEAD onto the new branch; git
+    // refuses to delete the branch the worktree is on, which is why each of
+    // these steps checks out main again before the next.
+    await call("git.branchCreate", { name: "topic", from: "HEAD" });
+    const withTopic = await call<Branch[]>("git.branches");
+    check(
+      "git.branchCreate",
+      withTopic.some((b) => b.name === "topic" && b.head),
+      withTopic.map((b) => (b.head ? `*${b.name}` : b.name)).join(", "),
+    );
+
+    await call("git.checkout", { ref: "main" });
+    await call("git.branchRename", { from: "topic", to: "topic-2" });
+    const renamed = await call<Branch[]>("git.branches");
+    check(
+      "git.branchRename",
+      renamed.some((b) => b.name === "topic-2") && !renamed.some((b) => b.name === "topic"),
+      renamed.map((b) => b.name).join(", "),
+    );
+
+    await call("git.branchDelete", { name: "topic-2" });
+    const deleted = await call<Branch[]>("git.branches");
+    check("git.branchDelete", !deleted.some((b) => b.name.startsWith("topic")), deleted.map((b) => b.name).join(", "));
+
+    // Merge of a branch that points at the same commit: a fast-forward that
+    // changes nothing, so the repository is left where the later checks expect
+    // it, and the reply is still the one the panel would show.
+    await call("git.branchCreate", { name: "ff", from: "HEAD" });
+    await call("git.checkout", { ref: "main" });
+    const merged = await call("git.merge", { ref: "ff" });
+    check("git.merge", merged !== undefined, "already up to date");
+    await call("git.branchDelete", { name: "ff" });
+
+    // Revert and cherry-pick need a clean tree — git refuses both otherwise —
+    // so the staging left over from the checks above is put back first.
+    await call("git.unstage", { paths: ["a.txt"] });
+    await call("git.discard", { paths: ["a.txt"] });
+    await call("fs.delete", { paths: ["new.txt"] });
+    const clean = await call<GitStatus>("git.status");
+    check("tree clean before revert", clean.entries.length === 0, `${clean.entries.length} entries`);
+
+    // Revert first, then cherry-pick the same commit back, which leaves the tree
+    // as it was — and makes both ops observable through the log rather than the
+    // tree.
+    const log = await call<Commit[]>("git.log", { limit: 5 });
+    const second = log.find((c) => c.subject === "second")!;
+    await call("git.revert", { oid: second.oid });
+    const afterRevert = await call<Commit[]>("git.log", { limit: 5 });
+    check("git.revert", afterRevert.length === log.length + 1, `${afterRevert.length} commits, head="${afterRevert[0]?.subject}"`);
+
+    await call("git.cherryPick", { oid: second.oid });
+    const afterPick = await call<Commit[]>("git.log", { limit: 6 });
+    check("git.cherryPick", afterPick.length === afterRevert.length + 1, `head="${afterPick[0]?.subject}"`);
+
+    // mergeAbort with no merge in progress, and resolve on a path with no
+    // conflict: neither is a normal call, and an agent that answers one of them
+    // differently is an agent that says something different in the panel.
+    await call("git.mergeAbort", {}).catch(() => {});
+    await call("git.resolve", { paths: ["b.txt"] }).catch(() => {});
+    check("git.mergeAbort / git.resolve answered", true, "recorded for comparison");
+
+    // The other half of the watcher. Started by the read-only suite; stopping it
+    // was never called anywhere.
+    await call("watch.start");
+    const stopped = await call("watch.stop");
+    check("watch.stop", stopped !== undefined, JSON.stringify(stopped));
+  } catch (e) {
+    check("unexpected error (mutations)", false, e instanceof Error ? e.message : String(e));
+  } finally {
+    await client.close();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+// ── the ops added for the agent package ───────────────────────────────────
+//
+// Eight ops that arrived in one pass, each behind a piece of UI that could not
+// be built without it. They share a suite for the same reason they shared a
+// pass: every one of them is a new argv in two implementations, and the only
+// question worth asking about each is whether the two answer alike.
+
+async function newOps(
+  impl: Impl,
+  answers: Map<string, string>,
+  check: (name: string, ok: boolean, note?: string) => void,
+): Promise<void> {
+  // Two repositories under one parent, and the agent told the parent is fair
+  // game: that is the shape agent.setRoot exists for — one agent, a second
+  // project, no restart.
+  const parent = await mkdtemp(join(tmpdir(), `enc-agent-ops-${impl.id}-`));
+  const root = await makeRepo(`ops-${impl.id}`, parent);
+  const other = await makeRepo(`other-${impl.id}`, parent);
+  const client = await connect(
+    argvFor(impl, root, impl.port + 40, ["--allow-root", parent]),
+    `${impl.label} — new ops`,
+    answers,
+    "ops ",
+    { GIT_AUTHOR_DATE: FIXED_DATE, GIT_COMMITTER_DATE: FIXED_DATE },
+  );
+  const { call } = client;
+
+  /** The op must be refused, with a message matching `re`.
+   *
+   *  `track` is off where the params carry this run's temp directory: the
+   *  cross-agent comparison keys replies by op and params, and the two runs get
+   *  their own workspaces — so a path that differs by construction would be
+   *  reported as the implementations disagreeing. The check itself still runs
+   *  against both. */
+  const denied = async (
+    name: string,
+    op: string,
+    params: Record<string, unknown>,
+    re: RegExp,
+    track = true,
+  ): Promise<void> => {
+    try {
+      const data = await call(op, params, track);
+      check(name, false, `ALLOWED — returned ${JSON.stringify(data).slice(0, 60)}`);
+    } catch (e) {
+      const msg = (e as Error).message;
+      check(name, re.test(msg), msg.slice(0, 80));
+    }
+  };
+
+  try {
+    // ── UXB-77: git.log skip ──
+    // Two commits exist. Page size one: the second page must be the second
+    // commit, and asking past the end must be empty rather than an error.
+    const page1 = await call<Commit[]>("git.log", { limit: 1 });
+    const page2 = await call<Commit[]>("git.log", { limit: 1, skip: 1 });
+    const all = await call<Commit[]>("git.log", { limit: 10 });
+    check(
+      "git.log skip pages the history",
+      page1.length === 1 && page2.length === 1 && page1[0].oid === all[0].oid && page2[0].oid === all[1].oid,
+      `${page1[0]?.subject} then ${page2[0]?.subject}`,
+    );
+    const past = await call<Commit[]>("git.log", { limit: 5, skip: 99 });
+    check("git.log skip past the end is empty", past.length === 0, `${past.length} commits`);
+
+    // ── UXB-74: git.checkIgnore ──
+    await writeFile(join(root, ".gitignore"), "ignored.txt\nbuild/\n");
+    await mkdir(join(root, "build"), { recursive: true });
+    await writeFile(join(root, "ignored.txt"), "x\n");
+    await writeFile(join(root, "build", "out.js"), "x\n");
+    await writeFile(join(root, "kept.txt"), "x\n");
+    const ignored = await call<string[]>("git.checkIgnore", {
+      paths: ["ignored.txt", "kept.txt", "build/out.js", "a.txt"],
+    });
+    check(
+      "git.checkIgnore names only the ignored",
+      ignored.length === 2 && ignored.includes("ignored.txt") && ignored.includes("build/out.js"),
+      JSON.stringify(ignored),
+    );
+    const noneIgnored = await call<string[]>("git.checkIgnore", { paths: ["a.txt", "b.txt"] });
+    // Exit 1 means "none of them", which must read as an empty list and not as
+    // a failed command — the difference between a dimmed tree and a red toast.
+    check("git.checkIgnore with no matches is empty, not an error", noneIgnored.length === 0, JSON.stringify(noneIgnored));
+
+    // ── UXB-79: tags ──
+    await call("git.tagCreate", { name: "v1.0.0", ref: "HEAD" });
+    await call("git.tagCreate", { name: "v1.1.0", ref: "HEAD", message: "first annotated" });
+    const tagged = await call<Branch[]>("git.branches");
+    const tags = tagged.filter((b) => b.tag).map((b) => b.name).sort();
+    check("git.tagCreate, lightweight and annotated", tags.join(",") === "v1.0.0,v1.1.0", tags.join(", "));
+    await call("git.tagDelete", { name: "v1.0.0" });
+    const afterDelete = await call<Branch[]>("git.branches");
+    check(
+      "git.tagDelete",
+      !afterDelete.some((b) => b.tag && b.name === "v1.0.0"),
+      afterDelete.filter((b) => b.tag).map((b) => b.name).join(", ") || "none",
+    );
+    await denied("git.tagCreate refuses an option-shaped name", "git.tagCreate", { name: "--output=x" }, /Invalid tag/);
+
+    // ── UXB-80: reflog ──
+    // Every ref movement so far is in it, newest first, and HEAD@{0} is the
+    // most recent — which is what "undo the last operation" resets onto.
+    const reflog = await call<{ selector: string; oid: string; action: string; message: string; time: number }[]>(
+      "git.reflog",
+      { limit: 10 },
+    );
+    check(
+      "git.reflog lists ref movements newest first",
+      reflog.length >= 2 && reflog[0].selector === "HEAD@{0}" && reflog[0].oid.length === 40,
+      reflog.slice(0, 2).map((r) => `${r.selector} ${r.action}: ${r.message}`).join(" | "),
+    );
+    check(
+      "git.reflog splits the action from the message",
+      reflog.every((r) => !r.message.startsWith(": ")) && reflog.some((r) => r.action === "commit"),
+      reflog.map((r) => r.action).join(","),
+    );
+
+    // ── UXB-72: remote administration ──
+    await call("git.remoteAdmin", { action: "add", name: "origin", url: "https://example.invalid/x.git" });
+    const added = await call<{ name: string; url: string }[]>("git.remotes");
+    check("git.remoteAdmin add", added.length === 1 && added[0].name === "origin", JSON.stringify(added));
+    await call("git.remoteAdmin", { action: "rename", name: "origin", to: "upstream" });
+    const renamed = await call<{ name: string; url: string }[]>("git.remotes");
+    check("git.remoteAdmin rename", renamed.length === 1 && renamed[0].name === "upstream", JSON.stringify(renamed));
+
+    // The URL is the one value here git will later execute against, so the
+    // refusals matter more than the happy path.
+    await denied(
+      "git.remoteAdmin refuses an ext:: transport",
+      "git.remoteAdmin",
+      { action: "add", name: "evil", url: "ext::sh -c whoami" },
+      /Unsupported remote URL/,
+    );
+    await denied(
+      "git.remoteAdmin refuses a local path",
+      "git.remoteAdmin",
+      { action: "add", name: "local", url: "../../elsewhere" },
+      /Unsupported remote URL/,
+    );
+    await denied(
+      "git.remoteAdmin refuses an option-shaped name",
+      "git.remoteAdmin",
+      { action: "add", name: "-x", url: "https://example.invalid/x.git" },
+      /Invalid remote/,
+    );
+    await denied(
+      "git.remoteAdmin action is not a git subcommand",
+      "git.remoteAdmin",
+      { action: "set-url", name: "upstream", url: "https://example.invalid/y.git" },
+      /Invalid remote admin action/,
+    );
+    await call("git.remoteAdmin", { action: "remove", name: "upstream" });
+    const removed = await call<{ name: string; url: string }[]>("git.remotes");
+    check("git.remoteAdmin remove", removed.length === 0, JSON.stringify(removed));
+
+    // ── UXB-76: applyPatch ──
+    // A one-hunk patch against a two-line file: the index must take it and the
+    // worktree must not move, which is the whole point of --cached.
+    await writeFile(join(root, "hunk.txt"), "alpha\nbeta\ngamma\n");
+    await call("git.stage", { paths: ["hunk.txt"] });
+    await call("git.commit", { message: "add hunk.txt" }, false);
+    await writeFile(join(root, "hunk.txt"), "alpha\nBETA\ngamma\n");
+    const patch = [
+      "diff --git a/hunk.txt b/hunk.txt",
+      "--- a/hunk.txt",
+      "+++ b/hunk.txt",
+      "@@ -1,3 +1,3 @@",
+      " alpha",
+      "-beta",
+      "+BETA",
+      " gamma",
+      "",
+    ].join("\n");
+    await call("git.applyPatch", { patch });
+    const stagedHunk = await call<GitStatus>("git.status");
+    check(
+      "git.applyPatch stages a hunk",
+      stagedHunk.entries.some((e) => e.path === "hunk.txt" && e.index === "M"),
+      stagedHunk.entries.map((e) => `${e.path}:${e.index}${e.work}`).join(" "),
+    );
+    check("git.applyPatch left the worktree alone", (await readFile(join(root, "hunk.txt"), "utf8")) === "alpha\nBETA\ngamma\n");
+
+    await call("git.applyPatch", { patch, reverse: true });
+    const unstagedHunk = await call<GitStatus>("git.status");
+    check(
+      "git.applyPatch reverse unstages it again",
+      !unstagedHunk.entries.some((e) => e.path === "hunk.txt" && e.index === "M"),
+      unstagedHunk.entries.map((e) => `${e.path}:${e.index}${e.work}`).join(" ") || "clean index",
+    );
+    await denied("git.applyPatch refuses an empty patch", "git.applyPatch", { patch: "   " }, /Patch is empty/);
+    await denied("git.applyPatch refuses a patch that does not apply", "git.applyPatch",
+      { patch: patch.replace("alpha", "nothing-like-this") }, /./);
+
+    // ── UXB-82: windowed fs.read ──
+    // The file is deliberately longer than one window and carries multi-byte
+    // characters, because a window that lands mid-character is the failure
+    // this has to not have.
+    const line = "абвгд-0123456789\n"; // 27 bytes: 10 two-byte runes + 7 ascii
+    const big = line.repeat(200);
+    await writeFile(join(root, "big.txt"), big);
+    const bigBytes = Buffer.byteLength(big, "utf8");
+
+    const head = await call<FileRead>("fs.read", { path: "big.txt", length: 100 });
+    check(
+      "fs.read window: offset 0",
+      head.text !== null && head.offset === 0 && !head.eof && head.size === bigBytes && big.startsWith(head.text),
+      `${head.text?.length} chars of ${head.size} bytes`,
+    );
+    // 25 is inside the first line's trailing ascii run; 5 is mid-way through a
+    // two-byte rune, which is the case alignUtf8 exists for.
+    const mid = await call<FileRead>("fs.read", { path: "big.txt", offset: 5, length: 60 });
+    check(
+      "fs.read window: an offset mid-character is snapped forward",
+      mid.text !== null && mid.offset === 6 && !mid.text.includes("�"),
+      `offset asked 5, got ${mid.offset}`,
+    );
+    check(
+      "fs.read window: the text is exactly the bytes it claims",
+      mid.text === Buffer.from(big, "utf8").subarray(mid.offset, mid.offset + Buffer.byteLength(mid.text ?? "", "utf8")).toString("utf8"),
+    );
+    const tail = await call<FileRead>("fs.read", { path: "big.txt", offset: bigBytes - 20, length: 4096 });
+    check("fs.read window: the last one reports eof", tail.eof === true && tail.text !== null, `eof=${tail.eof}`);
+    const whole = await call<FileRead>("fs.read", { path: "big.txt" });
+    check("fs.read without a window is unchanged", whole.text === big && whole.offset === 0 && whole.eof === true);
+    await denied("fs.read refuses a window past the read cap", "fs.read",
+      { path: "big.txt", length: 4 * 1024 * 1024 + 1 }, /^Length is too large: \d+ bytes .limit 4194304.$/);
+
+    // ── UXB-73: agent.setRoot ──
+    // The second repository, and back again.
+    const moved = await call<AgentInfo>("agent.setRoot", { path: other }, false);
+    check("agent.setRoot moves the workspace to another repository", moved.root === other && moved.repo === ".", moved.root.slice(-24));
+    const listedThere = await call<DirEntry[]>("fs.readdir", { path: "" }, false);
+    check(
+      "the new root is what fs.readdir lists",
+      listedThere.map((e) => e.name).join(",") === "a.txt,b.txt",
+      listedThere.map((e) => e.name).join(", "),
+    );
+    const logThere = await call<Commit[]>("git.log", { limit: 10 }, false);
+    check("git follows the workspace", logThere.length === 2 && logThere[0].subject === "second", `${logThere.length} commits`);
+
+    // The parent holds both repositories and is a repository itself of nothing.
+    // Saying so is the point: a stale `repo: "."` would have the UI showing a
+    // branch for a folder that has none.
+    const atParent = await call<AgentInfo>("agent.setRoot", { path: parent }, false);
+    check("a folder that is not a repository reports so", atParent.repo === null && atParent.root === parent, JSON.stringify(atParent.repo));
+    try {
+      await call("git.status", {}, false);
+      check("git ops are refused outside a repository", false, "git.status answered");
+    } catch (e) {
+      check("git ops are refused outside a repository", /Not a git repository/.test((e as Error).message), (e as Error).message);
+    }
+
+    const back = await call<AgentInfo>("agent.setRoot", { path: root }, false);
+    check("agent.setRoot comes back, and git with it", back.root === root && back.repo === ".", `${back.repo}`);
+
+    // A subfolder of a repository snaps back up to the repository root, the
+    // same way the startup root does — one coordinate system for filesystem and
+    // git paths is the whole reason that snapping exists.
+    await call("fs.createDir", { path: "sub/inner" }, false);
+    const snapped = await call<AgentInfo>("agent.setRoot", { path: join(root, "sub") }, false);
+    check("a subfolder of a repository snaps to the repository root", snapped.root === root, snapped.root.slice(-24));
+
+    await denied(
+      "agent.setRoot refuses a folder outside the allowed roots",
+      "agent.setRoot",
+      { path: tmpdir() },
+      /outside what this agent may open/,
+    );
+    await denied("agent.setRoot refuses a folder that is not there", "agent.setRoot",
+      { path: join(root, "no-such-folder") }, /Cannot open folder/, false);
+    const still = await call<AgentInfo>("agent.info", {}, false);
+    check("a refused setRoot left the workspace where it was", still.root === root, still.root.slice(-24));
+  } catch (e) {
+    check("unexpected error (new ops)", false, e instanceof Error ? e.message : String(e));
+  } finally {
+    await client.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+}
+
+// ── the watcher must not hear the agent's own reads ───────────────────────
+//
+// `git status` refreshes the index and writes the updated stat cache back to
+// `.git/index`. The watcher reports that as a change under `.git`, the UI
+// refreshes status, branches and history, and those run `git status` again: the
+// three panels rebuilt once a second forever with nobody touching anything.
+// `--no-optional-locks` is what breaks the circle — see readOnly() in
+// src/agent/git.ts and agent-go/git.go.
+//
+// Measured, not asserted: the reads the UI issues on a refresh are issued here,
+// and the pushes the agent volunteers afterwards are counted. A positive
+// control follows, because a watcher that reports nothing at all would
+// otherwise pass this happily.
+
+async function watcherQuiet(
+  impl: Impl,
+  answers: Map<string, string>,
+  check: (name: string, ok: boolean, note?: string) => void,
+): Promise<void> {
+  const root = await makeRepo(`watch-${impl.id}`);
+  const client = await connect(argvFor(impl, root, impl.port + 30), `${impl.label} — watcher`, answers, "watch ");
+  const { call, pushes } = client;
+
+  /** The watcher debounces by 120ms and the filesystem is not instant; a
+   *  quarter second is comfortably past both without making the suite slow. */
+  const settle = (): Promise<void> => new Promise((r) => setTimeout(r, 250));
+
+  try {
+    const started = await call<{ watching: boolean }>("watch.start");
+    check("watch.start", started.watching === true, JSON.stringify(started));
+
+    // Anything left over from opening the workspace is not what is being
+    // measured here.
+    await settle();
+    pushes.length = 0;
+
+    // One refresh cycle as the UI performs it, three times over. Before the
+    // fix each of these rounds produced a `.git` push, which is precisely what
+    // made the next round happen.
+    for (let i = 0; i < 3; i++) {
+      await call("git.status");
+      await call("git.log", { limit: 50 });
+      await call("git.branches");
+      await settle();
+    }
+
+    const gitPushes = pushes.filter((p) => p.includes(".git") || p.includes("*"));
+    check(
+      "reads do not wake the watcher",
+      gitPushes.length === 0,
+      gitPushes.length ? `${gitPushes.length} push(es): ${JSON.stringify(gitPushes.slice(0, 3))}` : "no .git pushes",
+    );
+
+    // The control: a real edit still has to arrive, or the check above is
+    // measuring a dead watcher.
+    pushes.length = 0;
+    await writeFile(join(root, "watched.txt"), "touched\n");
+    for (let i = 0; i < 20 && !pushes.length; i++) await settle();
+    check(
+      "a real change still arrives",
+      pushes.some((p) => p.includes("watched.txt") || p.includes("*")),
+      JSON.stringify(pushes.slice(0, 3)),
+    );
+
+    // A write through the agent is a change like any other: the tree has to
+    // hear about it, so this must not be suppressed along with the reads.
+    pushes.length = 0;
+    await call("fs.write", { path: "viaAgent.txt", text: "written\n" }, false);
+    for (let i = 0; i < 20 && !pushes.length; i++) await settle();
+    check(
+      "an agent write still arrives",
+      pushes.some((p) => p.includes("viaAgent.txt") || p.includes("*")),
+      JSON.stringify(pushes.slice(0, 3)),
+    );
+
+    // And a commit — a real `.git` change — must still reach the panels, or
+    // the fix would have traded one bug for a worse one.
+    pushes.length = 0;
+    await call("git.stage", { paths: ["watched.txt", "viaAgent.txt"] });
+    await call("git.commit", { message: "from the watcher suite" }, false);
+    for (let i = 0; i < 20 && !pushes.some((p) => p.includes(".git") || p.includes("*")); i++) await settle();
+    check(
+      "a commit still wakes the watcher",
+      pushes.some((p) => p.includes(".git") || p.includes("*")),
+      JSON.stringify(pushes.slice(0, 3)),
+    );
+  } finally {
+    await client.close();
+    await rm(root, { recursive: true, force: true });
+  }
 }
 
 // ── hardening: the ways out of the workspace, and the ways back in ────────
@@ -466,9 +1048,23 @@ async function hardening(
     const config = await readFile(join(sandbox.root, ".git", "config"), "utf8");
     check("the repository config survived", !/fsmonitor|hooksPath/.test(config), "no command keys written");
 
-    // Neighbours of .git that are ordinary content and must stay writable.
-    await allowed("write to .gitignore still works", "fs.write", { path: ".gitignore", text: "node_modules\n" });
-    await allowed("write to .github still works", "fs.createFile", { path: ".github/ci.yml" });
+    // Neighbours of .git that are ordinary content and must stay writable. What
+    // is being tested is the *name* — that `isGitDirName` does not over-match
+    // `.gitignore` or `.github` — so where the file sits is free, and it is
+    // chosen to keep this suite from disturbing what the suite also compares.
+    //
+    // Both live inside `.github`, which the sandbox pre-creates, because these
+    // are the only two checks here that write rather than refuse and the
+    // sandbox is shared between the two runs. A file created at the root would
+    // be absent from the first run's `readdir` and present in the second's, and
+    // a file rewritten at the root would carry a different mtime in each — both
+    // reported as the implementations disagreeing, which would be this test
+    // describing its own side effects. A directory entry carries no mtime, so
+    // `.github` itself stays byte-identical in both listings.
+    await allowed("write to .gitignore still works", "fs.write", { path: ".github/.gitignore", text: "node_modules\n" });
+    // Per implementation, because createFile is exclusive: the first agent to
+    // run would create the file and the second would fail on EEXIST.
+    await allowed("write to .github still works", "fs.createFile", { path: `.github/ci-${impl.id}.yml` });
 
     // ── SEC-04: symlinks ──
     //
@@ -558,10 +1154,13 @@ async function hardening(
     // Reads stop at 4 MB; writes used to stop only at the 32 MB WebSocket
     // frame, which let a client put on the disk what no read could return.
     const overCap = "x".repeat(4 * 1024 * 1024 + 1);
+    // Inside `.github` for the reason given above: this suite compares the root
+    // listing byte for byte, and a file one run leaves there is a file the
+    // other run's listing does not have.
     await denied("a write past the read limit is refused", "fs.write",
-      { path: "too-big.txt", text: overCap }, /^Text is too large: [0-9]+ bytes .limit 4194304.$/);
+      { path: ".github/too-big.txt", text: overCap }, /^Text is too large: [0-9]+ bytes .limit 4194304.$/);
     await allowed("a write at the limit still goes through", "fs.write",
-      { path: "at-limit.txt", text: "y".repeat(4 * 1024 * 1024) }, "exactly 4 MB");
+      { path: ".github/at-limit.txt", text: "y".repeat(4 * 1024 * 1024) }, "exactly 4 MB");
   } catch (e) {
     check("unexpected error (hardening)", false, e instanceof Error ? e.message : String(e));
   } finally {

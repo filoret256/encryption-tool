@@ -31,8 +31,23 @@ const (
 	logFmt = "%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%s"
 )
 
+// readOnly builds the argv for a git command that only reads.
+//
+// `git status` is not a pure read: it refreshes the index and writes the
+// updated stat cache back to `.git/index`. The watcher sees a write under
+// `.git`, the UI refreshes status, branches and history, those run `git status`
+// again — and the three panels rebuild once a second forever, with no user
+// action anywhere in the loop. `--no-optional-locks` tells git to skip exactly
+// the writes it performs only as an optimisation, so a read stays a read; the
+// same flag is why other editors do not sit in this loop. git 2.15 and newer.
+//
+// Writes must not use it: they need the lock they are taking.
+func readOnly(args ...string) []string {
+	return append([]string{"git", "--no-optional-locks"}, args...)
+}
+
 func gitOut(ctx context.Context, cwd string, args ...string) (string, error) {
-	r, err := run(ctx, append([]string{"git"}, args...), cwd)
+	r, err := run(ctx, readOnly(args...), cwd)
 	if err != nil {
 		return "", err
 	}
@@ -61,7 +76,7 @@ func splitAt(s, sep string, n int) []string { return strings.SplitN(s, sep, n+1)
 // repoRoot is the absolute path of the repository containing cwd, or "" when
 // there is none.
 func repoRoot(ctx context.Context, cwd string) string {
-	r, err := run(ctx, []string{"git", "rev-parse", "--show-toplevel"}, cwd)
+	r, err := run(ctx, readOnly("rev-parse", "--show-toplevel"), cwd)
 	if err != nil || r.code != 0 {
 		return ""
 	}
@@ -180,6 +195,10 @@ type logOpts struct {
 	limit int
 	all   bool
 	path  string
+	// skip is what makes "load more" a page rather than a bigger request: the
+	// history view used to raise its limit and re-ask for the whole window, so
+	// the tenth page walked the first nine again and parsed them again.
+	skip int
 }
 
 func gitLog(ctx context.Context, cwd string, o logOpts) ([]commit, error) {
@@ -188,6 +207,10 @@ func gitLog(ctx context.Context, cwd string, o logOpts) ([]commit, error) {
 		limit = 200
 	}
 	args := []string{"log", "--date-order", "--format=" + logFmt, "-n" + strconv.Itoa(limit)}
+	// A number, never a string, so there is nothing here for safeArg to screen.
+	if o.skip > 0 {
+		args = append(args, "--skip="+strconv.Itoa(o.skip))
+	}
 	if o.all {
 		args = append(args, "--all")
 	} else if o.ref != "" {
@@ -215,6 +238,88 @@ var (
 	aheadRe  = regexp.MustCompile(`ahead (\d+)`)
 	behindRe = regexp.MustCompile(`behind (\d+)`)
 )
+
+// gitCheckIgnore reports which of paths git would ignore.
+//
+// Asked a directory at a time: the explorer dims a folder's contents, and one
+// call per file would be one spawn per row.
+//
+// The paths go in on stdin rather than in the argv. -z is what makes the answer
+// parseable for a path containing a newline, and git accepts -z only together
+// with --stdin — but stdin is also the only inlet with no length limit, and a
+// directory of ten thousand entries would otherwise be an argv too long for the
+// platform to spawn.
+//
+// No --no-index: a tracked file is not ignored however well it matches a
+// pattern, and that is precisely the distinction the explorer is drawing.
+func gitCheckIgnore(ctx context.Context, cwd string, paths []string) ([]string, error) {
+	out := []string{}
+	if len(paths) == 0 {
+		return out, nil
+	}
+	p, err := safeArgs(paths, "path")
+	if err != nil {
+		return nil, err
+	}
+	r, err := runStdin(ctx, readOnly("check-ignore", "-z", "--stdin"), cwd, strings.Join(p, "\x00"))
+	if err != nil {
+		return nil, err
+	}
+	// 0 = some are ignored, 1 = none are. Anything else is a real failure.
+	if r.code != 0 && r.code != 1 {
+		if r.stderr != "" {
+			return nil, &gitError{r.stderr}
+		}
+		return nil, &gitError{r.stdout}
+	}
+	for _, s := range strings.Split(r.stdout, "\x00") {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out, nil
+}
+
+// gitReflog is where HEAD has been — the undo list.
+//
+// Every ref movement git makes is recorded here, including the ones with no
+// other way back: a `reset --hard` that threw away a commit leaves the commit
+// itself intact and only this remembers its name. So the UI's "undo the last
+// operation" is a reflog entry plus the reset onto it, and this is the half
+// that has to exist first.
+func gitReflog(ctx context.Context, cwd string, limit int) ([]reflogEntry, error) {
+	if limit < 1 {
+		limit = 50
+	}
+	// No --date: it rewrites %gd from the ordinal HEAD@{0} into a timestamp form,
+	// and the ordinal is the half that can be passed back to reset. The time
+	// comes from %ct, which --date does not touch.
+	out, err := gitOut(ctx, cwd, "reflog", "-n"+strconv.Itoa(limit), "--format=%gd%x1f%H%x1f%gs%x1f%ct")
+	if err != nil {
+		return nil, err
+	}
+	entries := []reflogEntry{}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		p := strings.Split(line, fldSep)
+		t, _ := strconv.ParseInt(field(p, 3), 10, 64)
+		// "commit: subject", "reset: moving to …", "checkout: moving from a to b"
+		action, message, found := strings.Cut(field(p, 2), ": ")
+		if !found {
+			action, message = "", field(p, 2)
+		}
+		entries = append(entries, reflogEntry{
+			Selector: field(p, 0),
+			Oid:      field(p, 1),
+			Action:   action,
+			Message:  message,
+			Time:     t,
+		})
+	}
+	return entries, nil
+}
 
 func gitBranches(ctx context.Context, cwd string) ([]branch, error) {
 	// upstream:track prints "[ahead 1, behind 2]", "[gone]" or nothing;
@@ -404,7 +509,7 @@ func blobAt(ctx context.Context, cwd, rev, path string) (*string, bool, error) {
 	if rev != "" {
 		spec = rev + ":" + path
 	}
-	code, bytes, _, err := runBytes(ctx, []string{"git", "show", spec}, cwd)
+	code, bytes, _, err := runBytes(ctx, readOnly("show", spec), cwd)
 	if err != nil {
 		return nil, false, err
 	}

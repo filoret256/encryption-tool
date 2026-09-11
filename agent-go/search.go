@@ -167,7 +167,7 @@ func rgSearch(ctx context.Context, root string, o searchOpts, limit int, emit fu
 
 func fallbackSearch(ctx context.Context, root string, o searchOpts, limit int, emit func(searchHit)) searchSummary {
 	paths := []string{}
-	if r, err := run(ctx, []string{"git", "ls-files", "-co", "--exclude-standard", "-z"}, root); err == nil && r.code == 0 {
+	if r, err := run(ctx, readOnly("ls-files", "-co", "--exclude-standard", "-z"), root); err == nil && r.code == 0 {
 		for _, p := range strings.Split(r.stdout, "\x00") {
 			if p != "" {
 				paths = append(paths, p)

@@ -6,19 +6,25 @@
  */
 import type { EditorState } from "@codemirror/state";
 import { isAgentUrl, type AgentClient } from "./agent.ts";
-import type { DiffPair, DirEntry, FileRead, FsChange, GitStatus } from "../../agent/protocol.ts";
+import type { AgentInfo, Commit, CommitDetail, DiffPair, DirEntry, FileRead, FsChange, GitStatus } from "../../agent/protocol.ts";
 import { CodeEditor } from "./editor.ts";
-import { FileTree } from "./tree.ts";
+import { distinguish, FileTree } from "./tree.ts";
 import { GitPanel } from "./git-panel.ts";
-import { HistoryPanel } from "./history.ts";
+import { absolute as absoluteTime, HistoryPanel } from "./history.ts";
+import { grammarFor, languageOf, LANGUAGES } from "./grammars.ts";
 import { SearchPanel } from "./search-panel.ts";
-import { DiffView } from "./diff.ts";
+import { DiffView, type HunkAction } from "./diff.ts";
+import { hunkPatches } from "./hunkpatch.ts";
 import { findConflicts } from "./conflicts.ts";
-import { applyRowHeight, esc, modalConfirm, modalPrompt, showMenu, type MenuItem } from "./ui.ts";
+import { applyRowHeight, copyToClipboard, esc, modalConfirm, modalPrompt, showMenu, type MenuItem } from "./ui.ts";
 import { draftsFor, dropDraft, putDraft } from "./drafts.ts";
 import { OutputLog } from "./output.ts";
-import { Commands } from "./commands.ts";
+import { Commands, keyLabel } from "./commands.ts";
 import { quickPick } from "./quickpick.ts";
+import { compareFolders, type EntryState, type FolderEntry } from "./foldercompare.ts";
+import type { BlameLine } from "./blame.ts";
+import { ansible } from "../../crypto/index.ts";
+import { indentOfLine, isVaultFile, schemeName, schemes, unwrapVaultBlock, vaultBlock, type Scheme } from "./vault.ts";
 import { iconBranch, iconFiles, iconHistory, iconNewFile, iconNewFolder, iconRefresh, iconSearch } from "./icons.ts";
 
 export interface CodeContext {
@@ -31,6 +37,8 @@ export interface CodeContext {
   dismissNotices: () => void;
   /** Called whenever agent state changes so the header badge can repaint. */
   onCapsChanged: () => void;
+  /** Open the "get agent" popover in the header. */
+  getAgent: () => void;
 }
 
 export interface CodeTab {
@@ -106,13 +114,23 @@ const SHELL = `
     </aside>
     <div class="code-splitter" title="Drag to resize · double-click to hide (Ctrl+B)"></div>
     <div class="code-main">
-      <div class="code-tabs js-tabs" hidden></div>
+      <div class="code-tabstrip">
+        <div class="code-tabs js-tabs" hidden></div>
+        <button class="t-icon js-tab-list" type="button" title="All open tabs" hidden>⌄</button>
+      </div>
+      <nav class="code-crumbs js-crumbs" hidden aria-label="Path of the open file"></nav>
       <div class="offline-bar js-offline" hidden></div>
+      <div class="compare-bar js-compare" hidden></div>
+      <div class="compare-bar js-blame" hidden></div>
+      <div class="compare-bar js-vault" hidden></div>
+      <div class="compare-bar js-window" hidden></div>
       <div class="conflict-bar js-hunk" hidden></div>
       <div class="conflict-bar js-disk-conflict" hidden></div>
       <div class="conflict-bar js-conflict" hidden></div>
       <div class="code-editor-host"></div>
+      <div class="code-welcome js-welcome" hidden></div>
       <div class="code-diff-host" hidden></div>
+      <div class="code-folder-host" hidden></div>
       <div class="js-output"></div>
     </div>
   </div>
@@ -120,6 +138,10 @@ const SHELL = `
     <div class="sb-item code-path">no file</div>
     <div class="sb-item code-dirty"></div>
     <div class="t-spacer"></div>
+    <button class="sb-item sb-button js-sb-pos" type="button" hidden></button>
+    <button class="sb-item sb-button js-sb-indent" type="button" hidden></button>
+    <button class="sb-item sb-button js-sb-eol" type="button" hidden></button>
+    <div class="sb-item js-sb-lang" hidden></div>
     <div class="sb-item code-sync"></div>
     <div class="sb-item code-engine"></div>
     <button class="sb-item sb-button js-output-toggle" type="button" title="What git and the agent said (the output log)">output</button>
@@ -141,6 +163,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   const engineLabel = $(".code-engine");
   const editorHost = $(".code-editor-host");
   const diffHost = $(".code-diff-host");
+  const folderHost = $(".code-folder-host");
 
   // ── the output log ──
   // Every operation this tab performs on the user's behalf reports here, and
@@ -237,9 +260,19 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
      *  without restoring this on save every write to a CRLF file would rewrite
      *  every line and turn each save into a whole-file diff. */
     eol: "\n" | "\r\n";
+    /** `eol` was changed in this tab and not yet written. See isDirty. */
+    eolChanged?: boolean;
     /** The file was deleted or moved away underneath us. The buffer stays; the
      *  tab says so, and saving asks before writing the file back into being. */
     missing?: boolean;
+    /** Set when the tab holds a slice of a file too large to open whole.
+     *
+     *  What used to happen here was "// file too large to open" and nothing
+     *  else — a 300 MB log could not be looked at at all. A window can: it is
+     *  read-only for the obvious reason that writing a slice back would truncate
+     *  everything around it, and the bar above the editor says which bytes
+     *  these are and moves to the next ones. */
+    window?: { offset: number; length: number; size: number; eof: boolean };
   }
   interface DiffTab {
     kind: "diff";
@@ -250,6 +283,13 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     /** Text the reader has produced by reverting chunks or typing, not yet on
      *  disk. Cleared by saving or by leaving the tab. */
     pending?: string;
+    /** Present on the two diffs that have an index on one side, which are the
+     *  only two where staging a single change means anything: "index → working
+     *  tree" stages it, "HEAD → index" takes it back out. */
+    staging?: { path: string; reverse: boolean };
+    /** The two workspace files this tab compares, when that is what it is.
+     *  Lets the sides be swapped without picking them again. */
+    comparing?: { left: string; right: string };
     /** Derived from what is being compared, so re-opening the same diff focuses
      *  the tab it is already in instead of stacking duplicates. */
     id: string;
@@ -257,7 +297,42 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     title: string;
     pair: DiffPair;
   }
-  type OpenTab = FileTab | DiffTab;
+  /** The result of comparing two folders — a list, not a document.
+   *
+   *  It is a tab rather than a panel because it is a finding worth keeping:
+   *  you work through the differing files one by one, opening each pair, and
+   *  every one of those lands in its own diff tab. A panel would have been
+   *  replaced by the first file you opened from it. */
+  interface FolderTab {
+    kind: "folder";
+    id: string;
+    label: string;
+    title: string;
+    /** What is being compared. All three produce the same list of paths in the
+     *  same four states; they differ in where the two sides come from and
+     *  therefore in what opening a row means. */
+    mode: "folders" | "head" | "commits";
+    /** The left-hand folder — for "head", the folder being examined. */
+    left: string;
+    /** The right-hand folder; null unless the mode is "folders". */
+    right: string | null;
+    /** The two commits, oldest first, when the mode is "commits". */
+    revs?: { from: Commit; to: Commit };
+    /** What to call each side in the header. Not derived from `left`/`right`,
+     *  because against HEAD the committed version is the left-hand side while
+     *  the folder being examined is the right — deriving it got that backwards
+     *  and labelled the working tree as the thing it was being compared to. */
+    leftName: string;
+    rightName: string;
+    state: "running" | "done" | "failed";
+    error?: string;
+    entries: FolderEntry[];
+    truncated: boolean;
+    /** Are identical files listed? Off by default — the answer to "what is
+     *  different" should not open with three hundred rows saying "same". */
+    showSame: boolean;
+  }
+  type OpenTab = FileTab | DiffTab | FolderTab;
 
   const tabs: OpenTab[] = [];
   /** Keyed by tab id, never by path — see FileTab.id. */
@@ -295,10 +370,17 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   // Typing into a previewed file is what makes it worth keeping, so the first
   // real edit promotes it. `swappingState` keeps a tab switch — which also
   // replaces the document — from counting as one.
-  const editor = new CodeEditor(editorHost, ctx.isDark(), () => void save(), () => {
-    if (!swappingState) pin(openFile?.id ?? null);
-    onEditorChange();
-  });
+  const editor = new CodeEditor(
+    editorHost,
+    ctx.isDark(),
+    () => void save(),
+    () => {
+      if (!swappingState) pin(openFile?.id ?? null);
+      onEditorChange();
+    },
+    (oid) => void revealCommit(oid),
+    () => renderStatusSegments(),
+  );
   const diff = new DiffView(diffHost, ctx.isDark());
 
   const saveBtn = $<HTMLButtonElement>(".js-save");
@@ -312,7 +394,43 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       : openFile.readOnly ? "This file is read-only"
       : "";
     saveBtn.disabled = why !== "";
+    // The accent belongs to the thing worth pressing. On an empty screen the
+    // brightest element used to be a blue "save" that saved nothing, while the
+    // one route into the setup — "get agent" — was a muted chip.
+    saveBtn.classList.toggle("t-btn-primary", !saveBtn.disabled);
     saveBtn.title = why || (openFile?.missing ? "Save — the file is gone from disk and will be created again" : "Save the open file");
+    renderWelcome();
+  }
+
+  /** The first screen, as a sequence rather than a blank editor.
+   *
+   *  "Select a file in the explorer" is the wrong sentence when there is no
+   *  explorer to select from and no agent to provide one — it reads as an
+   *  instruction the reader has already failed to follow. What is actually
+   *  needed is three steps, and this is where they belong. */
+  function renderWelcome(): void {
+    const el = $(".js-welcome");
+    const show = agent.state !== "online" && tabs.length === 0;
+    el.hidden = !show;
+    editorHost.classList.toggle("is-welcome", show);
+    if (!show || el.dataset.built) return;
+    el.dataset.built = "1";
+    el.innerHTML = `<div class="welcome">
+      <h2>Open a project folder</h2>
+      <p>The editor works on files on this machine. A small local agent serves one
+         folder to this page over a loopback socket — nothing is uploaded.</p>
+      <ol>
+        <li><b>Get the agent.</b> One binary, no installer.
+            <button class="t-btn js-welcome-get" type="button">get agent</button></li>
+        <li><b>Run it in your project folder.</b>
+            <code>enc-tool-agent</code> — it prints a <code>ws://127.0.0.1:…</code> URL.</li>
+        <li><b>Paste that URL here.</b>
+            <button class="t-btn t-btn-primary js-welcome-connect" type="button">connect…</button></li>
+      </ol>
+      <p class="welcome-note">The crypto tabs above need none of this — they run entirely in the browser.</p>
+    </div>`;
+    el.querySelector(".js-welcome-get")!.addEventListener("click", () => ctx.getAgent());
+    el.querySelector(".js-welcome-connect")!.addEventListener("click", () => void connect());
   }
 
   /** Nothing open: the editor holds only its placeholder, so it is dimmed and
@@ -326,7 +444,9 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   }
 
   function showEditor(): void {
+    renderStatusSegments();
     diffHost.hidden = true;
+    folderHost.hidden = true;
     editorHost.hidden = false;
     // The hunk bar belongs to a diff; leaving it up over the editor would offer
     // to write a file the reader is no longer looking at.
@@ -334,12 +454,30 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     $(".js-tabs").hidden = tabs.length === 0;
   }
   function showDiff(): void {
+    renderStatusSegments();
     editorHost.hidden = true;
+    folderHost.hidden = true;
     diffHost.hidden = false;
     // The strip stays: a diff is one of the open tabs, not a takeover.
     $(".js-tabs").hidden = tabs.length === 0;
     $(".js-conflict").hidden = true;
     $(".js-disk-conflict").hidden = true;
+    $(".js-blame").hidden = true;
+    $(".js-vault").hidden = true;
+    $(".js-window").hidden = true;
+  }
+  function showFolder(): void {
+    renderStatusSegments();
+    editorHost.hidden = true;
+    diffHost.hidden = true;
+    folderHost.hidden = false;
+    $(".js-tabs").hidden = tabs.length === 0;
+    $(".js-hunk").hidden = true;
+    $(".js-conflict").hidden = true;
+    $(".js-disk-conflict").hidden = true;
+    $(".js-blame").hidden = true;
+    $(".js-vault").hidden = true;
+    $(".js-window").hidden = true;
   }
 
   /** Has this tab's buffer moved away from what was last read or written?
@@ -348,7 +486,14 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  against its stashed state — the stash is only refreshed on a tab switch,
    *  so for the active tab it is always one step behind. */
   const isDirty = (tab: FileTab | null | undefined): boolean =>
-    !!tab && states.has(tab.id) && baselines.get(tab.id) !== (tab.id === openFile?.id ? editor.value : states.get(tab.id)!.doc.toString());
+    !!tab &&
+    states.has(tab.id) &&
+    // A line-ending change touches every line of the file without touching a
+    // single character of the buffer — CodeMirror holds \n either way. It is
+    // still an unsaved change, and saying otherwise would let it be closed
+    // without a word.
+    (tab.eolChanged === true ||
+      baselines.get(tab.id) !== (tab.id === openFile?.id ? editor.value : states.get(tab.id)!.doc.toString()));
 
   function onEditorChange(): void {
     const dirty = isDirty(openFile);
@@ -357,6 +502,11 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     renderTabs();
     renderConflictBar();
     renderOfflineBar();
+    // Blame describes the last commit. The moment the buffer moves away from
+    // it, the bar has to say so — waiting for a tab switch to notice would
+    // leave the gutter looking current while it no longer is.
+    if (openFile && blaming.has(openFile.id)) renderBlameBar();
+    renderVaultBar();
     scheduleDraft();
   }
 
@@ -599,6 +749,15 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         agent.call("fs.move", { from, to }).then(() => {
           retargetTabs(from, to);
         }),
+      readText: (path) => agent.call<FileRead>("fs.read", { path }).then((f) => f.text),
+      writeText: (path, text) => agent.call("fs.write", { path, text }).then(() => undefined),
+      // A stat that throws is the answer "no", which is the only thing the
+      // caller wants to know.
+      exists: (path) => agent.call("fs.stat", { path }).then(() => true).catch(() => false),
+      // Without git there is nothing to ask, and an explorer that cannot ask
+      // must not guess — so this answers "none of them" rather than dimming.
+      checkIgnore: (paths) =>
+        agent.info?.gitVersion ? agent.call<string[]>("git.checkIgnore", { paths }) : Promise.resolve([]),
       remove: (paths) =>
         agent.call("fs.delete", { paths }).then(() => {
           for (const tab of fileTabs()) {
@@ -619,7 +778,21 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
           danger: true,
         }),
       compare: (left, right) => void compare(left, right),
+      compareFolders: (left, right) => void compareFolderTree(left, right),
+      onCompareBase: (path, isDir) => renderCompareBar(path, isDir),
       compareWithHead: (path) => void openDiff(path, "head"),
+      compareFolderWithHead: (path) => void compareFolderWithHead(path),
+      fileHistory: (path) => showFileHistory(path),
+      blame: (path) => void blameFile(path),
+      searchIn: (path) => {
+        showView("search");
+        searchPanel.searchFor("", `${path}/**`);
+      },
+      crypto: (path, direction) =>
+        void open(path, false, false).then(() => {
+          // The operation works on the buffer, so the file has to be in one.
+          if (openFile?.path === path) return cryptoWholeFile(direction);
+        }),
     },
   );
 
@@ -631,7 +804,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   });
 
   const history = new HistoryPanel(host.querySelector<HTMLElement>('[data-pane="history"]')!, agent, {
-    openDiff: (path, kind) => void openDiff(path, kind),
+    openDiff: (path, kind, about) => void openDiff(path, kind, about),
+    compareCommits: (a, b) => void compareCommits(a, b),
     toast: panelReport,
     afterChange: () => void afterGitChange(),
   });
@@ -639,6 +813,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   const searchPanel = new SearchPanel(host.querySelector<HTMLElement>('[data-pane="search"]')!, agent, {
     openAt: (path, line, col) => void openAt(path, line, col),
     toast: panelReport,
+    report: (summary, detail) => report("replace", summary, { detail }),
     afterReplace: () => {
       void refreshStatus();
       void tree.refresh(["*"]);
@@ -654,8 +829,19 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   const splitter = $(".code-splitter");
   const side = loadSide();
 
+  /** The one rule about how wide the panel may be.
+   *
+   *  It used to live only inside the drag handler, so a width chosen on a
+   *  1440px monitor was restored verbatim on a 760px laptop: the panel took
+   *  more than half the window and the editor became the gutter. The stored
+   *  number is a preference, not a measurement — it has to be read against the
+   *  window it is being applied to. */
+  const clampWidth = (w: number): number => Math.round(Math.min(Math.max(w, 150), window.innerWidth * 0.6));
+
   function applySide(): void {
-    sideEl.style.width = `${side.width}px`;
+    // Not written back to storage: narrowing the window for an hour should not
+    // lose the width the user picked for their monitor.
+    sideEl.style.width = `${clampWidth(side.width)}px`;
     // Both go: with the panel closed a bare splitter is a handle attached to
     // nothing. The rail is how it comes back, as is Ctrl+B.
     sideEl.hidden = side.collapsed;
@@ -667,6 +853,19 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     applySide();
   }
   applySide();
+
+  /** Below this the two columns of a side-by-side diff are about fifty
+   *  characters between them — two narrow ribbons of clipped text. Inline is
+   *  the readable shape at that width, so the view switches to it and says so
+   *  in the mode button rather than leaving the reader to work it out. */
+  const NARROW = 820;
+
+  const onViewportChange = (): void => {
+    applySide();
+    diff.setNarrow(window.innerWidth < NARROW);
+  };
+  onViewportChange();
+  window.addEventListener("resize", onViewportChange);
 
   splitter.addEventListener("pointerdown", (e) => {
     const ev = e as PointerEvent;
@@ -781,7 +980,93 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       run: () => void revealOpenFile(),
     },
     { id: "tree.collapse", title: "Collapse all folders", category: "view", when: () => agent.state === "online", run: () => tree.collapseAll() },
+    {
+      id: "tree.undo",
+      title: "Undo the last file move or creation",
+      category: "file",
+      when: () => agent.state === "online",
+      run: () => void tree.undoLast(),
+    },
     { id: "tree.filter", title: "Filter the explorer by name", category: "view", when: () => agent.state === "online", run: () => tree.focusFilter() },
+    {
+      id: "compare.select",
+      title: "Mark the open file for comparison",
+      category: "go",
+      when: () => openFile !== null,
+      run: () => tree.setCompareBase(openFile!.path),
+    },
+    {
+      id: "compare.with",
+      title: "Compare the open file with…",
+      category: "go",
+      when: () => openFile !== null && agent.state === "online",
+      run: () => void pickCompareTarget(openFile!.path),
+    },
+    {
+      id: "search.next",
+      title: "Next search result",
+      category: "go",
+      key: "F4",
+      when: () => agent.state === "online",
+      run: () => searchPanel.step(1),
+    },
+    {
+      id: "search.prev",
+      title: "Previous search result",
+      category: "go",
+      key: "Shift+F4",
+      when: () => agent.state === "online",
+      run: () => searchPanel.step(-1),
+    },
+    {
+      id: "crypto.encryptFile",
+      title: "Encrypt the open file…",
+      category: "file",
+      when: () => openFile !== null,
+      run: () => void cryptoWholeFile("encrypt"),
+    },
+    {
+      id: "crypto.decryptFile",
+      title: "Decrypt the open file…",
+      category: "file",
+      when: () => openFile !== null,
+      run: () => void cryptoWholeFile("decrypt"),
+    },
+    {
+      id: "crypto.encryptSelection",
+      title: "Encrypt the selection as !vault…",
+      category: "file",
+      when: () => openFile !== null,
+      run: () => void encryptSelection(),
+    },
+    {
+      id: "crypto.decryptSelection",
+      title: "Decrypt the selected !vault block…",
+      category: "file",
+      when: () => openFile !== null,
+      run: () => void decryptSelection(),
+    },
+    {
+      id: "git.blame",
+      title: "Blame the open file",
+      category: "go",
+      when: () => openFile !== null && agent.state === "online",
+      run: () => void toggleBlame(),
+    },
+    {
+      id: "git.fileHistory",
+      title: "History of the open file",
+      category: "go",
+      when: () => openFile !== null && agent.state === "online",
+      run: () => showFileHistory(openFile!.path),
+    },
+    {
+      id: "compare.folders",
+      title: "Compare two folders…",
+      category: "go",
+      when: () => agent.state === "online",
+      run: () => void pickFolderPair(),
+    },
   );
 
   /** Move `delta` tabs along the strip, wrapping. */
@@ -909,6 +1194,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     for (const b of host.querySelectorAll<HTMLElement>(".rail-btn")) {
       b.classList.toggle("active", b.dataset.view === view);
     }
+    saveSession();
     for (const p of host.querySelectorAll<HTMLElement>(".side-view")) {
       p.classList.toggle("active", p.dataset.pane === view);
     }
@@ -918,37 +1204,102 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   }
 
   // ── tabs ──
+  /** The path of the open file, one clickable segment per folder.
+   *
+   *  The tab says `main.yml`; a repository with four roles has four of those.
+   *  The status bar carries the full path but it is a line of grey text at the
+   *  bottom of the window, and nothing in it is a target — so "where am I" and
+   *  "show me that folder" were two different problems with no answer here. */
+  function renderCrumbs(): void {
+    const nav = $(".js-crumbs");
+    const tab = openFile;
+    nav.hidden = !tab;
+    if (!tab) return;
+    const parts = tab.path.split("/");
+    nav.innerHTML = parts
+      .map((seg, i) => {
+        const path = parts.slice(0, i + 1).join("/");
+        const last = i === parts.length - 1;
+        return `<button class="crumb${last ? " is-file" : ""}" type="button" data-path="${esc(path)}"
+          data-dir="${last ? "" : "1"}" title="${esc(path)}">${esc(seg)}</button>`;
+      })
+      .join(`<span class="crumb-sep" aria-hidden="true">›</span>`);
+    for (const el of nav.querySelectorAll<HTMLElement>(".crumb")) {
+      el.addEventListener("click", () => {
+        const path = el.dataset.path!;
+        // A folder reveals itself in the explorer; the file itself offers the
+        // other files beside it, which is the question a breadcrumb's last
+        // segment is asked in every editor that has one.
+        if (el.dataset.dir) void revealInTree(path);
+        else void siblingsMenu(el, path);
+      });
+    }
+  }
+
+  /** The files next to this one, from the breadcrumb. */
+  async function siblingsMenu(anchor: HTMLElement, path: string): Promise<void> {
+    const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+    let entries: DirEntry[];
+    try {
+      entries = await agent.call<DirEntry[]>("fs.readdir", { path: dir });
+    } catch (e) {
+      return reportError("explorer", e);
+    }
+    const r = anchor.getBoundingClientRect();
+    showMenu(
+      r.left,
+      r.bottom,
+      entries
+        .filter((e) => !e.dir)
+        .slice(0, 40)
+        .map((e) => ({
+          label: e.name,
+          run: () => void open(dir ? `${dir}/${e.name}` : e.name, false, true),
+        })),
+    );
+  }
+
   function renderTabs(): void {
+    saveSession();
     const bar = $(".js-tabs");
     bar.hidden = tabs.length === 0;
     bar.innerHTML = tabs
       .map((t) => {
         const file = t.kind === "file" ? t : null;
-        const name = file ? (file.path.split("/").pop() ?? file.path) : (t as DiffTab).label;
+        const name = t.kind === "file" ? (t.path.split("/").pop() ?? t.path) : t.label;
         const dirty = isDirty(file);
         const cls = ["code-tab", t.id === activeId ? "active" : "", dirty ? "dirty" : "",
           t.id === previewId ? "preview" : "", file ? "" : "is-diff",
           file?.missing ? "missing" : ""]
           .filter(Boolean)
           .join(" ");
-        const title = file
-          ? file.missing
-            ? `${file.path} — deleted on disk; the buffer is still open`
-            : file.path
-          : (t as DiffTab).title;
-        return `<div class="${cls}" data-id="${esc(t.id)}" title="${esc(title)}">
-          ${file ? "" : `<span class="code-tab-icon">⇄</span>`}
+        const title = t.kind === "file"
+          ? t.missing
+            ? `${t.path} — deleted on disk; the buffer is still open`
+            : t.path
+          : t.title;
+        return `<div class="${cls}" draggable="true" data-id="${esc(t.id)}" title="${esc(title)}">
+          ${file ? "" : `<span class="code-tab-icon">${t.kind === "folder" ? "🗀" : "⇄"}</span>`}
           <span class="code-tab-name">${esc(name)}</span>
           <button class="code-tab-close" type="button" title="Close">${dirty ? "●" : "✕"}</button>
         </div>`;
       })
       .join("");
+    // The overflow button appears only when the strip actually cannot show
+    // everything, which is the moment it stops being possible to find a tab by
+    // looking at it.
+    const overflow = $<HTMLButtonElement>(".js-tab-list");
+    overflow.hidden = tabs.length === 0 || bar.scrollWidth <= bar.clientWidth + 1;
+    renderCrumbs();
   }
 
+  /** Anything that changes the strip, the tree or the view writes the session
+   *  back — debounced, so a burst of openings is one write. */
   function forget(tab: OpenTab): void {
     if (tab.kind !== "file") return;
     states.delete(tab.id);
     baselines.delete(tab.id);
+    blaming.delete(tab.id);
   }
 
   /** Put a newly opened tab in the strip. A preview replaces the preview slot
@@ -988,6 +1339,18 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     stashActive();
     activeId = id;
 
+    if (tab.kind === "folder") {
+      openFile = null;
+      renderFolderTab(tab);
+      pathLabel.textContent = tab.title;
+      updateSaveEnabled();
+      dirtyLabel.textContent = "";
+      dirtyLabel.classList.remove("is-dirty");
+      showFolder();
+      renderTabs();
+      return;
+    }
+
     if (tab.kind === "diff") {
       openFile = null;
       diff.show(
@@ -998,6 +1361,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
               renderHunkBar(tab);
             }
           : undefined,
+        tab.comparing ? () => void swapCompare(tab) : undefined,
+        hunkActionFor(tab),
       );
       renderHunkBar(tab);
       pathLabel.textContent = tab.title;
@@ -1022,6 +1387,9 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     renderTabs();
     renderConflictBar();
     renderDiskConflictBar();
+    renderBlameBar();
+    renderVaultBar();
+    renderWindowBar();
     onEditorChange();
     editor.focus();
   }
@@ -1089,6 +1457,100 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     }
   });
 
+  // A strip with a dozen tabs on it needs the same bulk actions every editor
+  // has, and "why is this one in italics" needs answering somewhere other than
+  // the source.
+  $(".js-tabs").addEventListener("contextmenu", (e) => {
+    const ev = e as MouseEvent;
+    const id = (ev.target as HTMLElement).closest<HTMLElement>(".code-tab")?.dataset.id;
+    if (!id) return;
+    ev.preventDefault();
+    const tab = tabs.find((t) => t.id === id);
+    if (!tab) return;
+    const others = tabs.filter((t) => t.id !== id);
+    const saved = tabs.filter((t) => t.kind !== "file" || !isDirty(t));
+
+    const items: MenuItem[] = [
+      { label: "Close", hint: keyLabel("Alt+W"), run: () => void closeTab(id) },
+      { label: `Close others (${others.length})`, run: () => void closeMany(others.map((t) => t.id)) },
+      { label: `Close saved (${saved.length})`, run: () => void closeMany(saved.map((t) => t.id)) },
+      { label: "Close all", run: () => void closeMany(tabs.map((t) => t.id)) },
+    ];
+    if (tab.kind === "file") {
+      items.push(
+        { label: "Copy path", separated: true, run: () => void copyToClipboard(tab.path, "Path", (m, isError) => report("editor", m, { isError })) },
+        { label: "Reveal in explorer", run: () => void revealInTree(tab.path) },
+        { label: "File history", run: () => showFileHistory(tab.path) },
+      );
+    }
+    if (id === previewId) {
+      // The italic has meant "this slot gets reused" since the first version
+      // and said so nowhere. Now the menu says it, and offers the way out.
+      items.push({ label: "Keep this tab open (it is a preview)", separated: true, run: () => pin(id) });
+    }
+    showMenu(ev.clientX, ev.clientY, items);
+  });
+
+  // Every open tab, by name, when the strip has run out of room.
+  $(".js-tab-list").addEventListener("click", (e) => {
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    showMenu(
+      Math.max(4, r.right - 240),
+      r.bottom,
+      tabs.map((t) => ({
+        label:
+          (t.id === activeId ? "✓ " : "   ") +
+          (t.kind === "file" ? t.path : t.title) +
+          (t.kind === "file" && isDirty(t) ? " ●" : ""),
+        run: () => activate(t.id),
+      })),
+    );
+  });
+
+  // Dragging tabs into the order you want them. The strip is the one place
+  // where position carries meaning the tool does not assign.
+  let dragTab: string | null = null;
+  $(".js-tabs").addEventListener("dragstart", (e) => {
+    const el = (e.target as HTMLElement).closest<HTMLElement>(".code-tab");
+    if (!el) return;
+    dragTab = el.dataset.id ?? null;
+    (e as DragEvent).dataTransfer?.setData("text/plain", dragTab ?? "");
+  });
+  $(".js-tabs").addEventListener("dragover", (e) => {
+    if (!dragTab) return;
+    e.preventDefault();
+    const over = (e.target as HTMLElement).closest<HTMLElement>(".code-tab");
+    for (const el of host.querySelectorAll<HTMLElement>(".code-tab")) {
+      el.classList.toggle("drop-before", el === over && el.dataset.id !== dragTab);
+    }
+  });
+  $(".js-tabs").addEventListener("drop", (e) => {
+    e.preventDefault();
+    const over = (e.target as HTMLElement).closest<HTMLElement>(".code-tab")?.dataset.id;
+    const from = tabs.findIndex((t) => t.id === dragTab);
+    const to = tabs.findIndex((t) => t.id === over);
+    dragTab = null;
+    for (const el of host.querySelectorAll<HTMLElement>(".code-tab")) el.classList.remove("drop-before");
+    if (from === -1 || to === -1 || from === to) return;
+    const [moved] = tabs.splice(from, 1);
+    tabs.splice(to, 0, moved);
+    renderTabs();
+  });
+  $(".js-tabs").addEventListener("dragend", () => {
+    dragTab = null;
+    for (const el of host.querySelectorAll<HTMLElement>(".code-tab")) el.classList.remove("drop-before");
+  });
+
+  /** Close a list of tabs, oldest first, asking once per unsaved buffer. */
+  async function closeMany(ids: string[]): Promise<void> {
+    for (const id of ids) await closeTab(id);
+  }
+
+  async function revealInTree(path: string): Promise<void> {
+    showView("explorer");
+    await tree.reveal(path);
+  }
+
   // ── file IO ──
   /** Open a file in a tab, or focus the tab it is already in. `reload` forces a
    *  fresh read for a file that changed underneath us. */
@@ -1134,11 +1596,32 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     }
   }
 
+  /** How much of an oversized file to fetch at a time.
+   *
+   *  A megabyte is roughly ten thousand lines of log — enough that paging is
+   *  rare, small enough that the round trip and the editor both stay quick. */
+  const WINDOW_BYTES = 1024 * 1024;
+
   async function readIntoTab(path: string, reload: boolean, preview: boolean, already: FileTab | undefined): Promise<void> {
     const seq = ++openSeq;
     try {
-      const file = await agent.call<FileRead>("fs.read", { path });
-      const readOnly = file.binary || file.tooLarge;
+      let file = await agent.call<FileRead>("fs.read", { path });
+      // Too large to open whole is not the same as impossible to read: ask for
+      // the first window instead of showing a placeholder.
+      let window: FileTab["window"];
+      if (file.tooLarge) {
+        const slice = await agent
+          .call<FileRead>("fs.read", { path, offset: 0, length: WINDOW_BYTES })
+          .catch(() => null);
+        if (slice?.text !== null && slice !== null) {
+          file = slice;
+          window = { offset: slice.offset, length: WINDOW_BYTES, size: slice.size, eof: slice.eof };
+        }
+      }
+      // A window is read-only for the same reason a binary file is: what is on
+      // screen is not the whole document, and writing it back would be a
+      // truncation rather than a save.
+      const readOnly = file.binary || file.tooLarge || window !== undefined;
       const raw = file.text ?? (file.binary ? "// binary file" : "// file too large to open");
       const eol: "\n" | "\r\n" = raw.includes("\r\n") ? "\r\n" : "\n";
       // Compare against the normalised text, since that is what the editor holds.
@@ -1149,8 +1632,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       // A reload keeps the tab it is refreshing — its id, its place in the
       // strip and, if it is the active one, the screen.
       const tab: FileTab = already
-        ? { ...already, readOnly, eol, missing: false }
-        : { kind: "file", id: newTabId(), path, readOnly, eol };
+        ? { ...already, readOnly, eol, missing: false, window }
+        : { kind: "file", id: newTabId(), path, readOnly, eol, window };
       placeTab(tab, preview && !reload);
       states.set(tab.id, editor.newState(path, text, readOnly));
       baselines.set(tab.id, text);
@@ -1178,11 +1661,102 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   /** Put a diff in the tab strip, or refresh and focus the one already there.
    *  The pair is kept on the tab, so switching away to a file and back redraws
    *  it without another round trip. */
-  function showDiffTab(id: string, label: string, title: string, pair: DiffPair, preview = true, editablePath?: string): void {
+  function showDiffTab(
+    id: string,
+    label: string,
+    title: string,
+    pair: DiffPair,
+    preview = true,
+    editablePath?: string,
+    comparing?: { left: string; right: string },
+    staging?: { path: string; reverse: boolean },
+  ): void {
     // Diffs pile up the same way files do — a commit with sixty files is sixty
     // clicks — so they share the preview slot.
-    placeTab({ kind: "diff", id, label, title, pair, editablePath }, preview);
+    placeTab({ kind: "diff", id, label, title, pair, editablePath, comparing, staging }, preview);
     activate(id);
+  }
+
+  /** "Stage this change" for a diff that has an index on one side.
+   *
+   *  The patch is built in the browser from the two sides already on screen —
+   *  see hunkpatch.ts — and applied with `git apply --cached`, which is the
+   *  only way git offers to move part of a file into the index. The worktree is
+   *  never touched either way, so an open buffer of the same file does not move
+   *  under the person reading it.
+   */
+  function hunkActionFor(tab: DiffTab): HunkAction | undefined {
+    if (!tab.staging) return undefined;
+    const { path, reverse } = tab.staging;
+    return {
+      label: reverse ? "unstage" : "stage",
+      apply: async (index) => {
+        const patches = hunkPatches(path, tab.pair.before ?? "", tab.pair.after ?? "");
+        const patch = patches[index];
+        if (!patch) return reportError("stage", new Error("That change is no longer in the diff — reopen it."));
+        try {
+          await agent.call("git.applyPatch", { patch, reverse });
+          report("git", `${reverse ? "unstaged" : "staged"} change ${index + 1} of ${path}`);
+          // Both sides moved: the index is what changed, and it is one side of
+          // this very diff. Re-reading it is what keeps the count honest.
+          const fresh = await agent.call<DiffPair>("git.diff", { path, kind: reverse ? "staged" : "worktree" });
+          tab.pair = fresh;
+          if (activeId === tab.id) diff.show(fresh, undefined, undefined, hunkActionFor(tab));
+          void refreshStatus();
+          void gitPanel.refresh();
+        } catch (e) {
+          reportError("git.applyPatch", e);
+        }
+      },
+    };
+  }
+
+  /** The bar that says what is marked for comparison.
+   *
+   *  "Select for compare" used to change nothing anyone could see: the row
+   *  looked the same, the status bar said "no file", and the only way to find
+   *  out what was marked was to open the menu on the file you suspected. So
+   *  the mark now has a place on screen, with the path spelled out and a way
+   *  to drop it.
+   */
+  function renderCompareBar(path: string | null, isDir = false): void {
+    const bar = $(".js-compare");
+    bar.hidden = path === null;
+    if (path === null) return;
+    bar.innerHTML = `<span class="compare-label">compare ${isDir ? "folder" : ""} with</span>
+      <span class="compare-path" title="${esc(path)}">${esc(path)}</span>
+      <span class="t-spacer"></span>
+      <button class="t-btn js-compare-open" type="button">pick the other ${isDir ? "folder" : "file"}…</button>
+      <button class="t-icon js-compare-clear" type="button" aria-label="Clear the comparison mark">✕</button>`;
+    bar.querySelector(".js-compare-open")!.addEventListener("click", () => void pickCompareTarget(path, isDir));
+    bar.querySelector(".js-compare-clear")!.addEventListener("click", () => tree.setCompareBase(null));
+  }
+
+  /** The second half of the pair, chosen from a list rather than by hunting
+   *  through the tree for the file you meant. */
+  async function pickCompareTarget(left: string, isDir = false): Promise<void> {
+    const files = await listFiles();
+    // The walk indexes files, so the folder list is what their paths imply —
+    // which is also exactly the set of folders that have anything in them.
+    const all = isDir
+      ? [...new Set(files.flatMap((p) => {
+          const parts = p.split("/").slice(0, -1);
+          return parts.map((_, i) => parts.slice(0, i + 1).join("/"));
+        }))].sort()
+      : files;
+    const other = await quickPick({
+      title: `Compare ${left} with`,
+      placeholder: `type part of a ${isDir ? "folder" : "path"}`,
+      buttons: false,
+      items: (query) =>
+        all
+          .filter((p) => p !== left && (!query || p.toLowerCase().includes(query.toLowerCase())))
+          .slice(0, 50)
+          .map((p) => ({ value: p, label: p.split("/").pop() ?? p, detail: p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "", filterText: p })),
+    });
+    if (!other) return;
+    if (isDir) await compareFolderTree(left, other);
+    else await compare(left, other);
   }
 
   /** Diff two arbitrary files in the workspace — no git involved. */
@@ -1192,31 +1766,850 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         agent.call<FileRead>("fs.read", { path: left }),
         agent.call<FileRead>("fs.read", { path: right }),
       ]);
-      showDiffTab(`cmp:${JSON.stringify([left, right])}`, `${base(left)} ↔ ${base(right)}`, `${left} ↔ ${right}`, {
-        path: `${left} ↔ ${right}`,
-        before: a.text,
-        after: b.text,
-        beforeLabel: left,
-        afterLabel: right,
-        binary: a.binary || b.binary,
-      });
+      // The tab is named by what tells the two apart — `prod/values.yaml ↔
+      // stage/values.yaml`, not `values.yaml ↔ values.yaml`, which is what two
+      // open comparisons used to look like in the strip.
+      const label = `${distinguish(left, right)} ↔ ${distinguish(right, left)}`;
+      showDiffTab(
+        `cmp:${JSON.stringify([left, right])}`,
+        label,
+        `${left} ↔ ${right}`,
+        {
+          path: `${left} ↔ ${right}`,
+          before: a.text,
+          after: b.text,
+          beforeLabel: left,
+          afterLabel: right,
+          binary: a.binary || b.binary,
+        },
+        // Not a preview. A comparison took two deliberate steps to set up, and
+        // the preview slot is for clicking through a list — the next diff used
+        // to take its place and there was no way back to it.
+        false,
+        undefined,
+        { left, right },
+      );
+      // The pair is made; keeping the mark would offer to compare against it
+      // again for the rest of the session, which is how it came to point at
+      // files from workspaces nobody had open any more.
+      tree.setCompareBase(null);
     } catch (e) {
       reportError("agent", e);
     }
   }
 
-  async function openDiff(path: string, kind: string): Promise<void> {
+  /** Show the same two files the other way round. */
+  async function swapCompare(tab: DiffTab): Promise<void> {
+    if (!tab.comparing) return;
+    await compare(tab.comparing.right, tab.comparing.left);
+  }
+
+  /** Both halves of a folder comparison, for people who came from the palette
+   *  rather than from a right-click in the tree. */
+  async function pickFolderPair(): Promise<void> {
+    const files = await listFiles();
+    const folders = [...new Set(files.flatMap((p) => {
+      const parts = p.split("/").slice(0, -1);
+      return parts.map((_, i) => parts.slice(0, i + 1).join("/"));
+    }))].sort();
+    const left = await quickPick({
+      title: "Compare folders — the first one",
+      placeholder: "type part of a folder",
+      buttons: false,
+      items: (query) =>
+        folders
+          .filter((p) => !query || p.toLowerCase().includes(query.toLowerCase()))
+          .slice(0, 50)
+          .map((p) => ({ value: p, label: p.split("/").pop() ?? p, detail: p, filterText: p })),
+    });
+    if (left) await pickCompareTarget(left, true);
+  }
+
+  // ── encryption, in the editor ──
+  // The two halves of this product used to be two tabs that had never been
+  // introduced. Encrypting the file you were looking at went through the
+  // clipboard in nine steps; encrypting one *value* inside a YAML file — which
+  // is what people actually do — was not possible at all.
+  //
+  // Nothing is written to disk here: the buffer changes and Ctrl+S is still the
+  // thing that writes. That keeps one rule about when a file is touched, and it
+  // means an encryption you did not mean is one Ctrl+Z away.
+
+  /** Ask for a password for one operation. Never stored, anywhere. */
+  async function askPassword(title: string, confirm: boolean): Promise<string | null> {
+    return modalPrompt({
+      title,
+      password: true,
+      confirm,
+      placeholder: "vault password",
+      okLabel: confirm ? "encrypt" : "decrypt",
+      hint: confirm
+        ? "Typed twice because nothing checks it: a mistyped password produces a file that cannot be opened again."
+        : "The password is used for this operation and not kept.",
+    });
+  }
+
+  /** Which of the two schemes, when the text does not say. */
+  async function askScheme(): Promise<Scheme | null> {
+    const pick = await quickPick({
+      title: "Encrypt with",
+      placeholder: "",
+      buttons: false,
+      items: [
+        { value: "ansible", label: "Ansible Vault", detail: "$ANSIBLE_VAULT;1.1;AES256 — reads with the ansible-vault CLI" },
+        { value: "helm", label: "helm-encrypt", detail: "this tool's own AES-256-CBC envelope" },
+      ],
+    });
+    return (pick as Scheme | null) ?? null;
+  }
+
+  /** Encrypt or decrypt the whole open buffer. */
+  async function cryptoWholeFile(direction: "encrypt" | "decrypt"): Promise<void> {
+    const tab = openFile;
+    if (!tab) return;
+    const text = editor.value;
+    if (!text.trim()) return report("crypto", "Nothing to encrypt — the file is empty.", { isError: true });
+
+    // A file that already carries the header answers the scheme question by
+    // itself, which is one fewer thing to get wrong when decrypting.
+    const scheme: Scheme | null =
+      direction === "decrypt" && isVaultFile(text) ? "ansible" : await askScheme();
+    if (!scheme) return;
+    const password = await askPassword(
+      `${direction === "encrypt" ? "Encrypt" : "Decrypt"} ${tab.path} with ${schemeName[scheme]}`,
+      direction === "encrypt",
+    );
+    if (!password) return;
+
+    try {
+      const out = await schemes[scheme][direction](text.trim(), password);
+      editor.replaceAll(direction === "encrypt" ? `${out}\n` : out);
+      report("crypto", `${tab.path} ${direction}ed with ${schemeName[scheme]} — not saved yet (Ctrl+S), and Ctrl+Z puts it back`);
+    } catch (e) {
+      reportError("crypto", e);
+    }
+  }
+
+  /** `ansible-vault encrypt_string`, on the selection.
+   *
+   *  The common shape in real repositories: one secret inside a file that stays
+   *  readable. The envelope is indented under a `!vault |` tag so the YAML
+   *  parser reads it back as a single scalar. */
+  async function encryptSelection(): Promise<void> {
+    const tab = openFile;
+    if (!tab) return;
+    const { state } = editor.view;
+    const sel = state.selection.main;
+    if (sel.empty) {
+      return report("crypto", "Select the value to encrypt first.", { isError: true });
+    }
+    const value = state.sliceDoc(sel.from, sel.to);
+    const password = await askPassword(`Encrypt the selection as !vault`, true);
+    if (!password) return;
+    try {
+      const envelope = await ansible.encrypt(value.trim(), password);
+      const line = state.doc.lineAt(sel.from);
+      const block = vaultBlock(envelope, indentOfLine(line.text));
+      editor.view.dispatch({ changes: { from: sel.from, to: sel.to, insert: block } });
+      report("crypto", `selection encrypted as !vault — not saved yet (Ctrl+S), and Ctrl+Z puts it back`);
+    } catch (e) {
+      reportError("crypto", e);
+    }
+  }
+
+  /** The reverse: a `!vault |` block back to its plain value. */
+  async function decryptSelection(): Promise<void> {
+    const tab = openFile;
+    if (!tab) return;
+    const { state } = editor.view;
+    const sel = state.selection.main;
+    if (sel.empty) return report("crypto", "Select the !vault block to decrypt first.", { isError: true });
+    const chunk = state.sliceDoc(sel.from, sel.to);
+    const envelope = unwrapVaultBlock(chunk) ?? (isVaultFile(chunk) ? chunk.trim() : null);
+    if (!envelope) {
+      return report("crypto", "That selection is not a !vault block or a vault envelope.", { isError: true });
+    }
+    const password = await askPassword("Decrypt the selected !vault block", false);
+    if (!password) return;
+    try {
+      const plain = await ansible.decrypt(envelope, password);
+      editor.view.dispatch({ changes: { from: sel.from, to: sel.to, insert: plain } });
+      report("crypto", "selection decrypted — not saved yet (Ctrl+S), and Ctrl+Z puts it back");
+    } catch (e) {
+      reportError("crypto", e);
+    }
+  }
+
+  /** The bar offering to decrypt a file that turned out to be a vault.
+   *
+   *  Opening `group_vars/prod/vault.yml` used to fill the editor with eighty
+   *  lines of hex and leave the reader to work out what it was. */
+  function renderVaultBar(): void {
+    const bar = $(".js-vault");
+    const tab = openFile;
+    const encrypted = tab !== null && !isDirty(tab) && isVaultFile(editor.value);
+    bar.hidden = !encrypted;
+    if (!encrypted) return;
+    bar.innerHTML = `<span class="compare-label">ansible vault</span>
+      <span class="compare-path">this file is encrypted</span>
+      <span class="t-spacer"></span>
+      <button class="t-btn js-vault-decrypt" type="button">decrypt…</button>`;
+    bar.querySelector(".js-vault-decrypt")!.addEventListener("click", () => void cryptoWholeFile("decrypt"));
+  }
+
+  const bytes = (n: number): string =>
+    n >= 1 << 30 ? `${(n / (1 << 30)).toFixed(1)} GB`
+    : n >= 1 << 20 ? `${(n / (1 << 20)).toFixed(1)} MB`
+    : n >= 1024 ? `${Math.round(n / 1024)} KB`
+    : `${n} bytes`;
+
+  /** The bar over a file being read a window at a time.
+   *
+   *  It has to say two things at once: that this is not the whole file — so
+   *  nobody reads the last line on screen as the last line of the log — and how
+   *  to get to the rest of it. */
+  function renderWindowBar(): void {
+    const bar = $(".js-window");
+    const tab = openFile;
+    const w = tab?.window;
+    bar.hidden = !w;
+    if (!tab || !w) return;
+    const from = w.offset;
+    const to = Math.min(w.offset + w.length, w.size);
+    bar.innerHTML = `<span class="compare-label">large file</span>
+      <span class="compare-path">showing ${bytes(from)}–${bytes(to)} of ${bytes(w.size)}, read-only</span>
+      <span class="t-spacer"></span>
+      <button class="t-btn js-win-start" type="button" title="Jump to the start">⇤ start</button>
+      <button class="t-btn js-win-prev" type="button">◀ earlier</button>
+      <button class="t-btn js-win-next" type="button">later ▶</button>
+      <button class="t-btn js-win-end" type="button" title="Jump to the end">end ⇥</button>`;
+    const at = (offset: number): void => void readWindow(tab, offset);
+    bar.querySelector<HTMLButtonElement>(".js-win-start")!.disabled = from === 0;
+    bar.querySelector<HTMLButtonElement>(".js-win-prev")!.disabled = from === 0;
+    bar.querySelector<HTMLButtonElement>(".js-win-next")!.disabled = w.eof;
+    bar.querySelector<HTMLButtonElement>(".js-win-end")!.disabled = w.eof;
+    bar.querySelector(".js-win-start")!.addEventListener("click", () => at(0));
+    bar.querySelector(".js-win-prev")!.addEventListener("click", () => at(Math.max(0, from - w.length)));
+    // From where this window ends, not from where it was asked to start: the
+    // agent may have moved the start forward off a half character.
+    bar.querySelector(".js-win-next")!.addEventListener("click", () => at(to));
+    bar.querySelector(".js-win-end")!.addEventListener("click", () => at(Math.max(0, w.size - w.length)));
+  }
+
+  /** Move a large file's window and redraw the buffer under it. */
+  async function readWindow(tab: FileTab, offset: number): Promise<void> {
+    try {
+      const slice = await agent.call<FileRead>("fs.read", { path: tab.path, offset, length: WINDOW_BYTES });
+      tab.window = { offset: slice.offset, length: WINDOW_BYTES, size: slice.size, eof: slice.eof };
+      const text = (slice.text ?? "").replace(/\r\n/g, "\n");
+      states.set(tab.id, editor.newState(tab.path, text, true));
+      baselines.set(tab.id, text);
+      if (activeId === tab.id) {
+        editor.state = states.get(tab.id)!;
+        editor.focus();
+      }
+      renderWindowBar();
+    } catch (e) {
+      reportError("fs.read", e);
+    }
+  }
+
+  // ── the status bar's document segments ──
+  // What someone editing a stranger's file in a mixed repository looks for:
+  // where the cursor is, what the line endings are, what the indentation is,
+  // and what the thing is being highlighted as. All four were absent, and the
+  // first three are settings this tab already tracks — they were simply never
+  // shown, so there was nowhere to change them either.
+
+  /** Language forced by the reader, per tab id. Not persisted: it is a decision
+   *  about one look at one file, and a file whose extension says `.yaml` should
+   *  not open as Python tomorrow because it once was. */
+  const forcedLanguage = new Map<string, string>();
+
+  /** Leading whitespace, as the file actually uses it.
+   *
+   *  Guessed, and labelled as a guess by being derived rather than configured:
+   *  the smallest indent step that appears more than once is what an editor can
+   *  honestly say about a file it did not write. */
+  function detectIndent(text: string): { kind: "tab" | "space"; width: number } {
+    let tabs = 0;
+    const widths = new Map<number, number>();
+    let previous = 0;
+    for (const line of text.split("\n", 4000)) {
+      const lead = /^[ \t]*/.exec(line)![0];
+      if (!lead || !line.slice(lead.length)) continue; // blank lines say nothing
+      if (lead.includes("\t")) {
+        tabs++;
+        continue;
+      }
+      const step = lead.length - previous;
+      if (step > 0) widths.set(step, (widths.get(step) ?? 0) + 1);
+      previous = lead.length;
+    }
+    let best = 0;
+    let bestCount = 0;
+    for (const [w, c] of widths) {
+      if (c > bestCount || (c === bestCount && w < best)) {
+        best = w;
+        bestCount = c;
+      }
+    }
+    if (tabs > bestCount) return { kind: "tab", width: 1 };
+    return { kind: "space", width: best || 2 };
+  }
+
+  function renderStatusSegments(): void {
+    const pos = $<HTMLButtonElement>(".js-sb-pos");
+    const eolEl = $<HTMLButtonElement>(".js-sb-eol");
+    const indentEl = $<HTMLButtonElement>(".js-sb-indent");
+    const langEl = $<HTMLElement>(".js-sb-lang");
+    const tab = openFile;
+    for (const el of [pos, eolEl, indentEl, langEl]) el.hidden = tab === null;
+    if (!tab) return;
+
+    const { line, col, selected } = editor.cursor;
+    pos.textContent = selected ? `Ln ${line}, Col ${col} (${selected} selected)` : `Ln ${line}, Col ${col}`;
+    pos.title = "Go to line (Ctrl+G)";
+
+    eolEl.textContent = tab.eol === "\r\n" ? "CRLF" : "LF";
+    eolEl.title = `Line endings — click to write this file with ${tab.eol === "\r\n" ? "LF" : "CRLF"} instead`;
+
+    const indent = detectIndent(editor.value);
+    indentEl.textContent = indent.kind === "tab" ? "Tab" : `Spaces: ${indent.width}`;
+    indentEl.title = "Indentation, as this file uses it — click to convert it";
+
+    const forced = forcedLanguage.get(tab.id);
+    langEl.textContent = forced ?? languageOf(tab.path);
+    langEl.title = forced ? `Highlighting as ${forced} (chosen for this tab)` : "Syntax highlighting — click to change it";
+    langEl.classList.toggle("is-forced", forced !== undefined);
+  }
+
+  /** Rewrite the buffer's line endings. Marks it dirty rather than writing:
+   *  changing every line of a file is an edit, and it goes through Ctrl+S like
+   *  any other. */
+  function switchEol(): void {
+    const tab = openFile;
+    if (!tab) return;
+    tab.eol = tab.eol === "\r\n" ? "\n" : "\r\n";
+    // Nothing in the buffer changes: CodeMirror holds LF either way, and the
+    // tab's eol is only consulted on write. isDirty is told separately, so the
+    // change is visible and closing the tab still asks about it.
+    tab.eolChanged = !tab.eolChanged;
+    onEditorChange();
+    renderStatusSegments();
+    report("editor", `${tab.path} will be saved with ${tab.eol === "\r\n" ? "CRLF" : "LF"} line endings`);
+  }
+
+  /** Convert leading whitespace throughout the buffer. */
+  async function convertIndent(): Promise<void> {
+    const tab = openFile;
+    if (!tab) return;
+    const current = detectIndent(editor.value);
+    const choice = await quickPick({
+      title: `Indentation — this file uses ${current.kind === "tab" ? "tabs" : `${current.width} spaces`}`,
+      placeholder: "convert the whole file to",
+      buttons: false,
+      items: [
+        { value: "tab", label: "Tabs", detail: "one tab per level" },
+        { value: "2", label: "Spaces: 2" },
+        { value: "4", label: "Spaces: 4" },
+        { value: "8", label: "Spaces: 8" },
+      ],
+    });
+    if (!choice) return;
+    const unit = choice === "tab" ? "\t" : " ".repeat(Number(choice));
+    const converted = editor.value
+      .split("\n")
+      .map((l) => {
+        const lead = /^[ \t]*/.exec(l)![0];
+        if (!lead) return l;
+        // Count levels in the file's own terms, then re-emit them in the new
+        // unit. Anything that is not a whole number of levels is left as it is:
+        // a continuation line aligned under an opening bracket is deliberate.
+        const levels = current.kind === "tab" ? lead.replace(/ /g, "").length : lead.length / current.width;
+        if (!Number.isInteger(levels)) return l;
+        return unit.repeat(levels) + l.slice(lead.length);
+      })
+      .join("\n");
+    if (converted === editor.value) return report("editor", "Indentation is already that.");
+    editor.replaceAll(converted);
+    renderStatusSegments();
+  }
+
+  async function pickLanguage(): Promise<void> {
+    const tab = openFile;
+    if (!tab) return;
+    const choice = await quickPick({
+      title: "Syntax highlighting for this tab",
+      placeholder: "type a language",
+      buttons: false,
+      items: LANGUAGES.map((l) => ({ value: l.name, label: l.name })),
+    });
+    if (!choice) return;
+    const ext = LANGUAGES.find((l) => l.name === choice)?.ext ?? "";
+    editor.setLanguage(ext ? grammarFor(`x.${ext}`) : null);
+    if (choice === languageOf(tab.path)) forcedLanguage.delete(tab.id);
+    else forcedLanguage.set(tab.id, choice);
+    renderStatusSegments();
+  }
+
+  $(".js-sb-pos").addEventListener("click", () => void gotoLine());
+  $(".js-sb-eol").addEventListener("click", () => switchEol());
+  $(".js-sb-indent").addEventListener("click", () => void convertIndent());
+  $(".js-sb-lang").addEventListener("click", () => void pickLanguage());
+
+  // ── blame and file history ──
+  // The agent has answered `git.blame` and `git.log {path}` from the start and
+  // nothing ever called either, so "when did this line change" was a question
+  // you left the tool to answer.
+
+  /** Tabs currently showing blame, by tab id.
+   *
+   *  Blame belongs to a document, and the rows live in that document's editor
+   *  state — but the bar above the editor is one element shared by every tab,
+   *  so it needs to be told which tab it is describing. */
+  const blaming = new Map<string, { path: string; stale: boolean }>();
+
+  async function toggleBlame(): Promise<void> {
+    const tab = openFile;
+    if (!tab) return;
+    if (blaming.has(tab.id)) {
+      blaming.delete(tab.id);
+      editor.setBlame(null);
+      renderBlameBar();
+      return;
+    }
+    try {
+      const rows = await agent.call<BlameLine[]>("git.blame", { path: tab.path });
+      if (openFile?.id !== tab.id) return; // the reader moved on while git ran
+      editor.setBlame(rows);
+      // Blame describes the committed file. An edited buffer has lines that
+      // commit never had, so the rows below the first edit line up with
+      // nothing — said once, in the bar, rather than left to be discovered.
+      blaming.set(tab.id, { path: tab.path, stale: isDirty(tab) });
+      renderBlameBar();
+      report("git blame", `blamed ${tab.path}`, { detail: `${rows.length} line(s)` });
+    } catch (e) {
+      reportError("git blame", e);
+    }
+  }
+
+  /** Blame a file from the explorer: open it first, since blame is a gutter
+   *  beside the text and there is nothing to put it beside otherwise. */
+  async function blameFile(path: string): Promise<void> {
+    await open(path, false, false);
+    if (openFile?.path !== path) return; // the open failed and already said so
+    if (!blaming.has(openFile.id)) await toggleBlame();
+  }
+
+  /** Keep the bar in step with whatever tab is on screen. */
+  function renderBlameBar(): void {
+    const bar = $(".js-blame");
+    const state = openFile ? blaming.get(openFile.id) : undefined;
+    bar.hidden = !state;
+    if (!state || !openFile) return;
+    const dirty = isDirty(openFile);
+    bar.innerHTML = `<span class="compare-label">blame</span>
+      <span class="compare-path">${
+        dirty
+          ? "the buffer has unsaved edits — these lines are the last commit's, and no longer line up"
+          : "click a line to open the commit it came from"
+      }</span>
+      <span class="t-spacer"></span>
+      <button class="t-btn js-blame-history" type="button">file history</button>
+      <button class="t-icon js-blame-off" type="button" aria-label="Turn blame off">✕</button>`;
+    bar.classList.toggle("is-warn", dirty);
+    bar.querySelector(".js-blame-history")!.addEventListener("click", () => showFileHistory(state.path));
+    bar.querySelector(".js-blame-off")!.addEventListener("click", () => void toggleBlame());
+  }
+
+  /** Scope the history panel to one path, and show it. */
+  function showFileHistory(path: string): void {
+    showView("history");
+    history.scopeTo(path);
+  }
+
+  /** Open the history panel with one commit expanded and scrolled to. */
+  async function revealCommit(oid: string): Promise<void> {
+    showView("history");
+    await history.reveal(oid);
+  }
+
+  // ── folder comparison ──
+  // Two environment folders, or one folder against what is committed. The
+  // result is a list of paths in three states; every row opens the pair in the
+  // ordinary diff view, so this adds a way to *find* the differences without
+  // adding a second way to read them.
+
+  /** Compare two folders in the workspace. */
+  async function compareFolderTree(left: string, right: string): Promise<void> {
+    const tab: FolderTab = {
+      kind: "folder",
+      id: `dircmp:${JSON.stringify([left, right])}`,
+      label: `${distinguish(left, right)} ↔ ${distinguish(right, left)}`,
+      title: `${left} ↔ ${right}`,
+      mode: "folders",
+      left,
+      right,
+      leftName: left,
+      rightName: right,
+      state: "running",
+      entries: [],
+      truncated: false,
+      showSame: false,
+    };
+    placeTab(tab, false);
+    activate(tab.id);
+    tree.setCompareBase(null);
+
+    try {
+      const result = await compareFolders(
+        {
+          readDir: (path) => agent.call<DirEntry[]>("fs.readdir", { path }),
+          read: (path) => agent.call<FileRead>("fs.read", { path }),
+        },
+        left,
+        right,
+      );
+      tab.entries = result.entries;
+      tab.truncated = result.truncated;
+      tab.state = "done";
+      const differing = result.entries.filter((e) => e.state !== "same").length;
+      report("compare", `${left} ↔ ${right}: ${differing || "no"} difference${differing === 1 ? "" : "s"}`);
+    } catch (e) {
+      tab.state = "failed";
+      tab.error = e instanceof Error ? e.message : String(e);
+      reportError("compare", e);
+    }
+    // The reader may well have moved on while a few hundred files were read.
+    if (activeId === tab.id) renderFolderTab(tab);
+    renderTabs();
+  }
+
+  /** Compare a folder against the committed version of itself.
+   *
+   *  This is git's own answer rather than a walk: `git status` already knows
+   *  which files under a path were added, deleted or changed, and asking it
+   *  costs one call instead of reading the folder twice. */
+  async function compareFolderWithHead(folder: string): Promise<void> {
+    const tab: FolderTab = {
+      kind: "folder",
+      id: `dirhead:${JSON.stringify(folder)}`,
+      label: `${folder.split("/").pop() ?? folder} ↔ HEAD`,
+      title: `${folder} ↔ HEAD`,
+      mode: "head",
+      left: folder,
+      right: null,
+      leftName: "HEAD (last commit)",
+      rightName: `${folder} (on disk)`,
+      state: "running",
+      entries: [],
+      truncated: false,
+      showSame: false,
+    };
+    placeTab(tab, false);
+    activate(tab.id);
+
+    try {
+      const st = await agent.call<GitStatus>("git.status");
+      const prefix = `${folder}/`;
+      tab.entries = st.entries
+        .filter((row) => row.path.startsWith(prefix) && !row.ignored)
+        .map((row) => {
+          const rel = row.path.slice(prefix.length);
+          // Either column can carry the letter: staged and unstaged changes are
+          // both changes as far as "is this folder what was committed?" goes.
+          const codes = row.index + row.work;
+          // Untracked and added files exist here and not in HEAD; deleted ones
+          // the other way round. "left" is HEAD, matching the diff that opens.
+          if (row.untracked || codes.includes("A")) return { rel, state: "right" as const, rightPath: row.path };
+          if (codes.includes("D")) return { rel, state: "left" as const, leftPath: row.path };
+          return { rel, state: "differs" as const, leftPath: row.path, rightPath: row.path };
+        })
+        .sort((a, b) => a.rel.localeCompare(b.rel));
+      tab.state = "done";
+      report("compare", `${folder} ↔ HEAD: ${tab.entries.length || "no"} change${tab.entries.length === 1 ? "" : "s"}`);
+    } catch (e) {
+      tab.state = "failed";
+      tab.error = e instanceof Error ? e.message : String(e);
+      reportError("git status", e);
+    }
+    if (activeId === tab.id) renderFolderTab(tab);
+    renderTabs();
+  }
+
+  /** What changed between two commits.
+   *
+   *  There is no `git diff A B --name-status` in the protocol, so the path set
+   *  is built from the commits on either side of the pair — `A..B` and `B..A`,
+   *  so two divergent branches are covered and not just a fast-forward — and
+   *  then each path is settled by reading its blob at both ends. That last step
+   *  is what makes the answer exact rather than "touched at some point": a file
+   *  changed and changed back reports as identical, which is the truth.
+   */
+  async function compareCommits(from: Commit, to: Commit): Promise<void> {
+    const a7 = from.oid.slice(0, 7);
+    const b7 = to.oid.slice(0, 7);
+    const tab: FolderTab = {
+      kind: "folder",
+      id: `revcmp:${from.oid}:${to.oid}`,
+      label: `${a7} ↔ ${b7}`,
+      title: `${a7} ${from.subject} ↔ ${b7} ${to.subject}`,
+      mode: "commits",
+      left: from.oid,
+      right: null,
+      revs: { from, to },
+      leftName: `${a7} · ${from.subject}`,
+      rightName: `${b7} · ${to.subject}`,
+      state: "running",
+      entries: [],
+      truncated: false,
+      showSame: false,
+    };
+    placeTab(tab, false);
+    activate(tab.id);
+
+    try {
+      // Both directions: a path touched only on the older commit's own branch
+      // is still a difference between the two, and `A..B` alone would miss it.
+      const [ahead, behind] = await Promise.all([
+        agent.call<Commit[]>("git.log", { ref: `${from.oid}..${to.oid}`, limit: REV_WALK }),
+        agent.call<Commit[]>("git.log", { ref: `${to.oid}..${from.oid}`, limit: REV_WALK }),
+      ]);
+      const between = [...ahead, ...behind];
+      const details = await Promise.all(
+        between.map((c) => agent.call<CommitDetail>("git.commitDetail", { oid: c.oid }).catch(() => null)),
+      );
+      const paths = new Set<string>();
+      for (const d of details) {
+        for (const f of d?.files ?? []) {
+          paths.add(f.path);
+          if (f.from) paths.add(f.from); // a rename is two paths, and both moved
+        }
+      }
+
+      const blob = (rev: string, path: string): Promise<{ text: string | null; binary: boolean } | null> =>
+        agent.call<{ text: string | null; binary: boolean }>("git.blob", { rev, path }).catch(() => null);
+      const normalise = (s: string | null): string => (s ?? "").replace(/\r\n/g, "\n").replace(/\n+$/, "");
+
+      const entries: FolderEntry[] = [];
+      for (const rel of [...paths].sort()) {
+        const [x, y] = await Promise.all([blob(from.oid, rel), blob(to.oid, rel)]);
+        // `git.blob` answers with a null text for a path the commit does not
+        // have, which is how "only on one side" is told from "empty file".
+        const inA = x !== null && (x.text !== null || x.binary);
+        const inB = y !== null && (y.text !== null || y.binary);
+        if (inA && !inB) entries.push({ rel, state: "left", leftPath: rel });
+        else if (!inA && inB) entries.push({ rel, state: "right", rightPath: rel });
+        else if (inA && inB) {
+          const same = x!.binary || y!.binary ? x!.binary === y!.binary : normalise(x!.text) === normalise(y!.text);
+          entries.push({ rel, state: same ? "same" : "differs", leftPath: rel, rightPath: rel });
+        }
+      }
+      tab.entries = entries;
+      tab.truncated = ahead.length >= REV_WALK || behind.length >= REV_WALK;
+      tab.state = "done";
+      const differing = entries.filter((e) => e.state !== "same").length;
+      report("compare", `${a7} ↔ ${b7}: ${differing || "no"} file${differing === 1 ? "" : "s"} differ`);
+    } catch (e) {
+      tab.state = "failed";
+      tab.error = e instanceof Error ? e.message : String(e);
+      reportError("compare", e);
+    }
+    if (activeId === tab.id) renderFolderTab(tab);
+    renderTabs();
+  }
+
+  /** Past this many commits on one side, the pair is far enough apart that the
+   *  question is really "what changed on this branch", and reading every
+   *  commit's file list to answer it is the wrong shape of call. */
+  const REV_WALK = 200;
+
+  /** One file, as it stood at two commits. */
+  async function compareRevs(path: string, from: Commit, to: Commit): Promise<void> {
+    const a7 = from.oid.slice(0, 7);
+    const b7 = to.oid.slice(0, 7);
+    try {
+      const [a, b] = await Promise.all([
+        agent.call<{ text: string | null; binary: boolean }>("git.blob", { rev: from.oid, path }),
+        agent.call<{ text: string | null; binary: boolean }>("git.blob", { rev: to.oid, path }),
+      ]);
+      showDiffTab(
+        `revdiff:${from.oid}:${to.oid}:${path}`,
+        `${base(path)} (${a7}…${b7})`,
+        `${path}\n\n${a7} · ${from.subject}\n${b7} · ${to.subject}`,
+        {
+          path,
+          before: a.text,
+          after: b.text,
+          beforeLabel: `${a7} · ${from.subject}`,
+          afterLabel: `${b7} · ${to.subject}`,
+          binary: a.binary || b.binary,
+        },
+        false,
+      );
+    } catch (e) {
+      reportError("git blob", e);
+    }
+  }
+
+  const FOLDER_BADGE: Record<EntryState, string> = { left: "−", right: "+", differs: "≠", same: "=" };
+
+  /** What each state is called, in the words that fit the comparison at hand:
+   *  between two folders a file is on one side or the other, but against HEAD
+   *  the same three states are the ones git already has names for. */
+  const stateWord = (tab: FolderTab, state: EntryState): string => {
+    if (tab.mode === "folders") {
+      return { left: "only on the left", right: "only on the right", differs: "differs", same: "identical" }[state];
+    }
+    return { left: "deleted", right: "new", differs: "modified", same: "unchanged" }[state];
+  };
+
+  /** The same states after a number, where the row wording does not read as
+   *  English: "2 differs" is not a count of anything. */
+  const countWord = (tab: FolderTab, state: EntryState): string =>
+    tab.mode === "folders"
+      ? { left: "only left", right: "only right", differs: "differ", same: "identical" }[state]
+      : stateWord(tab, state);
+
+  function renderFolderTab(tab: FolderTab): void {
+    if (tab.state === "running") {
+      folderHost.innerHTML = `<div class="dircmp"><p class="dircmp-note">Comparing ${esc(tab.leftName)} with ${esc(tab.rightName)}…</p></div>`;
+      return;
+    }
+    if (tab.state === "failed") {
+      folderHost.innerHTML = `<div class="dircmp"><p class="dircmp-note is-error">Could not compare these folders: ${esc(tab.error ?? "unknown error")}</p></div>`;
+      return;
+    }
+
+    const counts = { left: 0, right: 0, differs: 0, same: 0 };
+    for (const e of tab.entries) counts[e.state]++;
+    const shown = tab.entries.filter((e) => tab.showSame || e.state !== "same");
+
+    // The header says which side is which *by name*, because "left" and
+    // "right" mean nothing an hour later when the tab is still open.
+    const head = `<div class="dircmp-head">
+      <span class="dircmp-side"><b>−</b> ${esc(tab.leftName)}</span>
+      <span class="dircmp-side"><b>+</b> ${esc(tab.rightName)}</span>
+      <span class="t-spacer"></span>
+      <span class="dircmp-counts">${(["differs", "left", "right", "same"] as const)
+        .filter((s) => s !== "same" || counts.same)
+        .map((s) => `${counts[s]} ${countWord(tab, s)}`)
+        .join(" · ")}</span>
+      ${counts.same ? `<label class="dircmp-toggle"><input type="checkbox" class="js-show-same"${tab.showSame ? " checked" : ""}> show identical</label>` : ""}
+      <button class="t-btn js-dircmp-swap" type="button"${tab.mode === "folders" ? "" : " hidden"}>swap sides</button>
+      <button class="t-btn js-dircmp-again" type="button">re-run</button>
+    </div>`;
+
+    const note = tab.truncated
+      ? `<p class="dircmp-note is-warn">More than 4000 files on one side — this list is partial. Compare a folder further in.</p>`
+      : "";
+
+    const body = shown.length
+      ? `<div class="dircmp-list" role="list">${shown
+          .map((e, i) => {
+            const word = stateWord(tab, e.state);
+            const openable = e.state === "differs";
+            return `<div class="dircmp-row ${e.state}${openable ? " openable" : ""}" role="listitem" data-i="${i}"
+              tabindex="0" title="${esc(e.rel)} — ${word}${openable ? " · click to see the difference" : ""}">
+              <span class="dircmp-badge" aria-hidden="true">${FOLDER_BADGE[e.state]}</span>
+              <span class="dircmp-path">${esc(e.rel)}</span>
+              <span class="dircmp-word">${word}</span>
+            </div>`;
+          })
+          .join("")}</div>`
+      : `<p class="dircmp-note">${
+          counts.same && !tab.showSame
+            ? `No differences — all ${counts.same} files match. Tick “show identical” to list them.`
+            : tab.mode === "head"
+              ? `Nothing under ${esc(tab.left)} has changed since the last commit.`
+              : tab.mode === "commits"
+                ? "These two commits leave every file the same."
+                : "Both folders are empty."
+        }</p>`;
+
+    folderHost.innerHTML = `<div class="dircmp">${head}${note}${body}</div>`;
+
+    folderHost.querySelector(".js-show-same")?.addEventListener("change", () => {
+      tab.showSame = !tab.showSame;
+      renderFolderTab(tab);
+    });
+    folderHost.querySelector(".js-dircmp-again")!.addEventListener("click", () => {
+      if (tab.mode === "commits" && tab.revs) void compareCommits(tab.revs.from, tab.revs.to);
+      else if (tab.mode === "head") void compareFolderWithHead(tab.left);
+      else if (tab.right !== null) void compareFolderTree(tab.left, tab.right);
+    });
+    folderHost.querySelector(".js-dircmp-swap")?.addEventListener("click", () => {
+      if (tab.right !== null) void compareFolderTree(tab.right, tab.left);
+    });
+
+    const openRow = (i: number): void => {
+      const entry = shown[i];
+      if (!entry || entry.state !== "differs") return;
+      // Against HEAD there is one path and two versions of it; between two
+      // folders there are two paths. Both end up in the same diff view.
+      if (tab.mode === "head") void openDiff(entry.leftPath!, "head");
+      else if (tab.mode === "commits" && tab.revs) void compareRevs(entry.rel, tab.revs.from, tab.revs.to);
+      else void compare(entry.leftPath!, entry.rightPath!);
+    };
+    for (const row of folderHost.querySelectorAll<HTMLElement>(".dircmp-row")) {
+      const i = Number(row.dataset.i);
+      row.addEventListener("click", () => openRow(i));
+      row.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          openRow(i);
+        }
+      });
+    }
+  }
+
+  /** What a commit diff is a diff *of*, when the caller knows.
+   *
+   *  The agent can only answer `04b43473^ → 04b43473`, because a blob read is
+   *  all it was asked for. The history panel has the subject, the author and
+   *  the date in hand already, so it passes them down rather than making the
+   *  reader decode two near-identical hashes and a caret. */
+  interface DiffAbout {
+    subject: string;
+    author: string;
+    time: number;
+    /** Subject of the parent, when it is in the loaded log. */
+    parentSubject?: string;
+    parentOid?: string;
+  }
+
+  async function openDiff(path: string, kind: string, about?: DiffAbout): Promise<void> {
     try {
       const pair = await agent.call<DiffPair>("git.diff", { path, kind });
+      if (about) {
+        const short = kind.slice(0, 7);
+        // "before" is the parent commit, named as one. `<oid>^` is correct and
+        // unreadable: a junior reads the caret as a typo in the hash next to it.
+        pair.beforeLabel = about.parentOid
+          ? `${about.parentOid.slice(0, 7)} · ${about.parentSubject ?? "parent commit"}`
+          : "before this commit";
+        pair.afterLabel = `${short} · ${about.subject}`;
+      }
       // "worktree" is index vs the file on disk, so the right-hand side *is*
       // the file: reverting a chunk there is a real edit that can be written
       // back. Everything else (staged, a commit) compares two recorded states.
       const editablePath = kind === "worktree" ? path : undefined;
+      // The same two sides, read the other way: one of them is the index, so
+      // one change out of twenty can be moved across without staging the file.
+      const staging =
+        kind === "worktree" ? { path, reverse: false }
+        : kind === "staged" ? { path, reverse: true }
+        : undefined;
       // `kind` is either a named diff or a commit oid, and the label has to say
       // which — otherwise every commit's diff of the same file reads the same
       // in the strip. Keyed by kind too, so each gets its own tab.
       const what = /^[0-9a-f]{7,40}$/.test(kind) ? kind.slice(0, 7) : kind;
-      showDiffTab(`diff:${kind}:${path}`, `${base(path)} (${what})`, `${path}  (diff · ${what})`, pair, true, editablePath);
+      // The hover text spells the commit out; the strip cannot hold it.
+      const title = about
+        ? `${path}\n\n${what} · ${about.subject}\n${about.author} · ${absoluteTime(about.time)}`
+        : `${path}  (diff · ${what})`;
+      showDiffTab(`diff:${kind}:${path}`, `${base(path)} (${what})`, title, pair, true, editablePath, undefined, staging);
     } catch (e) {
       reportError("agent", e);
     }
@@ -1245,6 +2638,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       lastSelfWrite = Date.now();
       // What is on disk is now the baseline, so the tab stops showing dirty.
       baselines.set(tab.id, text);
+      tab.eolChanged = false;
       if (boundRoot) void dropDraft(boundRoot, path);
       conflictingTabs.delete(tab.id);
       tab.missing = false;
@@ -1300,6 +2694,101 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  and drafts only mean anything while it is the folder on the other end. */
   let boundRoot: string | null = null;
 
+  // ── session ──
+  // What was on screen last time. Width, folded SCM groups and search options
+  // were already remembered, which only made the rest more conspicuous: the
+  // tabs, which folder was open and which view you were in all reset on every
+  // reload, so coming back to a repository meant reopening four files by hand.
+  //
+  // Keyed by workspace root, because none of it means anything anywhere else.
+  interface Session {
+    open: string[];
+    active: string | null;
+    expanded: string[];
+    view: View;
+    histAll: boolean;
+    histGraph: boolean;
+  }
+  const SESSION_KEY = "enc-code-sessions";
+  /** A handful of workspaces, so localStorage does not accumulate every folder
+   *  the tool has ever been pointed at. */
+  const MAX_SESSIONS = 8;
+
+  const loadSessions = (): Record<string, Session> => {
+    try {
+      return JSON.parse(localStorage.getItem(SESSION_KEY) ?? "{}") as Record<string, Session>;
+    } catch {
+      return {};
+    }
+  };
+
+  let sessionTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Restoring opens tabs and expands folders, which is exactly what the save
+   *  hooks listen for — without this the restore would write its own progress
+   *  back over the session it is still reading. */
+  let restoringSession = false;
+
+  function saveSession(): void {
+    if (restoringSession || !boundRoot) return;
+    if (sessionTimer) clearTimeout(sessionTimer);
+    sessionTimer = setTimeout(writeSession, 400);
+  }
+
+  function writeSession(): void {
+    sessionTimer = null;
+    const root = boundRoot;
+    if (!root) return;
+    try {
+      const all = loadSessions();
+      const active = tabs.find((t) => t.id === activeId);
+      all[root] = {
+        open: fileTabs().filter((t) => !t.missing).map((t) => t.path),
+        active: active?.kind === "file" ? active.path : null,
+        expanded: tree.expandedPaths(),
+        view: ($(".code-side").dataset.view as View) ?? "explorer",
+        histAll: history.options.all,
+        histGraph: history.options.graph,
+      };
+      // Oldest out first — insertion order is close enough to recency here,
+      // because the current root is re-inserted on every save.
+      const keys = Object.keys(all);
+      for (const k of keys.slice(0, Math.max(0, keys.length - MAX_SESSIONS))) delete all[k];
+      localStorage.setItem(SESSION_KEY, JSON.stringify(all));
+    } catch {
+      /* private mode, or the quota — neither is worth interrupting anyone for */
+    }
+  }
+
+  // Folders opened in the tree do not go through any of the hooks above, and a
+  // reload right after expanding one would lose it. The page going away is the
+  // last moment anything can be written, so everything is flushed here.
+  window.addEventListener("pagehide", () => {
+    if (!restoringSession) writeSession();
+  });
+
+  async function restoreSession(root: string): Promise<void> {
+    const saved = loadSessions()[root];
+    if (!saved) return;
+    restoringSession = true;
+    try {
+      history.setOptions({ all: saved.histAll, graph: saved.histGraph });
+      if (saved.view) showView(saved.view);
+      await tree.restoreExpanded(saved.expanded ?? []);
+      // Only files that are still there, and never over tabs the user has
+      // already opened in this session — reconnecting should not duplicate
+      // what is on screen.
+      for (const path of saved.open ?? []) {
+        if (tabForPath(path)) continue;
+        await open(path, false, false).catch(() => undefined);
+      }
+      const back = saved.active ? tabForPath(saved.active) : undefined;
+      if (back) activate(back.id);
+    } finally {
+      restoringSession = false;
+    }
+    saveSession();
+  }
+
   async function onOnline(): Promise<void> {
     const root = agent.info?.root ?? "";
     // The same button now covers disconnecting and switching folders, so it
@@ -1324,6 +2813,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
     // Reconnected to the same folder: the files may have moved on without us.
     for (const tab of fileTabs()) void reconcileAfterReconnect(tab);
+    await restoreSession(root);
     void offerDrafts(root);
   }
 
@@ -1513,7 +3003,27 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       report("agent", "agent connected");
     } catch (e) {
       reportError("agent", e);
+      const message = e instanceof Error ? e.message : String(e);
+      // One agent serves one tab unless it was started otherwise. That is a
+      // deliberate default, and the way past it is a flag documented only in
+      // the README — so the refusal now carries the command itself.
+      if (/already serving another tab/i.test(message)) await offerAllowMultiple(url);
     }
+  }
+
+  /** Hand over the exact command that lifts the one-tab restriction.
+   *
+   *  A toast cannot hold something you have to retype into a terminal, and
+   *  "see the README" is the answer that sent people to the README. */
+  async function offerAllowMultiple(url: string): Promise<void> {
+    const root = loadRecents().find((r) => r.url === url)?.root;
+    const command = root ? `enc-tool-agent --allow-multiple --root "${root}"` : "enc-tool-agent --allow-multiple";
+    const ok = await modalConfirm({
+      title: "That agent is already serving another tab",
+      detail: `Close the other tab, or restart the agent so it accepts more than one:\n\n${command}`,
+      okLabel: "copy the command",
+    });
+    if (ok) await copyToClipboard(command, "Command", (m, isError) => report("agent", m, { isError }));
   }
 
   // ── recent workspaces ──
@@ -1578,8 +3088,51 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         run: () => void connectTo(r.url),
       });
     }
+    if (agent.state === "online") {
+      items.push({
+        label: "Open a different folder in this agent…",
+        hint: "no restart",
+        separated: items.length > 0,
+        run: () => void changeRoot(),
+      });
+    }
     items.push({ label: "Connect to another agent…", separated: items.length > 0, run: () => void connect() });
     showMenu(e.clientX, e.clientY, items);
+  }
+
+  /** Point the running agent at another folder.
+   *
+   *  Switching projects used to mean stopping the agent and starting a second
+   *  one, which is a terminal round trip for something the editor can ask for.
+   *  The agent decides whether it may: by default only within the folder it was
+   *  started on, and wider only where the person who started it said so with
+   *  --allow-root. So this asks, and reports the refusal in those terms rather
+   *  than pretending the path was wrong.
+   */
+  async function changeRoot(): Promise<void> {
+    const current = agent.info?.root ?? "";
+    const path = await modalPrompt({
+      title: "Open a different folder",
+      hint: "An absolute path on the machine the agent runs on. The agent will refuse anything outside what it was allowed at startup (--allow-root).",
+      value: current,
+      okLabel: "open",
+    });
+    if (!path || path === current) return;
+    try {
+      const info = await agent.call<AgentInfo>("agent.setRoot", { path });
+      agent.info = info;
+      report("agent", `workspace is now ${info.root}`);
+      // Everything on screen describes the old folder. The tabs are the only
+      // part worth keeping a decision about, so they are closed the same way
+      // disconnecting closes them — a buffer whose path means something else
+      // now is worse than no buffer.
+      // onOnline() is exactly this work: it rebinds the root, drops tabs that
+      // belonged to the old one, reloads the tree, status and panels, and
+      // restarts the watcher.
+      await onOnline();
+    } catch (e) {
+      reportError("agent.setRoot", e);
+    }
   }
 
   /** "2h", "3d" — the same shorthand the history uses. */
@@ -1623,9 +3176,13 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       title: "Local agent URL",
       value: fromClipboard ?? agent.savedUrl(),
       placeholder: "ws://127.0.0.1:5001/ws?token=…",
+      // Masked by default: this URL carries the agent's token, and the dialog
+      // is open precisely when someone is sharing a screen or pasting a
+      // screenshot into a ticket. The eye shows it when the port needs reading.
+      password: true,
       hint: fromClipboard
-        ? "Taken from your clipboard — the agent put it there when it started."
-        : "Run `enc-tool agent` in the folder you want to edit, then paste the URL it prints.",
+        ? "Taken from your clipboard — the agent put it there when it started. It contains the agent's token, so it is hidden until you show it."
+        : "Run `enc-tool agent` in the folder you want to edit, then paste the URL it prints. It contains a token, so it is hidden until you show it.",
       okLabel: "connect",
     });
     if (!url) return;

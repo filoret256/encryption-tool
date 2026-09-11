@@ -68,6 +68,12 @@ and be pointed at a project instead of copied into one:
                           curl, scripts, anything that is not a browser. Off by
                           default — a browser always sends one, so a missing
                           Origin is never the app.
+  --allow-root <dir>      another folder the editor may switch the workspace
+                          to, repeatable. Without it the workspace can only be
+                          moved inside the folder the agent was started on,
+                          which can never reach anything it could not already
+                          read. Naming a folder here is what lets the editor
+                          open a second project without a second agent.
   --allow-multiple        serve more than one client at once. By default the
                           agent takes a single connection and refuses the rest
                           while it is held, so it is always clear which page is
@@ -90,6 +96,9 @@ type options struct {
 	noClipboard   bool
 	allowNoOrigin bool
 	allowMultiple bool
+	// Folders agent.setRoot may move the workspace into, beyond the startup
+	// root itself. Empty is the safe default — see (*server).setRoot.
+	allowRoots []string
 }
 
 // envOrigins reads comma- or space-separated origins from the environment.
@@ -168,6 +177,8 @@ func parseArgs(argv []string) options {
 			o.noClipboard = true
 		case "--allow-no-origin":
 			o.allowNoOrigin = true
+		case "--allow-root":
+			o.allowRoots = append(o.allowRoots, value())
 		case "--allow-multiple":
 			o.allowMultiple = true
 		case "--version", "-v":
@@ -256,6 +267,19 @@ func main() {
 		Watch: watcherSupported(j.root),
 	}
 
+	// The startup root is always allowed, so setRoot can narrow to a subfolder
+	// and come back — neither reaches anything this agent could not already
+	// read, which makes the default a non-escalation rather than a judgement
+	// call. Anything wider is a --allow-root on the command line.
+	rerootBases := []string{j.root}
+	for _, dir := range opts.allowRoots {
+		allowed, err := openJail(dir)
+		if err != nil {
+			fail(fmt.Sprintf("--allow-root folder does not exist: %s", dir))
+		}
+		rerootBases = append(rerootBases, allowed.root)
+	}
+
 	srv := &server{
 		jail:          j,
 		info:          info,
@@ -264,6 +288,7 @@ func main() {
 		allowNoOrigin: opts.allowNoOrigin,
 		allowMultiple: opts.allowMultiple,
 		isRepo:        top != "",
+		rerootBases:   rerootBases,
 	}
 
 	listener := listen(opts)

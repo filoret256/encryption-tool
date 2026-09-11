@@ -30,6 +30,13 @@ export const isAgentUrl = (text: string): boolean => AGENT_URL.test(text.trim())
 
 const UNREACHABLE = "cannot reach the agent";
 
+/** Ops whose concurrent duplicates are answered once.
+ *
+ *  Only reads with no side effect and no streamed chunks belong here: two
+ *  callers share one reply object, so an op that changes anything — or whose
+ *  caller mutates what comes back — must not be on the list. */
+const SHARED_READS = new Set(["git.status", "git.branches", "git.identity"]);
+
 /** Attempts before the client stops trying and says why.
  *
  *  With the backoff below (1s, 2s, 4s, 8s, 15s…) this is a little over a
@@ -119,6 +126,8 @@ export class AgentClient {
   private pending = new Map<number, Pending>();
   private listeners = new Map<string, Set<(data: unknown) => void>>();
   private nextId = 1;
+  /** In-flight pure reads, keyed by op and params — see SHARED_READS. */
+  private inFlight = new Map<string, Promise<unknown>>();
   private url = "";
   private retry = 0;
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -282,6 +291,24 @@ export class AgentClient {
   }
 
   call<T>(op: string, params: Record<string, unknown> = {}, onChunk?: (c: unknown) => void): Promise<T> {
+    // Two panels asking the same question in the same tick is one question.
+    // The status bar and the source-control panel both want `git.status` on
+    // every refresh, and the panel wants `git.branches` alongside the branch
+    // picker — three round trips per wake-up where one answer would do. Only
+    // while the first is still in flight: this is deduplication, not a cache,
+    // so nothing here can serve a stale answer.
+    if (!onChunk && SHARED_READS.has(op)) {
+      const key = `${op} ${JSON.stringify(params)}`;
+      const live = this.inFlight.get(key) as Promise<T> | undefined;
+      if (live) return live;
+      const promise = this.callTracked<T>(op, params).promise;
+      this.inFlight.set(key, promise);
+      const done = (): void => {
+        if (this.inFlight.get(key) === promise) this.inFlight.delete(key);
+      };
+      promise.then(done, done);
+      return promise;
+    }
     return this.callTracked<T>(op, params, onChunk).promise;
   }
 

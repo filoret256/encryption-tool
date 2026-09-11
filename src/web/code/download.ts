@@ -100,6 +100,9 @@ function caveat(b: Build): string {
 export interface AgentDownload {
   /** Called on every tab switch; the manifest is fetched on the first reveal. */
   setVisible(visible: boolean): void;
+  /** Open the download popover from somewhere else — the code tab's first
+   *  screen, which is where someone without an agent actually is. */
+  open(): void;
 }
 
 export function mountAgentDownload(host: HTMLElement): AgentDownload {
@@ -242,6 +245,16 @@ export function mountAgentDownload(host: HTMLElement): AgentDownload {
         return;
       }
       host.hidden = manifest.builds.length === 0;
+    },
+    open(): void {
+      // Nothing to open when the server shipped no builds; the chip is hidden
+      // in that case and clicking through to an empty popover would be worse
+      // than the button doing nothing.
+      if (host.hidden) return;
+      pop.hidden = false;
+      chip.setAttribute("aria-expanded", "true");
+      render();
+      chip.focus();
     },
   };
 }

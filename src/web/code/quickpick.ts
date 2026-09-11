@@ -10,7 +10,7 @@
  *  one place a caller supplies markup. It must be escaped by the caller; the
  *  label and detail are inserted as text and cannot be.
  */
-import { esc } from "./ui.ts";
+import { esc, startTrimmed } from "./ui.ts";
 
 export interface PickItem {
   /** What the promise resolves to when this row is chosen. */
@@ -108,7 +108,7 @@ export function quickPick(opts: QuickPickOptions): Promise<string | null> {
             <span class="pick-label">${esc(item.label)}</span>
             ${item.badges ?? ""}
             <span class="t-spacer"></span>
-            ${item.detail ? `<span class="pick-detail">${esc(item.detail)}</span>` : ""}
+            ${item.detail ? `<span class="pick-detail">${esc(startTrimmed(item.detail))}</span>` : ""}
           </div>`;
         })
         .join("");

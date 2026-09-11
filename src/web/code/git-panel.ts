@@ -6,8 +6,8 @@
  *  approximation of them.
  */
 import type { AgentClient } from "./agent.ts";
-import type { Branch, GitStatus, StatusEntry } from "../../agent/protocol.ts";
-import { esc, modalConfirm, modalPrompt, setHtmlKeepingScroll, showMenu, type MenuItem } from "./ui.ts";
+import type { Branch, Commit, CommitDetail, GitStatus, ReflogEntry, StatusEntry } from "../../agent/protocol.ts";
+import { esc, modalConfirm, modalPrompt, setHtmlKeepingScroll, showMenu, startTrimmed, type MenuItem } from "./ui.ts";
 import { pickRef } from "./refpicker.ts";
 import { iconBranch, iconCheck, iconDiscard, iconFetch, iconMinus, iconMore, iconPlus, iconPull, iconPush } from "./icons.ts";
 
@@ -29,6 +29,40 @@ const GROUP_TITLES: Record<Group, string> = {
   untracked: "untracked",
 };
 
+/** One entry of `git stash list`.
+ *
+ *  The agent has listed, applied and dropped stashes by name since the first
+ *  version; the panel offered "stash" and "pop latest" and nothing else, so a
+ *  second `stash push` put the first one somewhere the UI could not name. */
+interface Stash {
+  /** `stash@{0}` — what every stash command takes as its argument. */
+  ref: string;
+  time: number;
+  /** `On main: wip` or `WIP on main: cd1e044 …` as git wrote it. */
+  subject: string;
+}
+
+/** `%gd%x00%ct%x00%gs` per line, which is what the agent asks git for. */
+function parseStashes(raw: string): Stash[] {
+  const out: Stash[] = [];
+  for (const line of raw.split("\n")) {
+    if (!line.trim()) continue;
+    const [ref, time, ...rest] = line.split("\0");
+    if (!ref) continue;
+    out.push({ ref, time: Number(time) || 0, subject: rest.join("\0") });
+  }
+  return out;
+}
+
+/** "On main: wip" carries the branch, which the row shows separately. */
+function stashLabel(subject: string): { branch: string; text: string } {
+  const m = /^(?:WIP on|On) ([^:]+): (.*)$/.exec(subject);
+  if (!m) return { branch: "", text: subject };
+  // An unnamed stash reads "WIP on main: <oid> <subject of HEAD>", where the
+  // oid is noise: it names the commit the stash sits on, not the work in it.
+  return { branch: m[1], text: m[2].replace(/^[0-9a-f]{7,40}\s+/, "") };
+}
+
 const SHELL = `
   <div class="gp-head">
     <button class="t-btn js-branch" type="button" title="Branches">${iconBranch}<span class="js-branch-name">—</span></button>
@@ -44,23 +78,31 @@ const SHELL = `
     <div class="gp-commit-row">
       <button class="t-btn t-btn-primary js-commit" type="button">✓ commit</button>
       <button class="t-btn js-amend" type="button" title="Replace the last commit">amend</button>
+      <button class="t-icon js-history" type="button" title="Recent commit messages">↺</button>
+      <span class="t-spacer"></span>
+      <span class="gp-len js-len" aria-live="off"></span>
     </div>
     <p class="gp-warn js-warn" hidden></p>
   </div>
   <div class="gp-groups js-groups"></div>
   <div class="gp-progress js-progress" hidden></div>`;
 
-const COLLAPSED_KEY = "enc-scm-collapsed";
+/** Collapsible sections: the four file groups plus the stash list. */
+type Section = Group | "stash";
 
-const loadCollapsed = (): Set<Group> => {
+const COLLAPSED_KEY = "enc-scm-collapsed";
+const VIEW_KEY = "enc-scm-view";
+const SORT_KEY = "enc-scm-sort";
+
+const loadCollapsed = (): Set<Section> => {
   try {
-    return new Set(JSON.parse(localStorage.getItem(COLLAPSED_KEY) ?? "[]") as Group[]);
+    return new Set(JSON.parse(localStorage.getItem(COLLAPSED_KEY) ?? "[]") as Section[]);
   } catch {
     return new Set();
   }
 };
 
-const saveCollapsed = (s: Set<Group>): void => {
+const saveCollapsed = (s: Set<Section>): void => {
   try {
     localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...s]));
   } catch {
@@ -68,12 +110,45 @@ const saveCollapsed = (s: Set<Group>): void => {
   }
 };
 
+const loadPref = <T extends string>(key: string, allowed: readonly T[], fallback: T): T => {
+  try {
+    const v = localStorage.getItem(key) as T | null;
+    return v && allowed.includes(v) ? v : fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+const savePref = (key: string, value: string): void => {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* private mode */
+  }
+};
+
+/** Relative age, short enough for a row. */
+function ago(seconds: number): string {
+  const d = Math.max(0, Date.now() / 1000 - seconds);
+  if (d < 60) return "just now";
+  if (d < 3600) return `${Math.floor(d / 60)}m ago`;
+  if (d < 86400) return `${Math.floor(d / 3600)}h ago`;
+  if (d < 86400 * 30) return `${Math.floor(d / 86400)}d ago`;
+  return `${Math.floor(d / (86400 * 30))}mo ago`;
+}
+
 export class GitPanel {
   private status: GitStatus | null = null;
   private branches: Branch[] = [];
+  private stashes: Stash[] = [];
   /** Groups the user has folded away, remembered between sessions: a repo
    *  where "untracked" is always noise should not need folding on every load. */
   private collapsed = loadCollapsed();
+  /** Flat list or folder tree, and what orders the rows. Both remembered:
+   *  someone who works in a monorepo wants the tree every time, and someone
+   *  who does not never wants to see it. */
+  private view = loadPref(VIEW_KEY, ["list", "tree"] as const, "list");
+  private sort = loadPref(SORT_KEY, ["name", "status"] as const, "name");
   private busy = false;
   /** Fingerprint of the rendered file list, so an unchanged status leaves the
    *  rows — and any click in flight over them — alone. */
@@ -96,18 +171,21 @@ export class GitPanel {
 
     this.$(".js-branch").addEventListener("click", (e) => this.branchMenu(e as MouseEvent));
     this.$(".js-sync").addEventListener("click", () => void this.sync());
-    this.$(".js-more").addEventListener("click", (e) => this.moreMenu(e as MouseEvent));
+    this.$(".js-more").addEventListener("click", (e) => void this.moreMenu(e as MouseEvent));
     this.$(".js-fetch").addEventListener("click", () => void this.remote("fetch", {}));
     this.$(".js-pull").addEventListener("click", () => void this.remote("pull", {}));
     this.$(".js-push").addEventListener("click", () => void this.push());
     this.$(".js-commit").addEventListener("click", () => void this.commit(false));
     this.$(".js-amend").addEventListener("click", () => void this.commit(true));
-    this.$<HTMLTextAreaElement>(".js-message").addEventListener("keydown", (e) => {
+    this.$(".js-history").addEventListener("click", (e) => void this.messageHistory(e as MouseEvent));
+    const box = this.$<HTMLTextAreaElement>(".js-message");
+    box.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
         void this.commit(false);
       }
     });
+    box.addEventListener("input", () => this.onMessageInput());
     // Opening a file reacts to the press: this panel rebuilds on every save and
     // every watcher event, and a rebuild between mousedown and mouseup means no
     // click event is ever produced. Stage / unstage / discard stay on click, so
@@ -128,13 +206,17 @@ export class GitPanel {
       return;
     }
     try {
-      const [status, branches, identity] = await Promise.all([
+      const [status, branches, identity, stashes] = await Promise.all([
         this.agent.call<GitStatus>("git.status"),
         this.agent.call<Branch[]>("git.branches"),
         this.agent.call<{ name: string | null; email: string | null }>("git.identity"),
+        // A repository with no stashes answers with an empty string, not an
+        // error, so this never needs its own failure path.
+        this.agent.call<string>("git.stash", { action: "list" }).catch(() => ""),
       ]);
       this.status = status;
       this.branches = branches;
+      this.stashes = parseStashes(stashes);
       this.failure = null;
 
       // git refuses to commit without an identity; say so before the failure.
@@ -204,6 +286,10 @@ export class GitPanel {
       (["conflict", "staged", "changes", "untracked"] as Group[]).map((k) =>
         g[k].map((e) => [e.path, e.index, e.work]),
       ),
+      this.stashes.map((s) => [s.ref, s.subject]),
+      this.view,
+      this.sort,
+      [...this.collapsed],
     ]);
     // An error state must be able to redraw itself once the cause is gone, so
     // it never counts as "the same as last time".
@@ -221,13 +307,54 @@ export class GitPanel {
            </div>`
       : !st
         ? `<p class="gp-empty">Not a git repository.</p>`
-        : total === 0
-          ? `<p class="gp-empty">No changes.</p>`
-          : (["conflict", "staged", "changes", "untracked"] as Group[])
-              .filter((k) => g[k].length)
-              .map((k) => this.groupHtml(k, g[k]))
-              .join(""),
+        : (total === 0
+            ? `<p class="gp-empty">No changes.</p>`
+            : (["conflict", "staged", "changes", "untracked"] as Group[])
+                .filter((k) => g[k].length)
+                .map((k) => this.groupHtml(k, g[k]))
+                .join("")) + this.stashHtml(),
     );
+  }
+
+  /** Stashes, listed and named.
+   *
+   *  They live below the file groups because they are not part of what is
+   *  about to be committed — but they are part of the working state, and until
+   *  now the only way to find out what was in one was to pop it. */
+  private stashHtml(): string {
+    if (!this.stashes.length) return "";
+    const open = !this.collapsed.has("stash");
+    return `<section class="gp-group">
+      <header class="gp-group-head">
+        <button class="gp-caret" type="button" data-collapse="stash"
+                aria-expanded="${open}" title="${open ? "Collapse" : "Expand"}">${open ? "▾" : "▸"}</button>
+        <span>stashes</span><span class="gp-count">${this.stashes.length}</span>
+        <span class="t-spacer"></span>
+      </header>
+      ${
+        open
+          ? this.stashes
+              .map((s) => {
+                const { branch, text } = stashLabel(s.subject);
+                // The branch is named only when it is not the one checked out:
+                // otherwise every row repeats "main" and spends the width the
+                // message needs. The full label is in the tooltip regardless.
+                const elsewhere = branch && branch !== this.status?.branch ? branch : "";
+                return `<div class="gp-row gp-stash" data-stash="${esc(s.ref)}"
+                  title="${esc(`${s.ref} — ${s.subject}`)}">
+                  <span class="gp-name">${esc(text || "(no message)")}</span>
+                  <span class="gp-dir">${esc([elsewhere, ago(s.time)].filter(Boolean).join(" · "))}</span>
+                  <span class="gp-actions">
+                    <button class="t-icon" data-stash-act="apply" title="Apply — keep the stash">↧</button>
+                    <button class="t-icon" data-stash-act="pop" title="Pop — apply and remove">↥</button>
+                    <button class="t-icon" data-stash-act="drop" title="Drop — delete this stash">${iconDiscard}</button>
+                  </span>
+                </div>`;
+              })
+              .join("")
+          : ""
+      }
+    </section>`;
   }
 
   private groupHtml(group: Group, entries: StatusEntry[]): string {
@@ -250,13 +377,57 @@ export class GitPanel {
         <span>${GROUP_TITLES[group]}</span><span class="gp-count">${entries.length}</span>
         <span class="t-spacer"></span>${bulk}
       </header>
-      ${open ? entries.map((e) => this.rowHtml(group, e)).join("") : ""}
+      ${open ? this.entriesHtml(group, entries) : ""}
     </section>`;
   }
 
-  private rowHtml(group: Group, e: StatusEntry): string {
+  /** The rows of one group, flat or nested, in the chosen order. */
+  private entriesHtml(group: Group, entries: StatusEntry[]): string {
+    const sorted = [...entries].sort(this.comparator());
+    if (this.view === "list") return sorted.map((e) => this.rowHtml(group, e)).join("");
+
+    // Tree mode. Directories are headings, not rows to act on: staging a whole
+    // folder is what the group's "stage all" is for, and a half-target that
+    // sometimes means a file and sometimes a folder is the thing this view is
+    // supposed to remove. Folders with a single child are joined into one
+    // heading ("roles/common/tasks"), the way every file tree does it — fifty
+    // changed files in a monorepo are otherwise fifty levels of indentation.
+    const byDir = new Map<string, StatusEntry[]>();
+    for (const e of sorted) {
+      const dir = e.path.includes("/") ? e.path.slice(0, e.path.lastIndexOf("/")) : "";
+      const list = byDir.get(dir);
+      if (list) list.push(e);
+      else byDir.set(dir, [e]);
+    }
+    const dirs = [...byDir.keys()].sort();
+    return dirs
+      .map((dir) => {
+        const rows = byDir.get(dir)!.map((e) => this.rowHtml(group, e, true)).join("");
+        if (!dir) return rows;
+        return `<div class="gp-dirhead" title="${esc(dir)}">${esc(startTrimmed(dir))}</div>${rows}`;
+      })
+      .join("");
+  }
+
+  /** How rows are ordered inside a group. */
+  private comparator(): (a: StatusEntry, b: StatusEntry) => number {
+    if (this.sort === "status") {
+      // Conflicts first, then deletions, then the rest: the order in which the
+      // rows need a decision, not the order git happened to print them.
+      const rank = (e: StatusEntry): number => {
+        const letter = e.conflict ? "!" : e.untracked ? "U" : e.index !== "." ? e.index : e.work;
+        return "!DRCAMTU".indexOf(letter) + 1 || 99;
+      };
+      return (a, b) => rank(a) - rank(b) || a.path.localeCompare(b.path);
+    }
+    return (a, b) => a.path.localeCompare(b.path);
+  }
+
+  private rowHtml(group: Group, e: StatusEntry, nested = false): string {
     const name = e.path.split("/").pop() ?? e.path;
-    const dir = e.path.includes("/") ? e.path.slice(0, e.path.lastIndexOf("/")) : "";
+    // In tree mode the directory is the heading above, so repeating it on every
+    // row is the noise this view exists to remove.
+    const dir = nested || !e.path.includes("/") ? "" : e.path.slice(0, e.path.lastIndexOf("/"));
     const letter = e.conflict ? "!" : e.untracked ? "U" : group === "staged" ? e.index : e.work;
     const actions =
       group === "staged"
@@ -266,9 +437,9 @@ export class GitPanel {
           : `<button class="t-icon" data-act="discard" title="Discard">${iconDiscard}</button>
              <button class="t-icon" data-act="stage" title="Stage">${iconPlus}</button>`;
 
-    return `<div class="gp-row" data-path="${esc(e.path)}" data-group="${group}" title="${esc(e.path)}">
+    return `<div class="gp-row${nested ? " nested" : ""}" data-path="${esc(e.path)}" data-group="${group}" title="${esc(e.path)}">
       <span class="gp-name">${esc(name)}</span>
-      <span class="gp-dir">${esc(dir)}</span>
+      <span class="gp-dir">${esc(startTrimmed(dir))}</span>
       <span class="gp-actions">${actions}</span>
       <span class="gp-mark dec-${group}">${esc(letter)}</span>
     </div>`;
@@ -282,7 +453,7 @@ export class GitPanel {
 
     const caret = target.closest<HTMLElement>("[data-collapse]");
     if (caret) {
-      const group = caret.dataset.collapse as Group;
+      const group = caret.dataset.collapse as Section;
       if (this.collapsed.has(group)) this.collapsed.delete(group);
       else this.collapsed.add(group);
       saveCollapsed(this.collapsed);
@@ -291,6 +462,12 @@ export class GitPanel {
       this.renderedKey = "";
       this.render();
       return;
+    }
+
+    const stashBtn = target.closest<HTMLElement>("[data-stash-act]");
+    if (stashBtn) {
+      const ref = target.closest<HTMLElement>("[data-stash]")?.dataset.stash;
+      if (ref) return this.stashAction(stashBtn.dataset.stashAct as "apply" | "pop" | "drop", ref);
     }
 
     const bulkBtn = target.closest<HTMLElement>("[data-bulk]");
@@ -311,11 +488,14 @@ export class GitPanel {
     if (e.button !== 0) return;
     const target = e.target as HTMLElement;
     // Buttons are handled on click, not here.
-    if (target.closest("[data-act]") || target.closest("[data-bulk]")) return;
+    if (target.closest("[data-act]") || target.closest("[data-bulk]") || target.closest("[data-stash-act]")) return;
 
     const row = target.closest<HTMLElement>(".gp-row");
-    if (!row) return;
-    const path = row.dataset.path!;
+    // A stash row shares the row class and has no path: it is a saved state,
+    // not a file, and there is nothing to open in a diff. Its own buttons are
+    // the only thing on it that does anything.
+    if (!row?.dataset.path) return;
+    const path = row.dataset.path;
     const group = row.dataset.group as Group;
 
     // Untracked files have no "before" side, so they open in the editor.
@@ -366,8 +546,91 @@ export class GitPanel {
     if ((this.status?.ahead ?? 0) > 0) await this.push();
   }
 
+  /** The message box grows with what is in it, and says how long the first
+   *  line is once that starts to matter.
+   *
+   *  Two rows fixed was enough for a subject and nothing else: a body had to be
+   *  written into a scrolling slot two lines tall. The 50/72 convention is
+   *  reported, not enforced — it is a convention, and a tool that refused to
+   *  commit over it would be wrong about some repositories. */
+  private onMessageInput(): void {
+    const box = this.$<HTMLTextAreaElement>(".js-message");
+    // Reset first: without it the box can only ever grow.
+    box.style.height = "auto";
+    box.style.height = `${Math.min(box.scrollHeight, 240)}px`;
+
+    const subject = box.value.split("\n", 1)[0] ?? "";
+    const len = this.$(".js-len");
+    const over = subject.length > 72 ? "over" : subject.length > 50 ? "long" : "";
+    len.textContent = over ? `${subject.length}` : "";
+    len.title = over
+      ? subject.length > 72
+        ? "The subject is over 72 characters — git log and most review tools will cut it."
+        : "Over 50 characters. Convention keeps the subject short and puts the detail in the body, after a blank line."
+      : "";
+    len.className = `gp-len js-len${over ? ` is-${over}` : ""}`;
+  }
+
+  /** The full message of HEAD — subject, then body. */
+  private async lastMessage(): Promise<string | null> {
+    try {
+      const [head] = await this.agent.call<Commit[]>("git.log", { limit: 1 });
+      if (!head) return null;
+      const detail = await this.agent.call<CommitDetail>("git.commitDetail", { oid: head.oid });
+      const body = detail.body.trim();
+      return body ? `${head.subject}\n\n${body}` : head.subject;
+    } catch {
+      // Not being able to read it is not a reason to block the amend; the box
+      // simply stays empty and git keeps the original message.
+      return null;
+    }
+  }
+
+  /** Recent messages, to reuse or to edit. Read from the log, so there is no
+   *  private list to keep in step with what was actually committed. */
+  private async messageHistory(e: MouseEvent): Promise<void> {
+    const { x, y } = { x: e.clientX, y: e.clientY };
+    let recent: Commit[] = [];
+    try {
+      recent = await this.agent.call<Commit[]>("git.log", { limit: 12 });
+    } catch (err) {
+      return this.cb.toast(err instanceof Error ? err.message : String(err), true);
+    }
+    const seen = new Set<string>();
+    const items: MenuItem[] = [];
+    for (const c of recent) {
+      if (!c.subject.trim() || seen.has(c.subject)) continue;
+      seen.add(c.subject);
+      items.push({
+        label: c.subject.length > 64 ? `${c.subject.slice(0, 63)}…` : c.subject,
+        run: () => {
+          const box = this.$<HTMLTextAreaElement>(".js-message");
+          box.value = c.subject;
+          this.onMessageInput();
+          box.focus();
+        },
+      });
+      if (items.length === 8) break;
+    }
+    if (!items.length) return this.cb.toast("No commits yet to take a message from.");
+    showMenu(x, y, items);
+  }
+
   private async commit(amend: boolean): Promise<void> {
     const box = this.$<HTMLTextAreaElement>(".js-message");
+    // Amending with an empty box used to mean "keep git's message", which is
+    // right, but the message was then invisible: you were replacing a commit
+    // whose text you could not see. Now it is put in the box to be edited.
+    if (amend && !box.value.trim()) {
+      const previous = await this.lastMessage();
+      if (previous) {
+        box.value = previous;
+        this.onMessageInput();
+        box.focus();
+        box.setSelectionRange(box.value.length, box.value.length);
+        return this.cb.toast("Previous message loaded — edit it and press amend again.");
+      }
+    }
     const message = box.value.trim();
     if (!message && !amend) return this.cb.toast("Commit message is required", true);
 
@@ -394,6 +657,7 @@ export class GitPanel {
     try {
       await this.agent.call("git.commit", { message, amend });
       box.value = "";
+      this.onMessageInput();
       this.cb.toast(amend ? "commit amended" : "committed");
       await this.refresh();
       this.cb.afterChange();
@@ -635,16 +899,109 @@ export class GitPanel {
 
   // ── remotes and the overflow menu ───────────────────────────────────────
 
-  private moreMenu(e: MouseEvent): void {
-    showMenu(e.clientX, e.clientY, [
-      ["↑ Push and set upstream", () => void this.remote("push", { setUpstream: true, remote: "origin", ref: this.status?.branch ?? undefined })],
-      ["⇡ Force push (with lease)", () => void this.forcePush()],
-      ["⌷ Stash changes", () => void this.stash("push")],
-      ["⌷ Pop latest stash", () => void this.stash("pop")],
-      ["✕ Abort merge", () => void this.run("git.mergeAbort", {}, "merge aborted")],
-      ["▶ Continue rebase", () => void this.run("git.rebase", { action: "continue" }, "rebase continued")],
-      ["✕ Abort rebase", () => void this.run("git.rebase", { action: "abort" }, "rebase aborted")],
-    ]);
+  /** Is a merge or a rebase half-finished?
+   *
+   *  `.git` is outside the jail on purpose — a page that can write
+   *  `.git/hooks/*` runs code on this machine — so the state cannot be read as
+   *  a file. It can be asked of git instead: `MERGE_HEAD` and `REBASE_HEAD`
+   *  resolve only while the corresponding operation is in progress, so a log
+   *  request for one either answers or fails, and that is the answer.
+   *
+   *  Probed when the menu opens, not on every refresh: the panel reloads on
+   *  every watcher event, and two more git invocations per event is how a
+   *  status poll turns into a busy loop.
+   */
+  private async inProgress(): Promise<{ merge: boolean; rebase: boolean }> {
+    const alive = async (ref: string): Promise<boolean> =>
+      this.agent
+        .call("git.log", { ref, limit: 1 })
+        .then(() => true)
+        .catch(() => false);
+    const [merge, rebase] = await Promise.all([alive("MERGE_HEAD"), alive("REBASE_HEAD")]);
+    return { merge, rebase };
+  }
+
+  private async moreMenu(e: MouseEvent): Promise<void> {
+    const { x, y } = { x: e.clientX, y: e.clientY };
+    const st = this.status;
+    const state = await this.inProgress();
+
+    const items: MenuItem[] = [];
+
+    // Push and pull. "Push and set upstream" is only an answer when there is
+    // no upstream; with one configured it was offering to redo what is done.
+    if (st?.branch && !st.upstream) {
+      items.push({
+        label: "↑ Publish this branch (push -u origin)",
+        run: () => void this.remote("push", { setUpstream: true, remote: "origin", ref: st.branch ?? undefined }),
+      });
+    }
+    items.push({ label: "⇡ Force push (with lease)", run: () => void this.forcePush(), danger: true });
+
+    // Remotes and tags: configuration rather than a step in today's work, so
+    // they sit below the two things the panel is usually opened for.
+    items.push({ label: "⇅ Remotes…", separated: true, run: () => void this.manageRemotes(x, y) });
+    items.push({ label: "⚑ Create tag…", run: () => void this.createTag() });
+    if (this.branches.some((b) => b.tag)) {
+      items.push({ label: "⚑ Delete tag…", danger: true, run: () => void this.deleteTag() });
+    }
+
+    // Undo. Placed where it can be found in a hurry, and it is the only item
+    // here that can reach something no other item can.
+    items.push({ label: "↶ Undo the last operation…", separated: true, run: () => void this.undoMenu(x, y) });
+
+    // Stash.
+    items.push({ label: "⌷ Stash changes…", separated: true, run: () => void this.stash() });
+    if (this.stashes.length) {
+      items.push({
+        label: `↥ Pop latest stash (${stashLabel(this.stashes[0].subject).text || this.stashes[0].ref})`,
+        run: () => void this.stashAction("pop", this.stashes[0].ref),
+      });
+    }
+
+    // How the list is shown. Two settings, so they are a pair of toggles rather
+    // than a submenu nobody would find.
+    items.push(
+      {
+        label: this.view === "tree" ? "☰ View as list" : "⊞ View as tree",
+        separated: true,
+        run: () => this.setView(this.view === "tree" ? "list" : "tree"),
+      },
+      {
+        label: this.sort === "status" ? "⇅ Sort by path" : "⇅ Sort by status",
+        run: () => this.setSort(this.sort === "status" ? "name" : "status"),
+      },
+    );
+
+    // Recovery. Shown only while there is something to recover from: these
+    // four were always on the menu, four of seven items, and pressing one
+    // outside a merge or rebase did nothing but produce an error toast.
+    if (state.merge) {
+      items.push({ label: "✕ Abort merge", separated: true, danger: true, run: () => void this.run("git.mergeAbort", {}, "merge aborted") });
+    }
+    if (state.rebase) {
+      items.push(
+        { label: "▶ Continue rebase", separated: true, run: () => void this.run("git.rebase", { action: "continue" }, "rebase continued") },
+        { label: "↷ Skip this commit", run: () => void this.run("git.rebase", { action: "skip" }, "commit skipped") },
+        { label: "✕ Abort rebase", danger: true, run: () => void this.run("git.rebase", { action: "abort" }, "rebase aborted") },
+      );
+    }
+
+    showMenu(x, y, items);
+  }
+
+  private setView(view: "list" | "tree"): void {
+    this.view = view;
+    savePref(VIEW_KEY, view);
+    this.renderedKey = "";
+    this.render();
+  }
+
+  private setSort(sort: "name" | "status"): void {
+    this.sort = sort;
+    savePref(SORT_KEY, sort);
+    this.renderedKey = "";
+    this.render();
   }
 
   private async forcePush(): Promise<void> {
@@ -716,11 +1073,194 @@ export class GitPanel {
     this.host.classList.toggle("is-busy", this.busy);
   }
 
-  private async stash(action: "push" | "pop"): Promise<void> {
-    await this.run("git.stash", { action }, action === "push" ? "changes stashed" : "stash popped");
+  /** Put the working tree aside under a name.
+   *
+   *  Naming it is the whole point: git's own default label is "WIP on main:
+   *  <oid> <subject of HEAD>", which describes the commit underneath the stash
+   *  and says nothing about what is in it. */
+  private async stash(): Promise<void> {
+    const g = this.groups();
+    const count = g.staged.length + g.changes.length + g.untracked.length;
+    if (!count) return this.cb.toast("Nothing to stash — the working tree is clean.");
+    const message = await modalPrompt({
+      title: `Stash ${count} change${count === 1 ? "" : "s"}`,
+      hint: "Untracked files are included. Leave the message empty to let git name it.",
+      placeholder: "what is in this stash",
+      okLabel: "stash",
+    });
+    // An empty string is a real answer here ("name it yourself, git"); only a
+    // cancelled dialog stops.
+    if (message === null) return;
+    await this.run("git.stash", { action: "push", message: message || undefined }, "changes stashed");
+  }
+
+  private async stashAction(action: "apply" | "pop" | "drop", ref: string): Promise<void> {
+    if (action === "drop") {
+      const entry = this.stashes.find((s) => s.ref === ref);
+      const ok = await modalConfirm({
+        title: `Drop ${ref}?`,
+        detail: `“${stashLabel(entry?.subject ?? "").text || ref}” is deleted. A dropped stash is not on any branch, so there is nothing to restore it from.`,
+        okLabel: "drop",
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    await this.run("git.stash", { action, ref }, `${ref} ${action === "drop" ? "dropped" : action === "pop" ? "popped" : "applied"}`);
   }
 
   /** Run one agent op, report it, then reload everything that may have moved. */
+  // ── remotes ───────────────────────────────────────────────────────────
+  //
+  // Listing them was always possible; changing them was not, so adding a
+  // remote meant a terminal — and the panel's whole claim is that ordinary git
+  // does not.
+
+  private async manageRemotes(x: number, y: number): Promise<void> {
+    let remotes: { name: string; url: string }[] = [];
+    try {
+      remotes = await this.agent.call<{ name: string; url: string }[]>("git.remotes");
+    } catch (e) {
+      return this.cb.toast(e instanceof Error ? e.message : String(e), true);
+    }
+    const items: MenuItem[] = remotes.map((r) => ({
+      // The URL is what tells two remotes apart, and it is long — so it is the
+      // hint, where the menu will trim it, rather than part of the label.
+      label: `⇅ ${r.name}`,
+      hint: r.url,
+      run: () => void this.remoteMenu(x, y, r),
+    }));
+    if (!remotes.length) items.push({ label: "No remotes configured", disabled: true, run: () => undefined });
+    items.push({ label: "+ Add a remote…", separated: true, run: () => void this.addRemote() });
+    showMenu(x, y, items);
+  }
+
+  private async remoteMenu(x: number, y: number, remote: { name: string; url: string }): Promise<void> {
+    showMenu(x, y, [
+      { label: `Fetch from ${remote.name}`, run: () => void this.remote("fetch", { remote: remote.name }) },
+      { label: "Rename…", separated: true, run: () => void this.renameRemote(remote.name) },
+      { label: "Remove", danger: true, run: () => void this.removeRemote(remote.name) },
+    ]);
+  }
+
+  private async addRemote(): Promise<void> {
+    const name = await modalPrompt({ title: "Add a remote", hint: "The short name you will type: origin, upstream, a fork.", placeholder: "origin", okLabel: "next" });
+    if (!name) return;
+    const url = await modalPrompt({
+      title: `URL for ${name}`,
+      hint: "https, ssh or git — a local path is not accepted.",
+      placeholder: "https://github.com/you/project.git",
+      okLabel: "add",
+    });
+    if (!url) return;
+    await this.run("git.remoteAdmin", { action: "add", name, url }, `remote ${name} added`);
+  }
+
+  private async renameRemote(name: string): Promise<void> {
+    const to = await modalPrompt({ title: `Rename ${name}`, value: name, okLabel: "rename" });
+    if (!to || to === name) return;
+    await this.run("git.remoteAdmin", { action: "rename", name, to }, `remote renamed to ${to}`);
+  }
+
+  private async removeRemote(name: string): Promise<void> {
+    // Local only — it forgets the address and the remote-tracking branches, and
+    // touches nothing on the server. Worth saying, because "remove remote"
+    // reads like it might not be.
+    const ok = await modalConfirm({
+      title: `Remove the remote "${name}"?`,
+      detail: `This forgets its address and its remote-tracking branches here. Nothing on the server changes.`,
+      okLabel: "remove",
+      danger: true,
+    });
+    if (!ok) return;
+    await this.run("git.remoteAdmin", { action: "remove", name }, `remote ${name} removed`);
+  }
+
+  // ── tags ──────────────────────────────────────────────────────────────
+
+  private async createTag(): Promise<void> {
+    const name = await modalPrompt({ title: "New tag", placeholder: "v1.2.0", okLabel: "next" });
+    if (!name) return;
+    // A message makes it an annotated tag — an object with an author and a
+    // date, which is what a release wants; without one it is a lightweight
+    // pointer, which is what a bookmark wants.
+    //
+    // The dialog cannot tell an empty answer from a cancelled one (both come
+    // back as null), so the second step does not offer a way out: the tag is
+    // created either way, and skipping the message is how you choose the
+    // lightweight kind. The hint says so rather than leaving it to be found.
+    const message = await modalPrompt({
+      title: `Tag ${name} at HEAD`,
+      hint: "With a message it is an annotated tag; skip it for a lightweight one. Either way the tag is created.",
+      placeholder: "release 1.2.0",
+      okLabel: "create",
+    });
+    await this.run("git.tagCreate", { name, ref: "HEAD", message: message ?? "" }, `tag ${name} created`);
+  }
+
+  private async deleteTag(): Promise<void> {
+    const refs = await this.freshRefs();
+    const name = await pickRef({ title: "Delete which tag?", refs, kinds: ["tag"], okLabel: "delete" });
+    if (!name) return;
+    const ok = await modalConfirm({
+      title: `Delete the tag "${name}"?`,
+      detail: "Local only — a tag already pushed stays on the server.",
+      okLabel: "delete",
+      danger: true,
+    });
+    if (!ok) return;
+    await this.run("git.tagDelete", { name }, `tag ${name} deleted`);
+  }
+
+  // ── undo, via the reflog ──────────────────────────────────────────────
+  //
+  // The menu above can throw work away — reset --hard, a bad merge, a rebase
+  // that went sideways — and git remembers where HEAD was before each of them
+  // even when nothing else does. This is that list, made pressable: the thing
+  // most wanted at the moment it is least easy to reach for.
+
+  private async undoMenu(x: number, y: number): Promise<void> {
+    let entries: ReflogEntry[] = [];
+    try {
+      entries = await this.agent.call<ReflogEntry[]>("git.reflog", { limit: 25 });
+    } catch (e) {
+      return this.cb.toast(e instanceof Error ? e.message : String(e), true);
+    }
+    // The first entry is where HEAD is now — moving onto it is not an undo.
+    const past = entries.slice(1);
+    if (!past.length) return this.cb.toast("Nothing in the reflog to go back to.", true);
+    showMenu(
+      x,
+      y,
+      past.map((entry) => ({
+        label: `${entry.oid.slice(0, 7)} · ${entry.action || "moved"}: ${
+          entry.message.length > 48 ? `${entry.message.slice(0, 47)}…` : entry.message
+        }`,
+        hint: entry.selector,
+        run: () => void this.resetTo(entry),
+      })),
+    );
+  }
+
+  private async resetTo(entry: ReflogEntry): Promise<void> {
+    // A hard reset is what makes this an undo rather than a suggestion, and it
+    // is also what makes it dangerous: it discards the working tree. Saying
+    // exactly that, with the number of files at stake, is the least this owes
+    // someone reaching for "undo" in a hurry.
+    const dirty = (this.status?.entries ?? []).filter((e) => !e.ignored).length;
+    const ok = await modalConfirm({
+      title: `Move HEAD back to ${entry.oid.slice(0, 7)}?`,
+      detail:
+        `${entry.selector} — ${entry.action || "moved"}: ${entry.message}\n\n` +
+        `This is a hard reset: the working tree goes back with it${
+          dirty ? `, and ${dirty} uncommitted change${dirty === 1 ? "" : "s"} will be lost` : ""
+        }. Anything committed stays reachable through the reflog.`,
+      okLabel: "go back",
+      danger: true,
+    });
+    if (!ok) return;
+    await this.run("git.reset", { oid: entry.oid, mode: "hard" }, `HEAD is back at ${entry.oid.slice(0, 7)}`);
+  }
+
   private async run(op: string, params: Record<string, unknown>, okMessage: string): Promise<void> {
     try {
       await this.agent.call(op, params);

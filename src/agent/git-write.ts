@@ -13,7 +13,7 @@
 import { run, runLines } from "./proc.ts";
 // safe/oneOf live in git.ts because the read operations need them just as much:
 // `--output=<file>` is a diff option, so `git log` accepts it too.
-import { GitError, oneOf, safe } from "./git.ts";
+import { GitError, oneOf, readOnly, safe } from "./git.ts";
 
 const RESET_MODES = ["soft", "mixed", "hard"] as const;
 const REBASE_ACTIONS = ["start", "continue", "abort", "skip"] as const;
@@ -43,6 +43,29 @@ export async function unstage(cwd: string, paths: string[]): Promise<string> {
 /** Throw away worktree changes. Staged-but-untracked files are deleted. */
 export const discard = (cwd: string, paths: string[]) =>
   git(cwd, ["checkout", "--", ...paths.map((p) => safe(p, "path"))]);
+
+/** Apply a unified diff to the index, or take one back out of it.
+ *
+ *  This is what stage-this-hunk is made of. The patch is a document, not an
+ *  argument: it arrives on stdin, which is why `run` grew a stdin parameter for
+ *  it. Always `--cached`, so the worktree is never touched — the caller staged
+ *  or unstaged a hunk, and their open buffer must come out of it unchanged.
+ *
+ *  `reverse` is unstage: the same patch read backwards out of the index.
+ *
+ *  `--unidiff-zero` is deliberately absent. Applying a zero-context patch is
+ *  guesswork about where it goes, and guessing wrong here silently stages
+ *  something the user did not point at; the client builds patches with context
+ *  and this refuses the ones without.
+ */
+export async function applyPatch(cwd: string, patch: string, reverse: boolean): Promise<string> {
+  if (!patch.trim()) throw new GitError("Patch is empty");
+  const args = ["apply", "--cached", "--whitespace=nowarn"];
+  if (reverse) args.push("--reverse");
+  const r = await run(["git", ...args], cwd, patch);
+  if (r.code !== 0) throw new GitError(r.stderr || r.stdout);
+  return r.stdout;
+}
 
 export async function commit(
   cwd: string,
@@ -189,6 +212,85 @@ export async function remote(
   return { output };
 }
 
+const REMOTE_ADMIN = ["add", "rename", "remove"] as const;
+
+/** A remote name the user is about to create. Unlike `knownRemote` there is
+ *  nothing to check it against yet, so the shape is checked instead: git's own
+ *  rules for a ref component, which is what a remote name becomes. */
+function newRemoteName(name: string): string {
+  const n = safe(name, "remote");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(n) || n.endsWith(".lock")) {
+    throw new GitError(`Invalid remote name: ${n}`);
+  }
+  return n;
+}
+
+/** Screen a remote URL before it is written into .git/config.
+ *
+ *  This is the one place the client hands over something git will later execute
+ *  against. `<transport>::<address>` makes git run `git-remote-<transport>`,
+ *  and `ext::sh -c whoami` is the documented way to spell "run this" — the
+ *  fetch path already refuses those, but a URL stored in the config is fetched
+ *  by name afterwards and would sail straight past that check.
+ *
+ *  So the allowed set is the transports that move bytes over a network and
+ *  nothing else. A local path is refused too: `git fetch /some/other/repo`
+ *  would pull a repository from outside the workspace into this one, where the
+ *  page can then read it — the jail exists to make exactly that impossible.
+ */
+function safeRemoteUrl(url: string): string {
+  const u = safe(url, "remote URL");
+  if (u.includes("::")) throw new GitError(`Unsupported remote URL: ${u}`);
+  const scheme = /^([A-Za-z][A-Za-z0-9+.-]*):\/\//.exec(u);
+  if (scheme) {
+    if (!["https", "http", "ssh", "git"].includes(scheme[1].toLowerCase())) {
+      throw new GitError(`Unsupported remote URL: ${u}`);
+    }
+    return u;
+  }
+  // scp-like: [user@]host:path — the form every ssh remote is written in.
+  if (/^[A-Za-z0-9._-]+(@[A-Za-z0-9._-]+)?:[^\s]+$/.test(u) && !/^[A-Za-z]:[\\/]/.test(u)) return u;
+  throw new GitError(`Unsupported remote URL: ${u}`);
+}
+
+/** Add, rename or remove a remote. Fetching through one is `remote()` above;
+ *  this is the configuration behind it. */
+export async function remoteAdmin(
+  cwd: string,
+  action: "add" | "rename" | "remove",
+  opts: { name?: string; url?: string; to?: string },
+): Promise<string> {
+  switch (oneOf(action, REMOTE_ADMIN, "remote admin action")) {
+    case "add":
+      return git(cwd, ["remote", "add", newRemoteName(opts.name ?? ""), safeRemoteUrl(opts.url ?? "")]);
+    case "rename":
+      // The source must exist, the destination must merely be a legal name.
+      return git(cwd, ["remote", "rename", await knownRemote(cwd, opts.name ?? ""), newRemoteName(opts.to ?? "")]);
+    default:
+      return git(cwd, ["remote", "remove", await knownRemote(cwd, opts.name ?? "")]);
+  }
+}
+
+// ── tags ──────────────────────────────────────────────────────────────────
+
+/** Create a tag. With a message it is an annotated tag — an object of its own
+ *  with an author and a date — which is what a release wants; without one it is
+ *  a lightweight pointer, which is what a bookmark wants. */
+export async function tagCreate(
+  cwd: string,
+  name: string,
+  opts: { ref?: string; message?: string; force?: boolean },
+): Promise<string> {
+  const args = ["tag"];
+  if (opts.force) args.push("--force");
+  if (opts.message?.trim()) args.push("-a", "-m", opts.message);
+  args.push(safe(name, "tag"));
+  if (opts.ref) args.push(safe(opts.ref, "ref"));
+  return git(cwd, args);
+}
+
+export const tagDelete = (cwd: string, name: string) => git(cwd, ["tag", "-d", safe(name, "tag")]);
+
 export async function remotes(cwd: string): Promise<{ name: string; url: string }[]> {
   const out = await git(cwd, ["remote", "-v"]);
   const seen = new Map<string, string>();
@@ -203,7 +305,7 @@ export async function remotes(cwd: string): Promise<{ name: string; url: string 
  *  UI can run before showing the commit box. */
 export async function identity(cwd: string): Promise<{ name: string | null; email: string | null }> {
   const one = async (key: string) => {
-    const r = await run(["git", "config", "--get", key], cwd);
+    const r = await run(readOnly(["config", "--get", key]), cwd);
     return r.code === 0 ? r.stdout.trim() || null : null;
   };
   return { name: await one("user.name"), email: await one("user.email") };

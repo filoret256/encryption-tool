@@ -15,7 +15,7 @@
  */
 import { randomBytes } from "node:crypto";
 import { copyToClipboard, interactive } from "./clipboard.ts";
-import { Jail } from "./jail.ts";
+import { Jail, withinRoot } from "./jail.ts";
 import { probe } from "./proc.ts";
 import * as fsops from "./fs-ops.ts";
 import * as git from "./git.ts";
@@ -39,6 +39,9 @@ interface Options {
   noClipboard: boolean;
   allowNoOrigin: boolean;
   allowMultiple: boolean;
+  /** Folders `agent.setRoot` may move the workspace into, beyond the startup
+   *  root itself. Empty is the safe default — see canReroot(). */
+  allowRoots: string[];
 }
 
 /** Origins trusted without being named on the command line: the port the web
@@ -86,6 +89,7 @@ function parseArgs(argv: string[]): Options {
     noClipboard: false,
     allowNoOrigin: false,
     allowMultiple: false,
+    allowRoots: [],
   };
   let rootFrom = "";
 
@@ -118,6 +122,7 @@ function parseArgs(argv: string[]): Options {
       case "--no-clipboard": o.noClipboard = true; break;
       case "--allow-no-origin": o.allowNoOrigin = true; break;
       case "--allow-multiple": o.allowMultiple = true; break;
+      case "--allow-root": o.allowRoots.push(value()); break;
       case "--version":
       case "-v":
         console.log(VERSION);
@@ -165,6 +170,12 @@ and be pointed at a project instead of copied into one:
                           curl, scripts, anything that is not a browser. Off by
                           default — a browser always sends one, so a missing
                           Origin is never the app.
+  --allow-root <dir>      another folder the editor may switch the workspace
+                          to, repeatable. Without it the workspace can only be
+                          moved inside the folder the agent was started on,
+                          which can never reach anything it could not already
+                          read. Naming a folder here is what lets the editor
+                          open a second project without a second agent.
   --allow-multiple        serve more than one client at once. By default the
                           agent takes a single connection and refuses the rest
                           while it is held, so it is always clear which page is
@@ -227,6 +238,9 @@ const spawnsProcess = (op: string): boolean => op === "search" || op.startsWith(
 
 interface Conn {
   watcher: Watcher | null;
+  /** How to reach this client. Set once the socket is open; used by a reroot
+   *  to re-aim a watcher that is running on a folder this agent has left. */
+  send: Send | null;
   /** Cancellation flags for requests still running, keyed by request id. */
   inflight: Map<number, Signal>;
   /** Bounds concurrent child processes — see MAX_CONCURRENT_PROCS. */
@@ -245,17 +259,32 @@ interface Ctx {
   send: Send;
   id: number;
   signal: Signal;
+  /** Move the whole agent to another folder. Supplied by startAgent, which owns
+   *  the mutable workspace state; see reroot() there. */
+  reroot: (dir: string) => Promise<AgentInfo>;
 }
 
 const str = (v: unknown): string => String(v ?? "");
 const strs = (v: unknown): string[] => (Array.isArray(v) ? v.map(String) : []);
+const num = (v: unknown): number => (Number.isFinite(Number(v)) ? Number(v) : 0);
 
 const OPS: Record<string, (ctx: Ctx, p: Req) => Promise<unknown>> = {
   "agent.info": async (c) => c.info,
 
+  /** Point the agent at a different folder without restarting it.
+   *
+   *  The path is absolute and native — this is the one op whose whole purpose
+   *  is to leave the current workspace, so it does not go through the jail. It
+   *  goes through canReroot() instead, which is the operator's boundary rather
+   *  than the page's: by default only the folder the agent was started on and
+   *  what is under it, which cannot reach anything the agent could not already
+   *  read. Widening that is a --allow-root flag and therefore a decision made at
+   *  the terminal, never by the page asking nicely. */
+  "agent.setRoot": (c, p) => c.reroot(str(p.path)),
+
   // ── filesystem ──
   "fs.readdir": (c, p) => fsops.readDir(c.jail, str(p.path)),
-  "fs.read": (c, p) => fsops.readTextFile(c.jail, str(p.path)),
+  "fs.read": (c, p) => fsops.readTextFile(c.jail, str(p.path), { offset: num(p.offset), length: num(p.length) }),
   "fs.write": (c, p) => fsops.writeTextFile(c.jail, str(p.path), str(p.text)),
   "fs.createFile": (c, p) => fsops.createFile(c.jail, str(p.path)).then(() => ({ ok: true })),
   "fs.createDir": (c, p) => fsops.createDir(c.jail, str(p.path)).then(() => ({ ok: true })),
@@ -271,8 +300,11 @@ const OPS: Record<string, (ctx: Ctx, p: Req) => Promise<unknown>> = {
       limit: Number(p.limit) || undefined,
       all: Boolean(p.all),
       path: p.path ? str(p.path) : undefined,
+      skip: num(p.skip) || undefined,
     }),
   "git.branches": (c) => git.branches(c.cwd),
+  "git.checkIgnore": (c, p) => git.checkIgnore(c.cwd, strs(p.paths)),
+  "git.reflog": (c, p) => git.reflog(c.cwd, num(p.limit) || 50),
   "git.commitDetail": (c, p) => git.commitDetail(c.cwd, str(p.oid)),
   "git.blob": (c, p) => git.blobAt(c.cwd, str(p.rev), str(p.path)),
   "git.blame": (c, p) => git.blame(c.cwd, str(p.path)),
@@ -287,6 +319,7 @@ const OPS: Record<string, (ctx: Ctx, p: Req) => Promise<unknown>> = {
   "git.unstage": (c, p) => gw.unstage(c.cwd, strs(p.paths)),
   "git.discard": (c, p) => gw.discard(c.cwd, strs(p.paths)),
   "git.resolve": (c, p) => gw.markResolved(c.cwd, strs(p.paths)),
+  "git.applyPatch": (c, p) => gw.applyPatch(c.cwd, str(p.patch), Boolean(p.reverse)),
   "git.commit": (c, p) =>
     gw.commit(c.cwd, { message: str(p.message), amend: Boolean(p.amend), all: Boolean(p.all) }),
   "git.identity": (c) => gw.identity(c.cwd),
@@ -299,6 +332,13 @@ const OPS: Record<string, (ctx: Ctx, p: Req) => Promise<unknown>> = {
   "git.reset": (c, p) => gw.reset(c.cwd, str(p.oid), (str(p.mode) || "mixed") as "soft" | "mixed" | "hard"),
   "git.revert": (c, p) => gw.revert(c.cwd, str(p.oid)),
   "git.cherryPick": (c, p) => gw.cherryPick(c.cwd, str(p.oid)),
+  "git.tagCreate": (c, p) =>
+    gw.tagCreate(c.cwd, str(p.name), {
+      ref: p.ref ? str(p.ref) : undefined,
+      message: p.message ? str(p.message) : undefined,
+      force: Boolean(p.force),
+    }),
+  "git.tagDelete": (c, p) => gw.tagDelete(c.cwd, str(p.name)),
 
   // ── git: merge / rebase / stash ──
   "git.merge": (c, p) => gw.merge(c.cwd, str(p.ref), Boolean(p.noFf)),
@@ -313,6 +353,12 @@ const OPS: Record<string, (ctx: Ctx, p: Req) => Promise<unknown>> = {
 
   // ── git: remotes (streams progress) ──
   "git.remotes": (c) => gw.remotes(c.cwd),
+  "git.remoteAdmin": (c, p) =>
+    gw.remoteAdmin(c.cwd, (str(p.action) || "add") as "add" | "rename" | "remove", {
+      name: p.name ? str(p.name) : undefined,
+      url: p.url ? str(p.url) : undefined,
+      to: p.to ? str(p.to) : undefined,
+    }),
   "git.remote": (c, p) =>
     gw.remote(
       c.cwd,
@@ -371,6 +417,11 @@ const OPS: Record<string, (ctx: Ctx, p: Req) => Promise<unknown>> = {
   },
 };
 
+/** Live connections. Only `agent.setRoot` reads this, and only to re-aim the
+ *  watchers: a watcher left on a folder the agent has left reports changes the
+ *  client cannot resolve to any path it is showing. */
+const connections = new Set<Conn>();
+
 // ── server ────────────────────────────────────────────────────────────────
 
 export async function startAgent(argv: string[]): Promise<void> {
@@ -388,11 +439,33 @@ export async function startAgent(argv: string[]): Promise<void> {
   // Snap the workspace to the repository root when the folder sits inside one:
   // git reports paths relative to the toplevel, and one coordinate system for
   // both filesystem and git paths is what keeps the UI honest.
-  const top = await git.repoRoot(jail.root);
-  if (top) {
-    const snapped = await Jail.open(top);
-    if (snapped.root !== jail.root) console.log(`agent: using repository root ${snapped.root}`);
-    jail = snapped;
+  //
+  // `snap` is reused by agent.setRoot, which has to do exactly the same thing
+  // to the folder it is handed.
+  const snap = async (dir: string): Promise<{ jail: Jail; top: string | null }> => {
+    const opened = await Jail.open(dir);
+    const toplevel = await git.repoRoot(opened.root);
+    return { jail: toplevel ? await Jail.open(toplevel) : opened, top: toplevel };
+  };
+
+  let top: string | null;
+  ({ jail, top } = await snap(jail.root));
+  if (top && top !== opts.root) console.log(`agent: using repository root ${jail.root}`);
+
+  /** Folders the workspace may be moved into.
+   *
+   *  The startup root is always one of them, so setRoot can narrow to a
+   *  subfolder and come back — neither reaches anything this agent could not
+   *  already read, which makes the default a non-escalation rather than a
+   *  judgement call. Anything wider is a --allow-root on the command line: the
+   *  operator's decision, made at the terminal, not the page's. */
+  const rerootBases: string[] = [jail.root];
+  for (const dir of opts.allowRoots) {
+    try {
+      rerootBases.push((await Jail.open(dir)).root);
+    } catch {
+      fail(`--allow-root folder does not exist: ${dir}`);
+    }
   }
 
   const info: AgentInfo = {
@@ -409,6 +482,44 @@ export async function startAgent(argv: string[]): Promise<void> {
   const probeWatcher = Watcher.start(jail.root, () => {});
   info.watch = probeWatcher !== null;
   probeWatcher?.close();
+
+  /** Move the workspace. Backs `agent.setRoot`; see the op for why the boundary
+   *  is where it is.
+   *
+   *  Every connection's watcher is pointed at the new folder, because a watcher
+   *  left on the old one reports changes the client can no longer resolve to a
+   *  path — a tree that refreshes on edits to a folder it is not showing. */
+  const reroot = async (dir: string): Promise<AgentInfo> => {
+    if (!dir) throw new Error("A folder is required");
+    let opened: Jail;
+    try {
+      opened = await Jail.open(dir);
+    } catch {
+      throw new Error(`Cannot open folder: ${dir}`);
+    }
+    if (!rerootBases.some((base) => withinRoot(base, opened.root))) {
+      throw Object.assign(new Error(`Folder is outside what this agent may open: ${opened.root}`), { code: "EPATH" });
+    }
+    // Snapping happens after the check, never before: the repository root of an
+    // allowed folder can be above it, and that is a folder nobody allowed.
+    const next = await snap(opened.root);
+    if (!rerootBases.some((base) => withinRoot(base, next.jail.root))) {
+      throw Object.assign(new Error(`Repository root is outside what this agent may open: ${next.jail.root}`), {
+        code: "EPATH",
+      });
+    }
+    jail = next.jail;
+    top = next.top;
+    info.root = jail.root;
+    info.repo = top ? "." : null;
+    for (const c of connections) {
+      if (!c.watcher) continue;
+      c.watcher.close();
+      c.watcher = Watcher.start(jail.root, (paths) => c.send?.({ event: "fs.change", data: { paths } }));
+    }
+    console.log(`agent: workspace is now ${jail.root}`);
+    return info;
+  };
 
   const allowedOrigins = new Set([...DEFAULT_ORIGINS, ...opts.origins]);
 
@@ -563,7 +674,8 @@ export async function startAgent(argv: string[]): Promise<void> {
         // handshake completing there is a turn of the loop, and two upgrades
         // arriving in it would both have seen zero.
         clients++;
-        const conn: Conn = { watcher: null, inflight: new Map(), slots: new Slots(MAX_CONCURRENT_PROCS) };
+        const conn: Conn = { watcher: null, send: null, inflight: new Map(), slots: new Slots(MAX_CONCURRENT_PROCS) };
+        connections.add(conn);
         if (srv.upgrade(req, { data: { conn, origin: origin ?? "(no Origin)" } })) return undefined;
         clients--;
         return new Response("upgrade failed", { status: 400, headers });
@@ -588,9 +700,10 @@ export async function startAgent(argv: string[]): Promise<void> {
         }
 
         const conn = ws.data.conn;
+        conn.send = send;
         const signal: Signal = { cancelled: false };
         conn.inflight.set(req.id, signal);
-        const ctx: Ctx = { jail, cwd: jail.root, info, conn, send, id: req.id, signal };
+        const ctx: Ctx = { jail, cwd: jail.root, info, conn, send, id: req.id, signal, reroot };
         // Not awaited: a long search or push must not block other requests.
         //
         // Wrapped rather than called directly because a handler can throw
@@ -632,6 +745,7 @@ export async function startAgent(argv: string[]): Promise<void> {
             ? `client disconnected — ${ws.data.origin} (${clients} connected)`
             : `client disconnected — ${ws.data.origin} — unlocked, accepting a connection again`,
         );
+        connections.delete(ws.data.conn);
         ws.data.conn.watcher?.close();
         ws.data.conn.watcher = null;
         // Anything still queued for a slot would otherwise wait for a turn that

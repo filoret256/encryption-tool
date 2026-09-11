@@ -31,6 +31,7 @@ import { highlightSelectionMatches, search, searchKeymap } from "@codemirror/sea
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import { grammarFor } from "./grammars.ts";
 import { conflictHighlighter } from "./conflicts.ts";
+import { blameGutter, hasBlame, setBlame, type BlameLine } from "./blame.ts";
 import { cspNonce } from "../csp.ts";
 
 const theme = EditorView.theme({
@@ -55,6 +56,10 @@ export class CodeEditor {
     private readonly onSave: () => void,
     /** Fired on every document change; the tab bar recomputes dirtiness. */
     private readonly onChange: () => void,
+    /** A blame line was clicked: the oid of the commit it came from. */
+    private readonly onBlamePick: (oid: string) => void = () => {},
+    /** The cursor moved, or the document under it changed. */
+    private readonly onCursor: () => void = () => {},
   ) {
     this.view = new EditorView({
       parent,
@@ -87,6 +92,9 @@ export class CodeEditor {
       placeholder("Select a file in the explorer"),
       // Inert unless git has written conflict markers into the file.
       conflictHighlighter(),
+      // Inert until `setBlame` carries rows in; the gutter draws nothing
+      // without them, so every document can afford to have it.
+      blameGutter(this.onBlamePick),
       this.cLang.of(lang ? [lang] : []),
       this.cTheme.of(syntaxHighlighting(this.dark ? oneDarkHighlightStyle : defaultHighlightStyle)),
       this.cReadOnly.of(readOnly ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []),
@@ -107,6 +115,9 @@ export class CodeEditor {
       ]),
       EditorView.updateListener.of((u) => {
         if (u.docChanged) this.onChange();
+        // Selection moves without the document changing — that is most of what
+        // a cursor position readout reports.
+        if (u.docChanged || u.selectionSet) this.onCursor();
       }),
     ];
   }
@@ -133,6 +144,38 @@ export class CodeEditor {
     return EditorState.create({ doc: text, extensions: this.extensions(grammarFor(path), readOnly) });
   }
 
+  /** Show blame beside the document on screen, or clear it with null.
+   *
+   *  Per document, not per editor: the rows live in the state, so a tab switch
+   *  takes its own blame with it and cannot inherit the previous file's. */
+  setBlame(rows: BlameLine[] | null): void {
+    this.view.dispatch({ effects: setBlame.of(rows) });
+  }
+
+  get blaming(): boolean {
+    return hasBlame(this.view);
+  }
+
+  /** Where the cursor is, 1-based, as a person counts.
+   *
+   *  The column is counted in characters, not bytes: a byte column is a thing
+   *  a tool knows and a person does not. */
+  get cursor(): { line: number; col: number; selected: number } {
+    const { state } = this.view;
+    const main = state.selection.main;
+    const line = state.doc.lineAt(main.head);
+    return { line: line.number, col: main.head - line.from + 1, selected: main.to - main.from };
+  }
+
+  /** Swap the syntax highlighting of the document on screen.
+   *
+   *  Through the same compartment the constructor sets up, so this is a
+   *  reconfiguration rather than a new state — the buffer, the cursor and the
+   *  undo history all stay. */
+  setLanguage(lang: Extension | null): void {
+    this.view.dispatch({ effects: this.cLang.reconfigure(lang ? [lang] : []) });
+  }
+
   setTheme(dark: boolean): void {
     this.dark = dark;
     this.applyTheme();
@@ -146,6 +189,14 @@ export class CodeEditor {
 
   focus(): void {
     this.view.focus();
+  }
+
+  /** Replace the whole document in one transaction.
+   *
+   *  One transaction, so a whole-file reformat is a single undo step rather
+   *  than something the reader has to unpick line by line. */
+  replaceAll(text: string): void {
+    this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
   }
 
   /** Put the cursor on a 1-based line / 0-based column and scroll it into the

@@ -51,6 +51,11 @@ function contains(root: string, abs: string): boolean {
   return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
+/** `contains` for callers outside the jail itself — `agent.setRoot` has to ask
+ *  whether a folder is inside one the operator allowed, which is the same
+ *  question about two paths that are both already absolute and real. */
+export const withinRoot = contains;
+
 export class Jail {
   private constructor(readonly root: string) {}
 

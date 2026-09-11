@@ -73,6 +73,29 @@ export interface FileRead {
   mtime: number;
   binary: boolean;
   tooLarge: boolean;
+  /** Byte offset `text` starts at. 0 for an ordinary whole-file read.
+   *
+   *  A read with `length` is a window onto a file too big to open whole: the
+   *  editor shows that slice read-only rather than the "too large" placeholder
+   *  that used to be the only answer. The offset is where the agent actually
+   *  started, which is not always where it was asked to — a window must not
+   *  begin in the middle of a UTF-8 character. */
+  offset: number;
+  /** Whether `text` runs to the end of the file. */
+  eof: boolean;
+}
+
+/** One line of `git reflog`: where a ref has been, and how it got there. */
+export interface ReflogEntry {
+  /** "HEAD@{3}" — what to pass back to reset onto this point. */
+  selector: string;
+  oid: string;
+  /** The verb git recorded: "commit", "reset", "checkout", "merge"… */
+  action: string;
+  /** The rest of the line: a commit subject, "moving to main", and so on. */
+  message: string;
+  /** Unix seconds. */
+  time: number;
 }
 
 /** One row of `git status --porcelain=v2`. */

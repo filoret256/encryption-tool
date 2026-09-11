@@ -109,6 +109,40 @@ func gitDiscard(ctx context.Context, cwd string, paths []string) (any, error) {
 	return gitOut(ctx, cwd, append([]string{"checkout", "--"}, p...)...)
 }
 
+// gitApplyPatch applies a unified diff to the index, or takes one back out.
+//
+// This is what stage-this-hunk is made of. The patch is a document, not an
+// argument: it arrives on stdin, which is why run grew runStdin for it. Always
+// --cached, so the worktree is never touched — the caller staged or unstaged a
+// hunk, and their open buffer must come out of it unchanged.
+//
+// reverse is unstage: the same patch read backwards out of the index.
+//
+// --unidiff-zero is deliberately absent. Applying a zero-context patch is
+// guesswork about where it goes, and guessing wrong here silently stages
+// something the user did not point at; the client builds patches with context
+// and this refuses the ones without.
+func gitApplyPatch(ctx context.Context, cwd, patch string, reverse bool) (any, error) {
+	if strings.TrimSpace(patch) == "" {
+		return nil, &gitError{"Patch is empty"}
+	}
+	args := []string{"git", "apply", "--cached", "--whitespace=nowarn"}
+	if reverse {
+		args = append(args, "--reverse")
+	}
+	r, err := runStdin(ctx, args, cwd, patch)
+	if err != nil {
+		return nil, err
+	}
+	if r.code != 0 {
+		if r.stderr != "" {
+			return nil, &gitError{r.stderr}
+		}
+		return nil, &gitError{r.stdout}
+	}
+	return r.stdout, nil
+}
+
 // gitMarkResolved marks a conflicted file resolved once the user has edited
 // the markers out.
 func gitMarkResolved(ctx context.Context, cwd string, paths []string) (any, error) {
@@ -436,11 +470,142 @@ func knownRemote(ctx context.Context, cwd, name string) (string, error) {
 	return "", &gitError{"Unknown remote: " + wanted}
 }
 
+var (
+	remoteNameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	urlSchemeRe  = regexp.MustCompile(`^([A-Za-z][A-Za-z0-9+.-]*)://`)
+	scpLikeRe    = regexp.MustCompile(`^[A-Za-z0-9._-]+(@[A-Za-z0-9._-]+)?:[^\s]+$`)
+	windowsPath  = regexp.MustCompile(`^[A-Za-z]:[\\/]`)
+)
+
+// newRemoteName checks a remote name the user is about to create. Unlike
+// knownRemote there is nothing to check it against yet, so the shape is checked
+// instead: git's own rules for a ref component, which is what it becomes.
+func newRemoteName(name string) (string, error) {
+	n, err := safeArg(name, "remote")
+	if err != nil {
+		return "", err
+	}
+	if !remoteNameRe.MatchString(n) || strings.HasSuffix(n, ".lock") {
+		return "", &gitError{"Invalid remote name: " + n}
+	}
+	return n, nil
+}
+
+// safeRemoteURL screens a remote URL before it is written into .git/config.
+//
+// This is the one place the client hands over something git will later execute
+// against. `<transport>::<address>` makes git run `git-remote-<transport>`, and
+// `ext::sh -c whoami` is the documented way to spell "run this" — the fetch path
+// already refuses those, but a URL stored in the config is fetched by name
+// afterwards and would sail straight past that check.
+//
+// So the allowed set is the transports that move bytes over a network and
+// nothing else. A local path is refused too: `git fetch /some/other/repo` would
+// pull a repository from outside the workspace into this one, where the page can
+// then read it — the jail exists to make exactly that impossible.
+func safeRemoteURL(url string) (string, error) {
+	u, err := safeArg(url, "remote URL")
+	if err != nil {
+		return "", err
+	}
+	if strings.Contains(u, "::") {
+		return "", &gitError{"Unsupported remote URL: " + u}
+	}
+	if m := urlSchemeRe.FindStringSubmatch(u); m != nil {
+		switch strings.ToLower(m[1]) {
+		case "https", "http", "ssh", "git":
+			return u, nil
+		}
+		return "", &gitError{"Unsupported remote URL: " + u}
+	}
+	// scp-like: [user@]host:path — the form every ssh remote is written in.
+	if scpLikeRe.MatchString(u) && !windowsPath.MatchString(u) {
+		return u, nil
+	}
+	return "", &gitError{"Unsupported remote URL: " + u}
+}
+
+var remoteAdminActions = []string{"add", "rename", "remove"}
+
+// gitRemoteAdmin adds, renames or removes a remote. Fetching through one is
+// gitRemote above; this is the configuration behind it.
+func gitRemoteAdmin(ctx context.Context, cwd, action, name, url, to string) (any, error) {
+	verb, err := oneOfArg(action, remoteAdminActions, "remote admin action")
+	if err != nil {
+		return nil, err
+	}
+	switch verb {
+	case "add":
+		n, err := newRemoteName(name)
+		if err != nil {
+			return nil, err
+		}
+		u, err := safeRemoteURL(url)
+		if err != nil {
+			return nil, err
+		}
+		return gitOut(ctx, cwd, "remote", "add", n, u)
+	case "rename":
+		// The source must exist, the destination must merely be a legal name.
+		from, err := knownRemote(ctx, cwd, name)
+		if err != nil {
+			return nil, err
+		}
+		n, err := newRemoteName(to)
+		if err != nil {
+			return nil, err
+		}
+		return gitOut(ctx, cwd, "remote", "rename", from, n)
+	default:
+		n, err := knownRemote(ctx, cwd, name)
+		if err != nil {
+			return nil, err
+		}
+		return gitOut(ctx, cwd, "remote", "remove", n)
+	}
+}
+
+// ── tags ──────────────────────────────────────────────────────────────────
+
+// gitTagCreate creates a tag. With a message it is an annotated tag — an object
+// of its own with an author and a date — which is what a release wants; without
+// one it is a lightweight pointer, which is what a bookmark wants.
+func gitTagCreate(ctx context.Context, cwd, name, ref, message string, force bool) (any, error) {
+	args := []string{"tag"}
+	if force {
+		args = append(args, "--force")
+	}
+	if strings.TrimSpace(message) != "" {
+		args = append(args, "-a", "-m", message)
+	}
+	n, err := safeArg(name, "tag")
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, n)
+	if ref != "" {
+		r, err := safeArg(ref, "ref")
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, r)
+	}
+	return gitOut(ctx, cwd, args...)
+}
+
+func gitTagDelete(ctx context.Context, cwd, name string) (any, error) {
+	n, err := safeArg(name, "tag")
+	if err != nil {
+		return nil, err
+	}
+	return gitOut(ctx, cwd, "tag", "-d", n)
+}
+
 // gitIdentity surfaces the check the UI runs before showing the commit box —
 // `git commit` refuses to run without one.
 func gitIdentity(ctx context.Context, cwd string) (any, error) {
 	one := func(key string) *string {
-		r, err := run(ctx, []string{"git", "config", "--get", key}, cwd)
+		r, err := run(ctx, readOnly("config", "--get", key), cwd)
 		if err != nil || r.code != 0 {
 			return nil
 		}

@@ -15,7 +15,7 @@ import { defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language"
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import type { DiffPair } from "../../agent/protocol.ts";
 import { grammarFor } from "./grammars.ts";
-import { esc } from "./ui.ts";
+import { esc, startTrimmed } from "./ui.ts";
 
 const theme = EditorView.theme({
   "&": { backgroundColor: "var(--panel)", color: "var(--text)" },
@@ -25,6 +25,19 @@ const theme = EditorView.theme({
 });
 
 export type DiffMode = "split" | "unified";
+
+/** Staging one change at a time, offered by whoever opened the diff.
+ *
+ *  Only the two diffs that have an index side can supply this: "index →
+ *  working tree" stages, "HEAD → index" unstages. Every other diff compares two
+ *  things already committed, and there is nothing to stage. */
+export interface HunkAction {
+  /** The verb, shown on the button: "stage" or "unstage". */
+  label: string;
+  /** Act on the change at this 0-based index, counted the way the view counts
+   *  them. Rejecting is how the caller reports a patch git would not take. */
+  apply(index: number): Promise<void>;
+}
 
 const MODE_KEY = "enc-diff-mode";
 
@@ -51,12 +64,19 @@ export class DiffView {
   private single: EditorView | null = null;
   private pair: DiffPair | null = null;
   private mode: DiffMode = loadMode();
+  /** The window is too narrow for two columns. Overrides the stored mode
+   *  without replacing it: widen the window and the preference comes back. */
+  private narrow = false;
   /** Where the reader is in the list of changes, so "next" means the next one
    *  after the last one they looked at. */
   private at = 0;
   private chunkCount = 0;
   /** Set while the working side may be edited — see show(). */
   private onEdit: ((text: string) => void) | undefined;
+  /** What "stage this change" does here, when the caller offers it. */
+  private hunk: HunkAction | undefined;
+  /** Set when the caller can show the same pair the other way round. */
+  private onSwap: (() => void) | undefined;
 
   private readonly header: HTMLElement;
   private readonly body: HTMLElement;
@@ -74,16 +94,26 @@ export class DiffView {
         <span class="diff-count js-count"></span>
         <button class="t-icon js-prev" type="button" title="Previous change (Shift+F7)">▲</button>
         <button class="t-icon js-next" type="button" title="Next change (F7)">▼</button>
+        <button class="t-btn js-hunk-apply" type="button" hidden></button>
+        <button class="t-icon js-swap" type="button" title="Swap the sides" hidden>⇄</button>
         <button class="t-btn js-mode" type="button">inline</button>
+      </div>
+      <div class="diff-columns js-columns" hidden>
+        <span class="diff-col js-col-a"></span>
+        <span class="diff-col js-col-b"></span>
       </div>
       <div class="diff-body"></div>`;
     this.header = host.querySelector(".diff-head")!;
     this.body = host.querySelector(".diff-body")!;
     this.header.querySelector(".js-mode")!.addEventListener("click", () => {
-      this.mode = this.mode === "split" ? "unified" : "split";
+      // Toggling while the window is forcing inline switches the *preference*,
+      // which takes effect the moment there is room for it again.
+      this.mode = this.effectiveMode === "split" ? "unified" : "split";
       saveMode(this.mode);
       this.render();
     });
+    this.header.querySelector(".js-swap")!.addEventListener("click", () => this.onSwap?.());
+    this.header.querySelector(".js-hunk-apply")!.addEventListener("click", () => void this.applyCurrentHunk());
     this.header.querySelector(".js-next")!.addEventListener("click", () => this.step(1));
     this.header.querySelector(".js-prev")!.addEventListener("click", () => this.step(-1));
     // F7 is what every diff viewer uses, and the pair is the only way to walk a
@@ -95,16 +125,119 @@ export class DiffView {
     });
   }
 
+  /** Tie the two halves' horizontal scrolling together.
+   *
+   *  MergeView keeps the vertical offsets aligned itself, but each editor
+   *  carries its own horizontal scrollbar — so comparing two long lines meant
+   *  scrolling one side, reading, scrolling the other side to the same place by
+   *  eye, and reading again. Whichever side is moved now drags the other with
+   *  it; a flag stops the two from pushing each other back and forth. */
+  private linkHorizontalScroll(): void {
+    const scrollers = [...this.body.querySelectorAll<HTMLElement>(".cm-scroller")];
+    if (scrollers.length !== 2) return;
+    let syncing = false;
+    for (const from of scrollers) {
+      from.addEventListener(
+        "scroll",
+        () => {
+          if (syncing) return;
+          syncing = true;
+          for (const to of scrollers) {
+            if (to !== from && to.scrollLeft !== from.scrollLeft) to.scrollLeft = from.scrollLeft;
+          }
+          // Released after the scroll events this write produced have been
+          // dispatched; clearing it synchronously would let them through.
+          requestAnimationFrame(() => {
+            syncing = false;
+          });
+        },
+        { passive: true },
+      );
+    }
+  }
+
+  private updateModeButton(): void {
+    const btn = this.header.querySelector<HTMLButtonElement>(".js-mode")!;
+    btn.textContent = this.effectiveMode === "split" ? "inline" : "side-by-side";
+    // Three things this button has to say, in order of what the reader needs:
+    // that the window is the reason for the current shape; that per-chunk
+    // buttons live in the inline view; and otherwise just what it does.
+    btn.title = this.narrow && this.mode === "split"
+      ? "The window is too narrow for two columns — widen it to get side-by-side back"
+      : this.onEdit && this.effectiveMode === "split"
+        ? "Switch to inline to revert individual changes"
+        : "Switch the diff layout";
+    btn.classList.toggle("is-forced", this.narrow && this.mode === "split");
+  }
+
+  /** What the view actually draws, which is the stored preference unless the
+   *  window has no room for two columns. */
+  private get effectiveMode(): DiffMode {
+    return this.narrow ? "unified" : this.mode;
+  }
+
+  /** Told by the shell when the window crosses the width where two columns
+   *  stop being readable. */
+  setNarrow(narrow: boolean): void {
+    if (this.narrow === narrow) return;
+    this.narrow = narrow;
+    // Only worth redrawing when a pair is on screen and the shape changes.
+    if (this.pair && this.mode === "split") this.render();
+    else this.updateModeButton();
+  }
+
   /** `onEdit` turns the working side into something you can change: the inline
    *  view then draws accept/reject buttons over every chunk, and reverting one
    *  is how you undo a single change out of twenty without touching the rest.
    *  Nothing is written to disk here — the caller decides what to do with the
-   *  text it is handed. */
-  show(pair: DiffPair, onEdit?: (text: string) => void): void {
+   *  text it is handed.
+   *
+   *  `hunk` adds the other half of working one change at a time: staging it.
+   *  The caller says what the verb is — "stage" against the working tree,
+   *  "unstage" against the index — and is handed the index of the change the
+   *  reader is standing on. */
+  show(pair: DiffPair, onEdit?: (text: string) => void, onSwap?: () => void, hunk?: HunkAction): void {
     this.pair = pair;
     this.onEdit = onEdit;
+    this.onSwap = onSwap;
+    this.hunk = hunk;
     this.at = 0;
     this.render();
+  }
+
+  /** Stage (or unstage) the change the reader is on.
+   *
+   *  Deliberately tied to the navigation rather than to a button per band: the
+   *  count and the ▲▼ pair already say which change is current, and one verb in
+   *  the header is a shorter path than twenty buttons down the page — the more
+   *  so in side-by-side, where the package draws no per-chunk controls at all.
+   */
+  private async applyCurrentHunk(): Promise<void> {
+    if (!this.hunk || !this.at) return;
+    this.header.querySelector<HTMLButtonElement>(".js-hunk-apply")!.disabled = true;
+    try {
+      // `at` is 1-based because it is a position in a list a human is reading.
+      await this.hunk.apply(this.at - 1);
+    } finally {
+      // Not `disabled = false`: applying redraws the view against the new index,
+      // which puts the reader back at "no change selected" — and re-enabling
+      // the button here would offer to stage whichever one that is not.
+      this.updateHunkButton();
+    }
+  }
+
+  private updateHunkButton(): void {
+    const button = this.header.querySelector<HTMLButtonElement>(".js-hunk-apply")!;
+    button.hidden = !this.hunk || this.chunkCount === 0;
+    if (button.hidden) return;
+    button.textContent = this.at ? `${this.hunk!.label} this change` : `${this.hunk!.label} a change`;
+    // Nothing is selected until the reader has stepped to a change, and a
+    // button that would act on "the first one, probably" is worse than one that
+    // says to pick.
+    button.disabled = !this.at;
+    button.title = this.at
+      ? `${this.hunk!.label} change ${this.at} of ${this.chunkCount}`
+      : "Pick a change with ▲ ▼ first";
   }
 
   /** Move to the next (or previous) change and say where we are.
@@ -115,7 +248,7 @@ export class DiffView {
    *  below. */
   private step(delta: number): void {
     if (!this.chunkCount) return;
-    const view = this.mode === "split" ? this.merge?.b : this.single;
+    const view = this.effectiveMode === "split" ? this.merge?.b : this.single;
     if (!view) return;
     const command = delta > 0 ? goToNextChunk : goToPreviousChunk;
     if (!command({ state: view.state, dispatch: (tr) => view.dispatch(tr) })) {
@@ -137,6 +270,7 @@ export class DiffView {
         : `${this.chunkCount} change${this.chunkCount === 1 ? "" : "s"}`
       : "";
     for (const b of nav) b.disabled = this.chunkCount === 0;
+    this.updateHunkButton();
   }
 
   clear(): void {
@@ -189,14 +323,25 @@ export class DiffView {
     pathEl.textContent = twoFiles ? `${pair.beforeLabel} → ${pair.afterLabel}` : pair.path;
     labelEl.textContent = twoFiles ? "" : `${pair.beforeLabel} → ${pair.afterLabel}`;
     labelEl.hidden = twoFiles;
-    this.header.querySelector(".js-mode")!.textContent = this.mode === "split" ? "inline" : "side-by-side";
-    // The per-chunk buttons only exist in the inline view, so say where they
-    // are rather than letting someone conclude the feature is missing.
-    const modeBtn = this.header.querySelector<HTMLButtonElement>(".js-mode")!;
-    modeBtn.title = this.onEdit && this.mode === "split" ? "Switch to inline to revert individual changes" : "Switch the diff layout";
+    this.updateModeButton();
 
     this.chunkCount = 0;
     this.updateCount();
+    this.header.querySelector<HTMLElement>(".js-swap")!.hidden = !this.onSwap;
+
+    // Which column is which. The header said it once, in a sentence, above a
+    // view that scrolls — so halfway down a long file the only way to tell the
+    // sides apart was the colours, which say "removed/added" and not "yours/
+    // theirs". These sit over the columns and stay there.
+    const columns = this.host.querySelector<HTMLElement>(".js-columns")!;
+    const twoColumns = this.effectiveMode === "split" && pair.before !== null && pair.after !== null && !pair.binary;
+    columns.hidden = !twoColumns;
+    if (twoColumns) {
+      // startTrimmed: these headers truncate at the start, and a label
+      // beginning with a neutral character would otherwise be reordered.
+      this.host.querySelector<HTMLElement>(".js-col-a")!.textContent = startTrimmed(pair.beforeLabel);
+      this.host.querySelector<HTMLElement>(".js-col-b")!.textContent = startTrimmed(pair.afterLabel);
+    }
 
     if (pair.binary) {
       this.body.innerHTML = `<div class="diff-note">Binary file — no textual diff.</div>`;
@@ -235,8 +380,16 @@ export class DiffView {
 
     const before = pair.before;
     const after = pair.after;
-    if (before === after) {
-      this.body.innerHTML = `<div class="diff-note">No changes (${esc(pair.beforeLabel)} and ${esc(pair.afterLabel)} are identical).</div>`;
+    // Normalised before deciding "identical": a file that differs only by CRLF
+    // or by a trailing newline is not a difference anyone asked about, and the
+    // strict comparison this used to do let such a file through as a diff —
+    // two identical-looking columns, no highlighting, and nothing saying why.
+    const normalise = (s: string): string => s.replace(/\r\n/g, "\n").replace(/\n+$/, "");
+    if (normalise(before) === normalise(after)) {
+      const onlyWhitespace = before !== after;
+      this.body.innerHTML = `<div class="diff-note">No changes — ${esc(pair.beforeLabel)} and ${esc(pair.afterLabel)} are identical${
+        onlyWhitespace ? ", apart from line endings" : ""
+      }.</div>`;
       return;
     }
 
@@ -249,7 +402,7 @@ export class DiffView {
     // context around every change so a hunk is never shown without its bearings.
     const collapse = { margin: 3, minSize: 6 };
 
-    if (this.mode === "split") {
+    if (this.effectiveMode === "split") {
       this.merge = new MergeView({
         a: { doc: before, extensions: this.base(pair.path) },
         b: { doc: after, extensions: this.base(pair.path) },
@@ -258,6 +411,7 @@ export class DiffView {
         highlightChanges: true,
         gutter: true,
       });
+      this.linkHorizontalScroll();
     } else {
       const editable = Boolean(this.onEdit);
       this.single = new EditorView({

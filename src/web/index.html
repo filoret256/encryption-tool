@@ -87,8 +87,8 @@
         <button type="button" class="t-eye" data-action="togglePw">👁</button>
       </div>
       <div class="toolbar-sep"></div>
-      <button class="t-btn t-btn-primary" data-action="encrypt">↑ encrypt</button>
-      <button class="t-btn t-btn-primary" data-action="decrypt">↓ decrypt</button>
+      <button class="t-btn t-btn-primary" data-action="encrypt" title="Encrypt the selection, or the whole buffer (Ctrl+E)">↑ encrypt</button>
+      <button class="t-btn t-btn-primary" data-action="decrypt" title="Decrypt the selection, or the whole buffer (Ctrl+D)">↓ decrypt</button>
       <div class="toolbar-sep"></div>
       <button class="t-btn" data-action="b64encode">b64 encode</button>
       <button class="t-btn" data-action="b64unix">b64 unix</button>
@@ -112,8 +112,12 @@
       <button class="t-btn js-ws" data-action="ws">¶ ws</button>
       <button class="t-btn js-wrap" data-action="wrap">↵ wrap</button>
       <button class="t-btn js-fold" data-action="fold" title="Fold blocks from the gutter">⌄ fold</button>
+      <button class="t-btn js-two" data-action="two" title="Keep the source and show the result beside it">⧉ two panes</button>
     </div>
-    <div class="editor-wrap"><div class="editor-host js-editor"></div></div>
+    <div class="editor-wrap">
+      <div class="editor-host js-editor"></div>
+      <div class="editor-host js-editor2" hidden></div>
+    </div>
     <div class="statusbar">
       <div class="sb-item">lines&nbsp;<b class="js-lines">0</b></div>
       <div class="sb-item">chars&nbsp;<b class="js-chars">0</b></div>
