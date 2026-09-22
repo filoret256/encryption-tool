@@ -15,13 +15,15 @@ import { defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language"
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import type { DiffPair } from "../../agent/protocol.ts";
 import { grammarFor } from "./grammars.ts";
+import { cmBase, cmDark } from "../cm-theme.ts";
 import { esc, startTrimmed } from "./ui.ts";
 
+// Everything but the type size comes from cmBase now. A diff is read, not
+// written, so it is set a notch smaller than the editor — two panes have to fit
+// side by side — but a selection made in it to copy a line out should look like
+// a selection made anywhere else, and before this it had no colour of its own.
 const theme = EditorView.theme({
-  "&": { backgroundColor: "var(--panel)", color: "var(--text)" },
-  ".cm-scroller": { fontFamily: "var(--mono)", fontSize: "12.5px", lineHeight: "1.5" },
-  ".cm-gutters": { backgroundColor: "var(--panel)", color: "var(--text-muted)", borderRight: "1px solid var(--border)" },
-  "&.cm-focused": { outline: "none" },
+  ".cm-scroller": { fontSize: "12.5px" },
 });
 
 export type DiffMode = "split" | "unified";
@@ -295,7 +297,11 @@ export class DiffView {
     const lang = grammarFor(path);
     return [
       lineNumbers(),
+      cmBase,
       theme,
+      // Rebuilt rather than reconfigured on a theme switch — `setTheme` re-runs
+      // `render()` — so this needs no compartment, unlike the two editors.
+      cmDark(this.dark),
       syntaxHighlighting(this.dark ? oneDarkHighlightStyle : defaultHighlightStyle),
       // Read-only unless the caller asked for the working side to be editable:
       // a diff is normally something you read, and an accidental keystroke in

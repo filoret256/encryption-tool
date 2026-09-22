@@ -14,6 +14,8 @@ server.exe
 .claude
 backlog.md
 ./backlog.md
+to-do.md
+./to-do.md
 ux*.md
 ./ux*.md
 

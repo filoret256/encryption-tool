@@ -102,10 +102,15 @@ const SHELL = `
   <div class="gp-commit">
     <textarea class="js-message" rows="2" placeholder="Message (Ctrl+Enter to commit)" spellcheck="false"></textarea>
     <div class="gp-commit-row">
-      <button class="t-btn t-btn-primary js-commit" type="button">✓ commit</button>
+      <button class="t-btn t-btn-primary js-commit" type="button"
+        title="Commit (Ctrl+Enter) — Ctrl+Shift+Enter commits and pushes">✓ commit</button>
       <button class="t-btn js-amend" type="button" title="Replace the last commit">amend</button>
       <button class="t-icon js-history" type="button" title="Recent commit messages">↺</button>
       <span class="t-spacer"></span>
+      <!-- What the branch still owes the remote, next to the button that just
+           created the debt. The arrows in the header say the same thing, but
+           nothing after a commit points at them. -->
+      <button class="t-btn gp-unpushed js-unpushed" type="button" hidden></button>
       <span class="gp-len js-len" aria-live="off"></span>
     </div>
     <p class="gp-warn js-warn" hidden></p>
@@ -268,6 +273,17 @@ export class GitPanel {
   private get pull(): PullMode | null {
     return this.pullModes[this.folderKey] ?? null;
   }
+  /** Whether this folder has anywhere to push to, and which folder that answer
+   *  is about.
+   *
+   *  Asked once per folder rather than with every status: remotes change when
+   *  someone changes them (and that path clears this), while the status is
+   *  re-read on every file the watcher sees move. Remote-tracking branches
+   *  would have answered it for free, but a remote that has been added and not
+   *  yet fetched has none — and that is exactly the repository where "publish"
+   *  is the thing to offer. */
+  private hasRemote = false;
+  private remotesFor: string | null = null;
   /** The prepared message already put in the box, so a box the user has since
    *  emptied is not refilled on the next watcher event. */
   private preparedOffered: string | null = null;
@@ -313,11 +329,17 @@ export class GitPanel {
     this.$(".js-commit").addEventListener("click", () => void this.commit(false));
     this.$(".js-amend").addEventListener("click", () => void this.commit(true));
     this.$(".js-history").addEventListener("click", (e) => void this.messageHistory(e as MouseEvent));
+    // Same action as the arrows in the header: pull first if the branch is
+    // behind, then push — or publish a branch that has no upstream yet.
+    this.$(".js-unpushed").addEventListener("click", () => void this.sync());
     const box = this.$<HTMLTextAreaElement>(".js-message");
     box.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
-        void this.commit(false);
+        // Shift sends it on in the same press. Committing and pushing is two
+        // deliberate acts and stays two buttons; this is for the case where
+        // the answer to "and now push?" is always yes.
+        void this.commit(false, e.shiftKey);
       }
     });
     box.addEventListener("input", () => this.onMessageInput());
@@ -342,18 +364,28 @@ export class GitPanel {
       return;
     }
     try {
-      const [status, branches, identity, stashes] = await Promise.all([
+      // Only the first status in a folder asks about remotes; after that the
+      // answer is kept until something changes it. A failure here is not one:
+      // it leaves "no remote", which hides an offer rather than making a wrong
+      // one.
+      const askRemotes = this.remotesFor !== this.folderKey;
+      const [status, branches, identity, stashes, remotes] = await Promise.all([
         this.agent.call<GitStatus>("git.status"),
         this.agent.call<Branch[]>("git.branches"),
         this.agent.call<{ name: string | null; email: string | null }>("git.identity"),
         // A repository with no stashes answers with an empty string, not an
         // error, so this never needs its own failure path.
         this.agent.call<string>("git.stash", { action: "list" }).catch(() => ""),
+        askRemotes ? this.agent.call<{ name: string }[]>("git.remotes").catch(() => []) : Promise.resolve(null),
       ]);
       this.status = status;
       this.branches = branches;
       this.stashes = parseStashes(stashes);
       this.failure = null;
+      if (remotes) {
+        this.hasRemote = remotes.length > 0;
+        this.remotesFor = this.folderKey;
+      }
 
       // The operation is over, or its conflicts are: whatever was said about
       // them is now a claim about a state that no longer exists, so take it
@@ -528,17 +560,22 @@ export class GitPanel {
     // button: it says what it will do and does it. It used to be a <span> —
     // two glyphs, no tooltip, nothing to press — while the actual pull and
     // push hid behind identical arrow icons further along the row.
+    const sync = this.syncState();
     const syncBtn = this.$<HTMLButtonElement>(".js-sync");
-    const ahead = st?.ahead ?? 0;
-    const behind = st?.behind ?? 0;
-    syncBtn.hidden = !st?.upstream || (!ahead && !behind);
-    if (!syncBtn.hidden) {
-      const parts = [behind ? `↓${behind}` : "", ahead ? `↑${ahead}` : ""].filter(Boolean);
-      set(".js-sync", parts.join(" "));
-      syncBtn.title =
-        behind && ahead ? `Pull ${behind} commit${behind === 1 ? "" : "s"} from ${st!.upstream}, then push ${ahead}`
-        : behind ? `Pull ${behind} commit${behind === 1 ? "" : "s"} from ${st!.upstream}`
-        : `Push ${ahead} commit${ahead === 1 ? "" : "s"} to ${st!.upstream}`;
+    syncBtn.hidden = !sync;
+    if (sync) {
+      set(".js-sync", sync.arrows);
+      syncBtn.title = sync.title;
+    }
+
+    // The same state, in words, in the commit block. Only when there is work of
+    // ours to send: a branch that is merely behind is not something a commit
+    // has just made worse, and a reminder there would be noise.
+    const unpushed = this.$<HTMLButtonElement>(".js-unpushed");
+    unpushed.hidden = !sync?.unpushed;
+    if (sync?.unpushed) {
+      set(".js-unpushed", sync.words);
+      unpushed.title = sync.title;
     }
 
     const g = this.groups();
@@ -915,6 +952,41 @@ export class GitPanel {
     }
   }
 
+  /** What the branch still owes its remote: as arrows, as words, as a sentence
+   *  — or null when it owes nothing.
+   *
+   *  One description for the two controls that report it, the arrows in the
+   *  header and the reminder in the commit block. Before there was one control
+   *  and it was hidden unless the branch had an upstream, so the branch with
+   *  the most unpublished work on it — one that exists only on this machine —
+   *  was the one that said nothing at all. */
+  private syncState(): { arrows: string; words: string; title: string; unpushed: boolean } | null {
+    const st = this.status;
+    // A detached HEAD has nothing to publish and nowhere to put it.
+    if (!st?.branch) return null;
+    const n = (c: number): string => `${c} commit${c === 1 ? "" : "s"}`;
+    if (!st.upstream) {
+      // ahead and behind are both 0 without an upstream — there is nothing for
+      // git to count against — so this reports the state, not an amount. And
+      // only where there is somewhere to publish to: in a repository with no
+      // remote, "publish" is an offer that cannot be taken.
+      if (!this.hasRemote) return null;
+      const title = `Push ${st.branch} to the remote and track it — it is on this machine only`;
+      return { arrows: "publish", words: "publish branch", title, unpushed: true };
+    }
+    const { ahead, behind } = st;
+    if (!ahead && !behind) return null;
+    return {
+      arrows: [behind ? `↓${behind}` : "", ahead ? `↑${ahead}` : ""].filter(Boolean).join(" "),
+      words: behind && ahead ? `sync ↓${behind} ↑${ahead}` : ahead ? `push ${ahead}` : `pull ${behind}`,
+      title:
+        behind && ahead ? `Pull ${n(behind)} from ${st.upstream}, then push ${n(ahead)}`
+        : behind ? `Pull ${n(behind)} from ${st.upstream}`
+        : `Push ${n(ahead)} to ${st.upstream}`,
+      unpushed: ahead > 0,
+    };
+  }
+
   /** Behind, ahead, or both — one press does the right thing in the right
    *  order. Pulling first is not a preference: pushing while behind is what
    *  produces the non-fast-forward rejection this saves people from. */
@@ -926,7 +998,8 @@ export class GitPanel {
       // pushing on top of that would be the wrong next move.
       if ((this.status?.behind ?? 0) > 0) return;
     }
-    if ((this.status?.ahead ?? 0) > 0) await this.push();
+    // No upstream is the publish case: nothing to compare, everything to send.
+    if ((this.status?.ahead ?? 0) > 0 || !this.status?.upstream) await this.push();
   }
 
   /** The message box grows with what is in it, and says how long the first
@@ -1002,7 +1075,20 @@ export class GitPanel {
     showMenu(x, y, items);
   }
 
-  private async commit(amend: boolean): Promise<void> {
+  /** The tail of a commit report: what is now waiting to be sent.
+   *
+   *  A commit is local, and the panel said nothing about that — the count sat
+   *  in a pair of arrows in the header that nothing pointed at, and on a branch
+   *  with no upstream it did not sit anywhere. Read after the commit, so the
+   *  commit just made is in it. */
+  private pushTail(): string {
+    const st = this.status;
+    if (!st?.branch) return "";
+    if (!st.upstream) return this.hasRemote ? " · branch not published" : "";
+    return st.ahead > 0 ? ` · ${st.ahead} to push` : "";
+  }
+
+  private async commit(amend: boolean, thenPush = false): Promise<void> {
     const box = this.$<HTMLTextAreaElement>(".js-message");
     // Amending with an empty box used to mean "keep git's message", which is
     // right, but the message was then invisible: you were replacing a commit
@@ -1051,11 +1137,18 @@ export class GitPanel {
       this.onMessageInput();
       const oid = /^\[[^\]]*?\s([0-9a-f]{7,40})\]/m.exec(out)?.[1];
       const files = staged ? ` · ${staged} file${staged === 1 ? "" : "s"}` : "";
+      // Before the report, not after it: the commit is only part of the news.
+      // The rest — how much is now waiting to be sent — is in the status this
+      // reads, and reporting first meant quoting the count from before the
+      // commit that had just changed it.
+      await this.refresh();
       // git's own summary — the branch, the insert/delete tally, any mode
       // changes — goes to the log; the line above is what the toast holds.
-      this.cb.report(`${amend ? "amended" : "committed"}${oid ? ` ${oid.slice(0, 7)}` : ""}${files}`, out);
-      await this.refresh();
+      this.cb.report(`${amend ? "amended" : "committed"}${oid ? ` ${oid.slice(0, 7)}` : ""}${files}${this.pushTail()}`, out);
       this.cb.afterChange();
+      // "and push" is the whole point of the shortcut, so a branch with no
+      // upstream gets published rather than told it has no upstream.
+      if (thenPush) await this.sync();
     } catch (e) {
       this.cb.toast(e instanceof Error ? e.message : String(e), true);
     }
@@ -1659,7 +1752,7 @@ export class GitPanel {
     }
     // Everything that talks to the remote, plus commit and amend: while one is
     // in flight the rest would only queue up behind it or fail.
-    for (const sel of [".js-fetch", ".js-pull", ".js-push", ".js-more", ".js-commit", ".js-amend"]) {
+    for (const sel of [".js-fetch", ".js-pull", ".js-push", ".js-more", ".js-commit", ".js-amend", ".js-unpushed"]) {
       this.$<HTMLButtonElement>(sel).disabled = this.busy;
     }
     this.host.classList.toggle("is-busy", this.busy);
@@ -1866,6 +1959,10 @@ export class GitPanel {
     } catch (e) {
       this.cb.toast(e instanceof Error ? e.message : String(e), true);
     }
+    // Adding or removing a remote is the one thing that changes the answer
+    // refresh() caches, so it is the one thing that has to forget it — a
+    // remote added through this panel has to reach the publish button.
+    if (op === "git.remoteAdmin") this.remotesFor = null;
     await this.refresh();
     this.cb.afterChange();
   }

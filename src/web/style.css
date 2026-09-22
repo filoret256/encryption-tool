@@ -38,12 +38,24 @@
      secondary next to --text. The dark theme's muted tone already passed. */
   --text-muted: #6b7280; --accent: #2563eb; --accent-fg: #fff;
   --btn: #f0f2f5; --btn-hover: #e4e8ee; --active: #dbeafe;
+  /* Text selection inside the editors, separate from --active (which marks a
+     selected *row* in a list). A list row is selected on its own, an editor
+     selection has code sitting on top of it, so this one is picked against the
+     syntax palette: every token colour has to stay readable over it, and the
+     band itself has to be obvious next to an unselected line. --active is too
+     pale for that here — it was the nearest thing and it read as "nothing is
+     selected" the moment a cursor sat on the line. */
+  --sel: #add6ff;
   --ok: #15803d; --bad: #b91c1c;
 }
 :root[data-theme="dark"] {
   --bg: #0d1117; --panel: #161b22; --border: #2d333b; --text: #e6edf3;
   --text-muted: #768390; --accent: #2f81f7; --accent-fg: #fff;
   --btn: #21262d; --btn-hover: #2d333b; --active: #1f3a5f;
+  /* Darker than it looks it should be: the dark syntax palette (one-dark) is
+     all light tones, and the purple keywords are the first to fail — over this
+     they hold ~3.3:1, over a lighter blue they drop below 3. */
+  --sel: #24466e;
   --ok: #3fb950; --bad: #f85149;
 }
 
@@ -65,6 +77,7 @@
     --bg: #0d1117; --panel: #161b22; --border: #2d333b; --text: #e6edf3;
     --text-muted: #768390; --accent: #2f81f7; --accent-fg: #fff;
     --btn: #21262d; --btn-hover: #2d333b; --active: #1f3a5f;
+    --sel: #24466e;
     --ok: #3fb950; --bad: #f85149;
   }
 }
@@ -463,6 +476,15 @@ body {
 .gp-commit textarea { min-height: calc(var(--row) * 2); overflow-y: auto; }
 .gp-commit-row { display: flex; align-items: center; gap: 6px; }
 .gp-commit-row .js-commit { flex: 0 1 auto; }
+/* Unpushed work, in the commit block. Accent-coloured but not a primary button:
+   it has to be noticed next to "commit" without competing with it, because the
+   press that belongs there is still the commit. */
+.gp-unpushed {
+  flex: 0 0 auto; font-size: var(--fs-xs);
+  color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--accent) 10%, var(--panel));
+}
+.gp-unpushed:not(:disabled):hover { background: color-mix(in srgb, var(--accent) 18%, var(--panel)); }
 /* Subject length, shown only once it is worth mentioning. Reported, not
    enforced: 50/72 is a convention, and some repositories do not keep it. */
 .gp-len { flex: 0 0 auto; font-size: var(--fs-badge); font-family: var(--mono); color: var(--text-muted); }

@@ -33,21 +33,23 @@ import { grammarFor } from "./grammars.ts";
 import { conflictHighlighter, setConflictSides, type ConflictSides } from "./conflicts.ts";
 import { blameGutter, hasBlame, setBlame, type BlameLine } from "./blame.ts";
 import { cspNonce } from "../csp.ts";
+import { cmBase, cmDark } from "../cm-theme.ts";
 
+// Surface, gutters, cursor and selection come from cmBase, which every editor
+// in the app shares; what is left here is what this one alone needs — it fills
+// a pane, so it takes the height, and it is the editor people read code in, so
+// it is the one with the larger type.
 const theme = EditorView.theme({
-  "&": { height: "100%", backgroundColor: "var(--panel)", color: "var(--text)" },
-  ".cm-scroller": { fontFamily: "var(--mono)", fontSize: "13px", lineHeight: "1.5", overflow: "auto" },
-  ".cm-gutters": { backgroundColor: "var(--panel)", color: "var(--text-muted)", borderRight: "1px solid var(--border)" },
-  "&.cm-focused": { outline: "none" },
-  ".cm-cursor": { borderLeftColor: "var(--text)" },
-  ".cm-activeLine": { backgroundColor: "var(--bg)" },
-  ".cm-activeLineGutter": { backgroundColor: "var(--bg)" },
+  "&": { height: "100%" },
+  ".cm-scroller": { fontSize: "13px", overflow: "auto" },
 });
 
 export class CodeEditor {
   readonly view: EditorView;
   private cLang = new Compartment();
   private cTheme = new Compartment();
+  /** Tells CodeMirror which way the theme is facing — see applyTheme. */
+  private cDark = new Compartment();
   private cReadOnly = new Compartment();
 
   constructor(
@@ -97,7 +99,11 @@ export class CodeEditor {
       blameGutter(this.onBlamePick),
       this.cLang.of(lang ? [lang] : []),
       this.cTheme.of(syntaxHighlighting(this.dark ? oneDarkHighlightStyle : defaultHighlightStyle)),
+      this.cDark.of(cmDark(this.dark)),
       this.cReadOnly.of(readOnly ? [EditorState.readOnly.of(true), EditorView.editable.of(false)] : []),
+      // Shared chrome first, this editor's own after it: where both name the
+      // same rule, the one that comes later is the one that applies.
+      cmBase,
       theme,
       // Order matters: closeBrackets claims Backspace over an auto-inserted
       // pair, and completion claims Escape and the arrow keys while its popup
@@ -182,9 +188,19 @@ export class CodeEditor {
     this.applyTheme();
   }
 
+  /** Both halves of "dark", which is what this used to get wrong.
+   *
+   *  Swapping the highlight style covers the code; everything CodeMirror styles
+   *  itself — the find panel, the completion popup, tooltips, the scrollbar —
+   *  is keyed on `&dark`, and without the flag it stayed light in a dark
+   *  window. The flag is a theme, so it has to live in a compartment to be
+   *  swapped at all. */
   private applyTheme(): void {
     this.view.dispatch({
-      effects: this.cTheme.reconfigure(syntaxHighlighting(this.dark ? oneDarkHighlightStyle : defaultHighlightStyle)),
+      effects: [
+        this.cTheme.reconfigure(syntaxHighlighting(this.dark ? oneDarkHighlightStyle : defaultHighlightStyle)),
+        this.cDark.reconfigure(cmDark(this.dark)),
+      ],
     });
   }
 

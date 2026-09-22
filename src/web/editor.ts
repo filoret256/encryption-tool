@@ -31,6 +31,7 @@ import { linter, lintGutter } from "@codemirror/lint";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import { yamlDiagnostics } from "./yaml-lint.ts";
 import { cspNonce } from "./csp.ts";
+import { cmBase, cmDark } from "./cm-theme.ts";
 import { prefersDark } from "./theme.ts";
 
 export type Tab = "ansible" | "helm";
@@ -70,22 +71,19 @@ function savePrefs(): void {
   }
 }
 
-// Editor chrome follows the app theme via CSS variables; only the syntax-colour
-// highlight style swaps between light/dark (see setTheme).
+// Editor chrome follows the app theme via CSS variables; the surface, gutters,
+// cursor and selection are cmBase, shared with the code tab and the diff, and
+// what is left here is this editor's own. The selection used to be a rule of
+// its own asking for var(--active) through a short selector — which, it turns
+// out, CodeMirror's own focused-selection rule outranks, so the colour applied
+// only while the editor was *not* focused. cmBase carries the selector shape
+// that works, and the same colour as everywhere else.
 const baseTheme = EditorView.theme({
-  "&": { height: "100%", backgroundColor: "var(--panel)", color: "var(--text)" },
-  ".cm-scroller": { fontFamily: "var(--mono)", fontSize: "13px", lineHeight: "1.5", overflow: "auto" },
-  ".cm-gutters": { backgroundColor: "var(--panel)", color: "var(--text-muted)", borderRight: "1px solid var(--border)" },
-  ".cm-activeLineGutter": { backgroundColor: "transparent" },
-  ".cm-activeLine": { backgroundColor: "transparent" },
-  "&.cm-focused": { outline: "none" },
-  ".cm-cursor": { borderLeftColor: "var(--text)" },
+  "&": { height: "100%" },
+  ".cm-scroller": { fontSize: "13px", overflow: "auto" },
   // Whitespace glyphs (·, →, ¬) share the muted colour so they don't distract.
   ".cm-highlightSpace:before, .cm-highlightTab, .cm-eol": { color: "var(--text-muted)", opacity: "0.6" },
   ".cm-eol": { paddingLeft: "1px" },
-  ".cm-selectionBackground, &.cm-focused .cm-selectionBackground, .cm-content ::selection": {
-    backgroundColor: "var(--active)",
-  },
 });
 
 // `highlightWhitespace()` only renders spaces (·) and tabs (→); CM6 has no
@@ -175,7 +173,10 @@ export class TabEditor {
           closeBrackets(),
           yamlLang(),
           this.cHighlight.of(syntaxHighlighting(dark ? oneDarkHighlightStyle : defaultHighlightStyle)),
-          this.cDark.of(EditorView.theme({}, { dark })),
+          this.cDark.of(cmDark(dark)),
+          // Shared chrome first, this editor's own after it: where both name
+          // the same rule, the one that comes later is the one that applies.
+          cmBase,
           baseTheme,
           cmPlaceholder(placeholderText),
           search(),
@@ -280,7 +281,7 @@ export class TabEditor {
     this.view.dispatch({
       effects: [
         this.cHighlight.reconfigure(syntaxHighlighting(dark ? oneDarkHighlightStyle : defaultHighlightStyle)),
-        this.cDark.reconfigure(EditorView.theme({}, { dark })),
+        this.cDark.reconfigure(cmDark(dark)),
       ],
     });
   }
