@@ -1,12 +1,12 @@
 /** Code tab: explorer, source control, history, editor and diff — wired to the
- *  local agent.
+ *  local code-agent.
  *
  *  Loaded lazily; main.ts imports it by URL on the first switch to this tab so
  *  the grammar set never lands in the crypto tabs' bundle.
  */
 import type { EditorState } from "@codemirror/state";
-import { isAgentUrl, type AgentClient } from "./agent.ts";
-import type { AgentInfo, Commit, CommitDetail, DiffPair, DirEntry, FileRead, FsChange, GitStatus } from "../../agent/protocol.ts";
+import { isCodeAgentUrl, type CodeAgentClient } from "./code-agent.ts";
+import type { CodeAgentInfo, Commit, CommitDetail, DiffPair, DirEntry, FileRead, FsChange, GitStatus } from "../../code-agent/protocol.ts";
 import { CodeEditor } from "./editor.ts";
 import { distinguish, FileTree } from "./tree.ts";
 import { GitPanel, mergeSource } from "./git-panel.ts";
@@ -18,6 +18,7 @@ import { hunkPatches } from "./hunkpatch.ts";
 import { findConflicts, type ConflictSides } from "./conflicts.ts";
 import { applyRowHeight, copyToClipboard, esc, modalConfirm, modalPrompt, showMenu, type MenuItem } from "./ui.ts";
 import { draftsFor, dropDraft, putDraft } from "./drafts.ts";
+import { singleFlight } from "./singleflight.ts";
 import { OutputLog } from "./output.ts";
 import { Commands, keyLabel } from "./commands.ts";
 import { quickPick } from "./quickpick.ts";
@@ -28,7 +29,7 @@ import { indentOfLine, isVaultFile, schemeName, schemes, unwrapVaultBlock, vault
 import { iconBranch, iconFiles, iconHistory, iconNewFile, iconNewFolder, iconRefresh, iconSearch } from "./icons.ts";
 
 export interface CodeContext {
-  agent: AgentClient;
+  codeAgent: CodeAgentClient;
   isDark: () => boolean;
   /** A notice with somewhere to go: the summary is shown, and `onDetails`
    *  opens the output log at the entry it came from. */
@@ -39,18 +40,18 @@ export interface CodeContext {
    *  describe has passed. See notify.ts: an error does not expire on a timer,
    *  but "resolve the conflicts below" must not outlive the conflicts. */
   dismissScope: (scope: string) => void;
-  /** Called whenever agent state changes so the header badge can repaint. */
+  /** Called whenever code-agent state changes so the header badge can repaint. */
   onCapsChanged: () => void;
-  /** Open the "get agent" popover in the header. */
-  getAgent: () => void;
+  /** Open the "get code-agent" popover in the header. */
+  getCodeAgent: () => void;
 }
 
 export interface CodeTab {
   setTheme(dark: boolean): void;
   connect(): Promise<void>;
   focus(): void;
-  /** main.ts owns the agent client and forwards its state changes here. */
-  onAgentState(): void;
+  /** main.ts owns the code-agent client and forwards its state changes here. */
+  onCodeAgentState(): void;
 }
 
 type View = "explorer" | "search" | "scm" | "history";
@@ -84,7 +85,7 @@ const SHELL = `
     <span class="t-label">folder</span>
     <span class="code-root">not connected</span>
     <button class="t-btn js-connect" type="button">connect…</button>
-    <button class="t-btn js-reload" type="button" data-requires="agent" title="Reload">${iconRefresh}</button>
+    <button class="t-btn js-reload" type="button" data-requires="codeAgent" title="Reload">${iconRefresh}</button>
     <div class="toolbar-sep"></div>
     <span class="t-label">branch</span>
     <span class="code-branch" data-requires="git">—</span>
@@ -94,7 +95,7 @@ const SHELL = `
   <div class="code-body">
     <nav class="code-rail">
       <button class="rail-btn active" type="button" data-view="explorer" title="Explorer">${iconFiles}</button>
-      <button class="rail-btn" type="button" data-view="search" data-requires="agent" title="Search across the project">${iconSearch}</button>
+      <button class="rail-btn" type="button" data-view="search" data-requires="codeAgent" title="Search across the project">${iconSearch}</button>
       <button class="rail-btn" type="button" data-view="scm" data-requires="git" title="Source control">
         ${iconBranch}<span class="rail-badge js-scm-badge" hidden></span>
       </button>
@@ -105,8 +106,8 @@ const SHELL = `
         <span class="js-side-title">explorer</span>
         <span class="t-spacer"></span>
         <span class="act-explorer">
-          <button class="t-icon js-newfile" type="button" data-requires="agent" title="New file">${iconNewFile}</button>
-          <button class="t-icon js-newdir" type="button" data-requires="agent" title="New folder">${iconNewFolder}</button>
+          <button class="t-icon js-newfile" type="button" data-requires="codeAgent" title="New file">${iconNewFile}</button>
+          <button class="t-icon js-newdir" type="button" data-requires="codeAgent" title="New folder">${iconNewFolder}</button>
         </span>
       </div>
       <div class="side-views">
@@ -148,7 +149,7 @@ const SHELL = `
     <div class="sb-item js-sb-lang" hidden></div>
     <div class="sb-item code-sync"></div>
     <div class="sb-item code-engine"></div>
-    <button class="sb-item sb-button js-output-toggle" type="button" title="What git and the agent said (the output log)">output</button>
+    <button class="sb-item sb-button js-output-toggle" type="button" title="What git and the code-agent said (the output log)">output</button>
   </div>`;
 
 export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
@@ -158,7 +159,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   applyRowHeight();
   const $ = <T extends HTMLElement>(sel: string): T => host.querySelector<T>(sel)!;
 
-  const { agent } = ctx;
+  const { codeAgent } = ctx;
   const rootLabel = $(".code-root");
   const branchLabel = $(".code-branch");
   const pathLabel = $(".code-path");
@@ -224,7 +225,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   }
 
   /** What the git, history and search panels call. They hand over whatever the
-   *  agent said, in full; splitting it into a line and a transcript happens
+   *  code-agent said, in full; splitting it into a line and a transcript happens
    *  here so every panel gets the same treatment without knowing about it. */
   function panelReport(message: string, isError = false, scope?: string): void {
     const long = message.includes("\n") || message.length > 200;
@@ -275,6 +276,14 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
      *  Saving is still allowed — the edits are the user's — but anything that
      *  writes the buffer somewhere consequential asks first. */
     stale?: boolean;
+    /** The buffer holds text that was decrypted in this tab — the whole file, or
+     *  a value inside it. While that is true and the buffer differs from the
+     *  file, no draft of it is kept: a draft is a copy of the buffer in
+     *  IndexedDB, and this would put the secrets on disk in the browser's
+     *  profile, in the clear, for as long as the tab stayed unsaved. Passwords
+     *  are "asked for per operation and never kept" (vault.ts); what they
+     *  unlock deserves no better a fate than the password. See scheduleDraft. */
+    decrypted?: boolean;
     /** Set when the tab holds a slice of a file too large to open whole.
      *
      *  What used to happen here was "// file too large to open" and nothing
@@ -403,18 +412,18 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
   const saveBtn = $<HTMLButtonElement>(".js-save");
 
-  /** Save is off unless there is a writable file on screen and an agent to
+  /** Save is off unless there is a writable file on screen and a code-agent to
    *  write it with — and the button says which of those is missing. */
   function updateSaveEnabled(): void {
     const why =
-      agent.state !== "online" ? "Requires the local agent"
+      codeAgent.state !== "online" ? "Requires the local code-agent"
       : openFile === null ? "No file open"
       : openFile.readOnly ? "This file is read-only"
       : "";
     saveBtn.disabled = why !== "";
     // The accent belongs to the thing worth pressing. On an empty screen the
     // brightest element used to be a blue "save" that saved nothing, while the
-    // one route into the setup — "get agent" — was a muted chip.
+    // one route into the setup — "get code-agent" — was a muted chip.
     saveBtn.classList.toggle("t-btn-primary", !saveBtn.disabled);
     saveBtn.title = why || (openFile?.missing ? "Save — the file is gone from disk and will be created again" : "Save the open file");
     renderWelcome();
@@ -423,31 +432,31 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   /** The first screen, as a sequence rather than a blank editor.
    *
    *  "Select a file in the explorer" is the wrong sentence when there is no
-   *  explorer to select from and no agent to provide one — it reads as an
+   *  explorer to select from and no code-agent to provide one — it reads as an
    *  instruction the reader has already failed to follow. What is actually
    *  needed is three steps, and this is where they belong. */
   function renderWelcome(): void {
     const el = $(".js-welcome");
-    const show = agent.state !== "online" && tabs.length === 0;
+    const show = codeAgent.state !== "online" && tabs.length === 0;
     el.hidden = !show;
     editorHost.classList.toggle("is-welcome", show);
     if (!show || el.dataset.built) return;
     el.dataset.built = "1";
     el.innerHTML = `<div class="welcome">
       <h2>Open a project folder</h2>
-      <p>The editor works on files on this machine. A small local agent serves one
+      <p>The editor works on files on this machine. A small local code-agent serves one
          folder to this page over a loopback socket — nothing is uploaded.</p>
       <ol>
-        <li><b>Get the agent.</b> One binary, no installer.
-            <button class="t-btn js-welcome-get" type="button">get agent</button></li>
+        <li><b>Get the code-agent.</b> One binary, no installer.
+            <button class="t-btn js-welcome-get" type="button">get code-agent</button></li>
         <li><b>Run it in your project folder.</b>
-            <code>enc-tool-agent</code> — it prints a <code>ws://127.0.0.1:…</code> URL.</li>
+            <code>enc-tool-code-agent</code> — it prints a <code>ws://127.0.0.1:…</code> URL.</li>
         <li><b>Paste that URL here.</b>
             <button class="t-btn t-btn-primary js-welcome-connect" type="button">connect…</button></li>
       </ol>
       <p class="welcome-note">The crypto tabs above need none of this — they run entirely in the browser.</p>
     </div>`;
-    el.querySelector(".js-welcome-get")!.addEventListener("click", () => ctx.getAgent());
+    el.querySelector(".js-welcome-get")!.addEventListener("click", () => ctx.getCodeAgent());
     el.querySelector(".js-welcome-connect")!.addEventListener("click", () => void connect());
   }
 
@@ -544,7 +553,15 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       const tab = openFile;
       const root = boundRoot;
       if (!tab || !root) return;
-      if (isDirty(tab)) void putDraft(root, tab.path, editor.value);
+      // Sticky while dirty, and clears itself the moment the buffer is the file
+      // again — saved, reloaded, or undone back to what was on disk.
+      if (!isDirty(tab)) tab.decrypted = false;
+      if (tab.decrypted) {
+        // Not written, and whatever was written earlier goes too: it is older
+        // than the decryption, so restoring it would offer a state that never
+        // existed on screen, and nothing is gained by keeping it.
+        void dropDraft(root, tab.path);
+      } else if (isDirty(tab)) void putDraft(root, tab.path, editor.value);
       else void dropDraft(root, tab.path);
     }, 800);
   }
@@ -561,7 +578,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     const names = stored.slice(0, 3).map((d) => d.path).join(", ");
     const ok = await modalConfirm({
       title: stored.length === 1 ? `Restore unsaved changes to ${stored[0].path}?` : `Restore unsaved changes to ${stored.length} files?`,
-      detail: `Kept in this browser when the agent went away${stored.length > 1 ? `: ${names}${stored.length > 3 ? ", …" : ""}` : ""}. Restoring reopens ${stored.length === 1 ? "it" : "them"} with your edits, unsaved — nothing is written until you save.`,
+      detail: `Kept in this browser when the code-agent went away${stored.length > 1 ? `: ${names}${stored.length > 3 ? ", …" : ""}` : ""}. Restoring reopens ${stored.length === 1 ? "it" : "them"} with your edits, unsaved — nothing is written until you save.`,
       okLabel: "restore",
     });
     if (!ok) {
@@ -582,7 +599,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  worth keeping a draft for. Then the tab opens on the buffer alone, marked
    *  missing, and saving it asks before recreating the file. */
   async function restoreDraft(draft: { path: string; text: string }): Promise<void> {
-    const onDisk = await agent.call<FileRead>("fs.read", { path: draft.path }).catch(() => null);
+    const onDisk = await codeAgent.call<FileRead>("fs.read", { path: draft.path }).catch(() => null);
     const readOnly = Boolean(onDisk?.binary || onDisk?.tooLarge);
     const raw = onDisk?.text ?? null;
     const eol: "\n" | "\r\n" = raw?.includes("\r\n") ? "\r\n" : "\n";
@@ -616,7 +633,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   // ── the file moved while we were not watching ──
   // Tab ids whose buffer is dirty *and* whose file on disk changed underneath
   // it — the case a reconnect can produce, because nothing was watching while
-  // the agent was gone. Neither side may be thrown away without asking.
+  // the code-agent was gone. Neither side may be thrown away without asking.
   const conflictingTabs = new Set<string>();
 
   function renderDiskConflictBar(): void {
@@ -627,7 +644,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       return;
     }
     bar.hidden = false;
-    bar.innerHTML = `<span>⚠ ${esc(tab.path)} changed on disk while the agent was away, and this buffer has unsaved edits.</span>
+    bar.innerHTML = `<span>⚠ ${esc(tab.path)} changed on disk while the code-agent was away, and this buffer has unsaved edits.</span>
       <button class="t-btn js-disk-compare" type="button">compare</button>
       <button class="t-btn js-disk-mine" type="button">keep mine</button>
       <button class="t-btn js-disk-theirs" type="button">use the file on disk</button>`;
@@ -680,7 +697,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     const openTab = tabForPath(path);
     const eol = openTab?.eol ?? "\n";
     try {
-      await agent.call("fs.write", { path, text: eol === "\n" ? tab.pending : tab.pending.replace(/\n/g, "\r\n") });
+      await codeAgent.call("fs.write", { path, text: eol === "\n" ? tab.pending : tab.pending.replace(/\n/g, "\r\n") });
       lastSelfWrite = Date.now();
       report("save", `wrote ${path}`);
       // What is on disk is the new right-hand side, so the view is rebuilt
@@ -707,7 +724,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  other diff here — the point is to decide, not to merge in place. */
   async function compareWithBuffer(tab: FileTab): Promise<void> {
     try {
-      const file = await agent.call<FileRead>("fs.read", { path: tab.path });
+      const file = await codeAgent.call<FileRead>("fs.read", { path: tab.path });
       const buffer = tab.id === openFile?.id ? editor.value : (states.get(tab.id)?.doc.toString() ?? "");
       showDiffTab(
         `buffer:${tab.id}`,
@@ -724,7 +741,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         false,
       );
     } catch (e) {
-      reportError("agent", e);
+      reportError("code-agent", e);
     }
   }
 
@@ -795,7 +812,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         }
       }
       if (isDirty(tabForPath(path))) await save();
-      await agent.call("git.resolve", { paths: [path] });
+      await codeAgent.call("git.resolve", { paths: [path] });
       report("git resolve", `${path} marked resolved`);
       await afterGitChange();
     } catch (e) {
@@ -807,28 +824,28 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   const tree = new FileTree(
     $(".code-tree"),
     {
-      readDir: (path) => agent.call<DirEntry[]>("fs.readdir", { path }),
-      createFile: (path) => agent.call("fs.createFile", { path }).then(() => undefined),
-      createDir: (path) => agent.call("fs.createDir", { path }).then(() => undefined),
+      readDir: (path) => codeAgent.call<DirEntry[]>("fs.readdir", { path }),
+      createFile: (path) => codeAgent.call("fs.createFile", { path }).then(() => undefined),
+      createDir: (path) => codeAgent.call("fs.createDir", { path }).then(() => undefined),
       // The open tabs are told directly rather than left to hear it from the
       // watcher: the watcher reports "something under this directory changed",
       // which cannot tell a rename from a delete-and-create, and guessing wrong
       // costs the user their buffer.
       move: (from, to) =>
-        agent.call("fs.move", { from, to }).then(() => {
+        codeAgent.call("fs.move", { from, to }).then(() => {
           retargetTabs(from, to);
         }),
-      readText: (path) => agent.call<FileRead>("fs.read", { path }).then((f) => f.text),
-      writeText: (path, text) => agent.call("fs.write", { path, text }).then(() => undefined),
+      readText: (path) => codeAgent.call<FileRead>("fs.read", { path }).then((f) => f.text),
+      writeText: (path, text) => codeAgent.call("fs.write", { path, text }).then(() => undefined),
       // A stat that throws is the answer "no", which is the only thing the
       // caller wants to know.
-      exists: (path) => agent.call("fs.stat", { path }).then(() => true).catch(() => false),
+      exists: (path) => codeAgent.call("fs.stat", { path }).then(() => true).catch(() => false),
       // Without git there is nothing to ask, and an explorer that cannot ask
       // must not guess — so this answers "none of them" rather than dimming.
       checkIgnore: (paths) =>
-        agent.info?.gitVersion ? agent.call<string[]>("git.checkIgnore", { paths }) : Promise.resolve([]),
+        codeAgent.info?.gitVersion ? codeAgent.call<string[]>("git.checkIgnore", { paths }) : Promise.resolve([]),
       remove: (paths) =>
-        agent.call("fs.delete", { paths }).then(() => {
+        codeAgent.call("fs.delete", { paths }).then(() => {
           for (const tab of fileTabs()) {
             if (paths.some((p) => tab.path === p || tab.path.startsWith(`${p}/`))) markMissing(tab);
           }
@@ -838,7 +855,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       onOpen: (path, preview) => void open(path, false, preview),
       onError: (m) => panelReport(m, true),
       notify: (m, isError) => report("explorer", m, { isError }),
-      workspaceRoot: () => agent.info?.root ?? null,
+      workspaceRoot: () => codeAgent.info?.root ?? null,
       confirmDelete: (paths) =>
         modalConfirm({
           title: paths.length === 1 ? `Delete ${paths[0]}?` : `Delete ${paths.length} items?`,
@@ -865,7 +882,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     },
   );
 
-  const gitPanel = new GitPanel(host.querySelector<HTMLElement>('[data-pane="scm"]')!, agent, {
+  const gitPanel = new GitPanel(host.querySelector<HTMLElement>('[data-pane="scm"]')!, codeAgent, {
     openDiff: (path, kind) => void openDiff(path, kind),
     // A conflicted row wants the markers on screen; an untracked one is just a
     // file. Both go to the editor, and openConflict() falls back to a plain
@@ -879,7 +896,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     afterChange: () => void afterGitChange(),
   });
 
-  const history = new HistoryPanel(host.querySelector<HTMLElement>('[data-pane="history"]')!, agent, {
+  const history = new HistoryPanel(host.querySelector<HTMLElement>('[data-pane="history"]')!, codeAgent, {
     openDiff: (path, kind, about) => void openDiff(path, kind, about),
     compareCommits: (a, b) => void compareCommits(a, b),
     compareRefs: (left, right) => void compareRefs(left, right),
@@ -893,7 +910,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     afterChange: () => void afterGitChange(),
   });
 
-  const searchPanel = new SearchPanel(host.querySelector<HTMLElement>('[data-pane="search"]')!, agent, {
+  const searchPanel = new SearchPanel(host.querySelector<HTMLElement>('[data-pane="search"]')!, codeAgent, {
     openAt: (path, line, col) => void openAt(path, line, col),
     toast: panelReport,
     report: (summary, detail) => report("replace", summary, { detail }),
@@ -1019,7 +1036,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       title: "Go to file…",
       category: "go",
       key: "Mod+P",
-      when: () => agent.state === "online",
+      when: () => codeAgent.state === "online",
       run: () => void quickOpenFile(),
     },
     { id: "view.palette", title: "Show all commands", category: "view", key: "Mod+Shift+P", run: () => void commands.palette() },
@@ -1030,7 +1047,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       title: "Search across the project",
       category: "view",
       key: "Mod+Shift+F",
-      when: () => agent.state === "online",
+      when: () => codeAgent.state === "online",
       run: () => showView("search"),
     },
     {
@@ -1038,7 +1055,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       title: "Show source control",
       category: "view",
       key: "Mod+Shift+G",
-      when: () => Boolean(agent.info?.gitVersion),
+      when: () => Boolean(codeAgent.info?.gitVersion),
       run: () => showView("scm"),
     },
     {
@@ -1046,7 +1063,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       title: "Show history",
       category: "view",
       key: "Mod+Shift+H",
-      when: () => Boolean(agent.info?.gitVersion),
+      when: () => Boolean(codeAgent.info?.gitVersion),
       run: () => showView("history"),
     },
     { id: "view.output", title: "Show the output log", category: "view", run: () => output.show() },
@@ -1075,15 +1092,15 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       when: () => openFile !== null,
       run: () => void revealOpenFile(),
     },
-    { id: "tree.collapse", title: "Collapse all folders", category: "view", when: () => agent.state === "online", run: () => tree.collapseAll() },
+    { id: "tree.collapse", title: "Collapse all folders", category: "view", when: () => codeAgent.state === "online", run: () => tree.collapseAll() },
     {
       id: "tree.undo",
       title: "Undo the last file move or creation",
       category: "file",
-      when: () => agent.state === "online",
+      when: () => codeAgent.state === "online",
       run: () => void tree.undoLast(),
     },
-    { id: "tree.filter", title: "Filter the explorer by name", category: "view", when: () => agent.state === "online", run: () => tree.focusFilter() },
+    { id: "tree.filter", title: "Filter the explorer by name", category: "view", when: () => codeAgent.state === "online", run: () => tree.focusFilter() },
     {
       id: "compare.select",
       title: "Mark the open file for comparison",
@@ -1095,7 +1112,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       id: "compare.with",
       title: "Compare the open file with…",
       category: "go",
-      when: () => openFile !== null && agent.state === "online",
+      when: () => openFile !== null && codeAgent.state === "online",
       run: () => void pickCompareTarget(openFile!.path),
     },
     {
@@ -1103,7 +1120,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       title: "Next search result",
       category: "go",
       key: "F4",
-      when: () => agent.state === "online",
+      when: () => codeAgent.state === "online",
       run: () => searchPanel.step(1),
     },
     {
@@ -1111,7 +1128,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       title: "Previous search result",
       category: "go",
       key: "Shift+F4",
-      when: () => agent.state === "online",
+      when: () => codeAgent.state === "online",
       run: () => searchPanel.step(-1),
     },
     {
@@ -1146,21 +1163,21 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       id: "git.blame",
       title: "Blame the open file",
       category: "go",
-      when: () => openFile !== null && agent.state === "online",
+      when: () => openFile !== null && codeAgent.state === "online",
       run: () => void toggleBlame(),
     },
     {
       id: "git.fileHistory",
       title: "History of the open file",
       category: "go",
-      when: () => openFile !== null && agent.state === "online",
+      when: () => openFile !== null && codeAgent.state === "online",
       run: () => showFileHistory(openFile!.path),
     },
     {
       id: "compare.folders",
       title: "Compare two folders…",
       category: "go",
-      when: () => agent.state === "online",
+      when: () => codeAgent.state === "online",
       run: () => void pickFolderPair(),
     },
   );
@@ -1192,7 +1209,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   // open it". So the workspace is walked once, breadth-first, and kept until
   // something on disk changes.
   //
-  // The skip list is not .gitignore — the agent would have to be asked, per
+  // The skip list is not .gitignore — the code-agent would have to be asked, per
   // directory, which is a protocol it does not have. These are the directories
   // that are build output or dependencies in every ecosystem this tool is
   // pointed at, and skipping them is the difference between an index that
@@ -1217,7 +1234,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         const dir = queue.shift()!;
         let entries: DirEntry[];
         try {
-          entries = await agent.call<DirEntry[]>("fs.readdir", { path: dir });
+          entries = await codeAgent.call<DirEntry[]>("fs.readdir", { path: dir });
         } catch {
           continue; // a directory that vanished mid-walk is not an error worth stopping for
         }
@@ -1337,7 +1354,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
     let entries: DirEntry[];
     try {
-      entries = await agent.call<DirEntry[]>("fs.readdir", { path: dir });
+      entries = await codeAgent.call<DirEntry[]>("fs.readdir", { path: dir });
     } catch (e) {
       return reportError("explorer", e);
     }
@@ -1706,12 +1723,12 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   async function readIntoTab(path: string, reload: boolean, preview: boolean, already: FileTab | undefined): Promise<void> {
     const seq = ++openSeq;
     try {
-      let file = await agent.call<FileRead>("fs.read", { path });
+      let file = await codeAgent.call<FileRead>("fs.read", { path });
       // Too large to open whole is not the same as impossible to read: ask for
       // the first window instead of showing a placeholder.
       let window: FileTab["window"];
       if (file.tooLarge) {
-        const slice = await agent
+        const slice = await codeAgent
           .call<FileRead>("fs.read", { path, offset: 0, length: WINDOW_BYTES })
           .catch(() => null);
         if (slice?.text !== null && slice !== null) {
@@ -1747,7 +1764,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       openFile = null; // stashActive already ran; do not stash the old doc twice
       activate(tab.id);
     } catch (e) {
-      reportError("agent", e);
+      reportError("code-agent", e);
     }
   }
 
@@ -1812,11 +1829,11 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         const patch = patches[index];
         if (!patch) return reportError("stage", new Error("That change is no longer in the diff — reopen it."));
         try {
-          await agent.call("git.applyPatch", { patch, reverse });
+          await codeAgent.call("git.applyPatch", { patch, reverse });
           report("git", `${reverse ? "unstaged" : "staged"} change ${index + 1} of ${path}`);
           // Both sides moved: the index is what changed, and it is one side of
           // this very diff. Re-reading it is what keeps the count honest.
-          const fresh = await agent.call<DiffPair>("git.diff", { path, kind: reverse ? "staged" : "worktree" });
+          const fresh = await codeAgent.call<DiffPair>("git.diff", { path, kind: reverse ? "staged" : "worktree" });
           tab.pair = fresh;
           if (activeId === tab.id) diff.show(fresh, undefined, undefined, hunkActionFor(tab));
           void refreshStatus();
@@ -1880,8 +1897,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   async function compare(left: string, right: string): Promise<void> {
     try {
       const [a, b] = await Promise.all([
-        agent.call<FileRead>("fs.read", { path: left }),
-        agent.call<FileRead>("fs.read", { path: right }),
+        codeAgent.call<FileRead>("fs.read", { path: left }),
+        codeAgent.call<FileRead>("fs.read", { path: right }),
       ]);
       // The tab is named by what tells the two apart — `prod/values.yaml ↔
       // stage/values.yaml`, not `values.yaml ↔ values.yaml`, which is what two
@@ -1911,7 +1928,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       // files from workspaces nobody had open any more.
       tree.setCompareBase(null);
     } catch (e) {
-      reportError("agent", e);
+      reportError("code-agent", e);
     }
   }
 
@@ -1974,7 +1991,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       buttons: false,
       items: [
         { value: "ansible", label: "Ansible Vault", detail: "$ANSIBLE_VAULT;1.1;AES256 — reads with the ansible-vault CLI" },
-        { value: "helm", label: "helm-encrypt", detail: "this tool's own AES-256-CBC envelope" },
+        { value: "helm", label: "helm-encrypt", detail: "this tool's own AES-256-GCM envelope (opens the older CBC one too)" },
       ],
     });
     return (pick as Scheme | null) ?? null;
@@ -2000,8 +2017,16 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
     try {
       const out = await schemes[scheme][direction](text.trim(), password);
+      // Set before the buffer changes: the change is what schedules the draft,
+      // and the draft must find the flag already there. Encrypting the whole
+      // buffer leaves ciphertext, so that direction is what lifts it.
+      tab.decrypted = direction === "decrypt";
       editor.replaceAll(direction === "encrypt" ? `${out}\n` : out);
-      report("crypto", `${tab.path} ${direction}ed with ${schemeName[scheme]} — not saved yet (Ctrl+S), and Ctrl+Z puts it back`);
+      report(
+        "crypto",
+        `${tab.path} ${direction}ed with ${schemeName[scheme]} — not saved yet (Ctrl+S), and Ctrl+Z puts it back` +
+          (direction === "decrypt" ? ". It is not backed up as a draft while it is decrypted." : ""),
+      );
     } catch (e) {
       reportError("crypto", e);
     }
@@ -2050,8 +2075,12 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     if (!password) return;
     try {
       const plain = await ansible.decrypt(envelope, password);
+      tab.decrypted = true; // before the change that schedules the draft; see FileTab.decrypted
       editor.view.dispatch({ changes: { from: sel.from, to: sel.to, insert: plain } });
-      report("crypto", "selection decrypted — not saved yet (Ctrl+S), and Ctrl+Z puts it back");
+      report(
+        "crypto",
+        "selection decrypted — not saved yet (Ctrl+S), and Ctrl+Z puts it back. The file is not backed up as a draft while it holds decrypted text.",
+      );
     } catch (e) {
       reportError("crypto", e);
     }
@@ -2108,7 +2137,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     bar.querySelector(".js-win-start")!.addEventListener("click", () => at(0));
     bar.querySelector(".js-win-prev")!.addEventListener("click", () => at(Math.max(0, from - w.length)));
     // From where this window ends, not from where it was asked to start: the
-    // agent may have moved the start forward off a half character.
+    // code-agent may have moved the start forward off a half character.
     bar.querySelector(".js-win-next")!.addEventListener("click", () => at(to));
     bar.querySelector(".js-win-end")!.addEventListener("click", () => at(Math.max(0, w.size - w.length)));
   }
@@ -2116,7 +2145,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   /** Move a large file's window and redraw the buffer under it. */
   async function readWindow(tab: FileTab, offset: number): Promise<void> {
     try {
-      const slice = await agent.call<FileRead>("fs.read", { path: tab.path, offset, length: WINDOW_BYTES });
+      const slice = await codeAgent.call<FileRead>("fs.read", { path: tab.path, offset, length: WINDOW_BYTES });
       tab.window = { offset: slice.offset, length: WINDOW_BYTES, size: slice.size, eof: slice.eof };
       const text = (slice.text ?? "").replace(/\r\n/g, "\n");
       states.set(tab.id, editor.newState(tab.path, text, true));
@@ -2276,7 +2305,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   $(".js-sb-lang").addEventListener("click", () => void pickLanguage());
 
   // ── blame and file history ──
-  // The agent has answered `git.blame` and `git.log {path}` from the start and
+  // The code-agent has answered `git.blame` and `git.log {path}` from the start and
   // nothing ever called either, so "when did this line change" was a question
   // you left the tool to answer.
 
@@ -2297,7 +2326,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       return;
     }
     try {
-      const rows = await agent.call<BlameLine[]>("git.blame", { path: tab.path });
+      const rows = await codeAgent.call<BlameLine[]>("git.blame", { path: tab.path });
       if (openFile?.id !== tab.id) return; // the reader moved on while git ran
       editor.setBlame(rows);
       // Blame describes the committed file. An edited buffer has lines that
@@ -2382,8 +2411,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     try {
       const result = await compareFolders(
         {
-          readDir: (path) => agent.call<DirEntry[]>("fs.readdir", { path }),
-          read: (path) => agent.call<FileRead>("fs.read", { path }),
+          readDir: (path) => codeAgent.call<DirEntry[]>("fs.readdir", { path }),
+          read: (path) => codeAgent.call<FileRead>("fs.read", { path }),
         },
         left,
         right,
@@ -2428,7 +2457,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     activate(tab.id);
 
     try {
-      const st = await agent.call<GitStatus>("git.status");
+      const st = await codeAgent.call<GitStatus>("git.status");
       const prefix = `${folder}/`;
       tab.entries = st.entries
         .filter((row) => row.path.startsWith(prefix) && !row.ignored)
@@ -2474,8 +2503,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   async function compareRefs(left: string, right: string): Promise<void> {
     try {
       const [a, b] = await Promise.all([
-        agent.call<Commit[]>("git.log", { ref: left, limit: 1 }),
-        agent.call<Commit[]>("git.log", { ref: right, limit: 1 }),
+        codeAgent.call<Commit[]>("git.log", { ref: left, limit: 1 }),
+        codeAgent.call<Commit[]>("git.log", { ref: right, limit: 1 }),
       ]);
       if (!a[0] || !b[0]) throw new Error(`Could not resolve ${!a[0] ? left : right}`);
       if (a[0].oid === b[0].oid) {
@@ -2516,12 +2545,12 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       // Both directions: a path touched only on the older commit's own branch
       // is still a difference between the two, and `A..B` alone would miss it.
       const [ahead, behind] = await Promise.all([
-        agent.call<Commit[]>("git.log", { ref: `${from.oid}..${to.oid}`, limit: REV_WALK }),
-        agent.call<Commit[]>("git.log", { ref: `${to.oid}..${from.oid}`, limit: REV_WALK }),
+        codeAgent.call<Commit[]>("git.log", { ref: `${from.oid}..${to.oid}`, limit: REV_WALK }),
+        codeAgent.call<Commit[]>("git.log", { ref: `${to.oid}..${from.oid}`, limit: REV_WALK }),
       ]);
       const between = [...ahead, ...behind];
       const details = await Promise.all(
-        between.map((c) => agent.call<CommitDetail>("git.commitDetail", { oid: c.oid }).catch(() => null)),
+        between.map((c) => codeAgent.call<CommitDetail>("git.commitDetail", { oid: c.oid }).catch(() => null)),
       );
       const paths = new Set<string>();
       for (const d of details) {
@@ -2532,7 +2561,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       }
 
       const blob = (rev: string, path: string): Promise<{ text: string | null; binary: boolean } | null> =>
-        agent.call<{ text: string | null; binary: boolean }>("git.blob", { rev, path }).catch(() => null);
+        codeAgent.call<{ text: string | null; binary: boolean }>("git.blob", { rev, path }).catch(() => null);
       const normalise = (s: string | null): string => (s ?? "").replace(/\r\n/g, "\n").replace(/\n+$/, "");
 
       const entries: FolderEntry[] = [];
@@ -2574,8 +2603,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     const b7 = to.oid.slice(0, 7);
     try {
       const [a, b] = await Promise.all([
-        agent.call<{ text: string | null; binary: boolean }>("git.blob", { rev: from.oid, path }),
-        agent.call<{ text: string | null; binary: boolean }>("git.blob", { rev: to.oid, path }),
+        codeAgent.call<{ text: string | null; binary: boolean }>("git.blob", { rev: from.oid, path }),
+        codeAgent.call<{ text: string | null; binary: boolean }>("git.blob", { rev: to.oid, path }),
       ]);
       showDiffTab(
         `revdiff:${from.oid}:${to.oid}:${path}`,
@@ -2716,7 +2745,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
   /** What a commit diff is a diff *of*, when the caller knows.
    *
-   *  The agent can only answer `04b43473^ → 04b43473`, because a blob read is
+   *  The code-agent can only answer `04b43473^ → 04b43473`, because a blob read is
    *  all it was asked for. The history panel has the subject, the author and
    *  the date in hand already, so it passes them down rather than making the
    *  reader decode two near-identical hashes and a caret. */
@@ -2731,7 +2760,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
   async function openDiff(path: string, kind: string, about?: DiffAbout): Promise<void> {
     try {
-      const pair = await agent.call<DiffPair>("git.diff", { path, kind });
+      const pair = await codeAgent.call<DiffPair>("git.diff", { path, kind });
       if (about) {
         const short = kind.slice(0, 7);
         // "before" is the parent commit, named as one. `<oid>^` is correct and
@@ -2761,7 +2790,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         : `${path}  (diff · ${what})`;
       showDiffTab(`diff:${kind}:${path}`, `${base(path)} (${what})`, title, pair, true, editablePath, undefined, staging);
     } catch (e) {
-      reportError("agent", e);
+      reportError("code-agent", e);
     }
   }
 
@@ -2784,7 +2813,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     const { path, eol } = tab;
     const text = editor.value;
     try {
-      await agent.call("fs.write", { path, text: eol === "\n" ? text : text.replace(/\n/g, "\r\n") });
+      await codeAgent.call("fs.write", { path, text: eol === "\n" ? text : text.replace(/\n/g, "\r\n") });
       lastSelfWrite = Date.now();
       // What is on disk is now the baseline, so the tab stops showing dirty.
       baselines.set(tab.id, text);
@@ -2801,15 +2830,25 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       report("save", `saved ${path}`);
       void refreshStatus();
     } catch (e) {
-      reportError("agent", e);
+      reportError("code-agent", e);
     }
   }
 
   // ── git status feeding the tree and the rail badge ──
-  async function refreshStatus(): Promise<void> {
-    if (agent.state !== "online" || !agent.info?.gitVersion) return;
+  //
+  // Every change the watcher reports asks for this, and `git status` lists every
+  // untracked file. Called as fast as a build reports, it queued run behind run,
+  // each answering a question already superseded — so it is coalesced: one in
+  // flight, one behind it, and a caller still gets an answer from a run that
+  // began after it asked. See singleflight.ts.
+  const statusFlight = singleFlight(() => loadStatus());
+  function refreshStatus(): Promise<void> {
+    return statusFlight();
+  }
+  async function loadStatus(): Promise<void> {
+    if (codeAgent.state !== "online" || !codeAgent.info?.gitVersion) return;
     try {
-      const st = await agent.call<GitStatus>("git.status");
+      const st = await codeAgent.call<GitStatus>("git.status");
       tree.setStatus(st.entries);
       branchLabel.textContent = st.branch ?? "(detached)";
 
@@ -2860,7 +2899,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     if (openFile && !isDirty(openFile)) void open(openFile.path, true);
   }
 
-  // ── agent lifecycle ──
+  // ── code-agent lifecycle ──
 
   /** The workspace the open tabs belong to. Paths are relative to it, so tabs
    *  and drafts only mean anything while it is the folder on the other end. */
@@ -2962,14 +3001,14 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   }
 
   async function onOnline(): Promise<void> {
-    const root = agent.info?.root ?? "";
+    const root = codeAgent.info?.root ?? "";
     // The same button now covers disconnecting and switching folders, so it
     // stops claiming there is nothing connected.
     $(".js-connect").textContent = "folder…";
     rootLabel.textContent = root;
     rootLabel.title = root;
-    engineLabel.textContent = agent.info?.ripgrep ? "rg" : "built-in search";
-    rememberWorkspace(agent.savedUrl(), root);
+    engineLabel.textContent = codeAgent.info?.ripgrep ? "rg" : "built-in search";
+    rememberWorkspace(codeAgent.savedUrl(), root);
     renderOfflineBar();
 
     // A different folder on the other end means every open path now points at
@@ -2981,7 +3020,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     await tree.load();
     await refreshStatus();
     void gitPanel.refresh();
-    await agent.call("watch.start").catch(() => undefined);
+    await codeAgent.call("watch.start").catch(() => undefined);
 
     // Reconnected to the same folder: the files may have moved on without us.
     for (const tab of fileTabs()) void reconcileAfterReconnect(tab);
@@ -3000,9 +3039,9 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     diff.clear();
     conflicted.clear();
     // The tabs stay. They used to be thrown away here, along with every
-    // unsaved edit in them, on nothing more than a dropped socket — an agent
+    // unsaved edit in them, on nothing more than a dropped socket — a code-agent
     // restart, a sleeping laptop, a pulled cable. The buffers are the user
-    // work; the connection is not. Saving is already disabled without an agent
+    // work; the connection is not. Saving is already disabled without a code-agent
     // (updateSaveEnabled), the bar below says so, and drafts.ts has a copy of
     // anything dirty in case the page itself goes too.
     renderOfflineBar();
@@ -3011,16 +3050,16 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     updateSaveEnabled();
   }
 
-  /** The strip above the editor while there is no agent. */
+  /** The strip above the editor while there is no code-agent. */
   function renderOfflineBar(): void {
     const bar = $(".js-offline");
-    const offline = agent.state !== "online";
+    const offline = codeAgent.state !== "online";
     bar.hidden = !offline || tabs.length === 0;
     if (bar.hidden) return;
     const unsaved = fileTabs().filter((t) => isDirty(t)).length;
     bar.textContent = unsaved
-      ? `Agent disconnected — ${unsaved} file${unsaved === 1 ? "" : "s"} with unsaved changes ${unsaved === 1 ? "is" : "are"} kept here and in this browser. Reconnect to save.`
-      : "Agent disconnected — the open files stay as they are. Reconnect to save or reload them.";
+      ? `Code-agent disconnected — ${unsaved} file${unsaved === 1 ? "" : "s"} with unsaved changes ${unsaved === 1 ? "is" : "are"} kept here and in this browser. Reconnect to save.`
+      : "Code-agent disconnected — the open files stay as they are. Reconnect to save or reload them.";
   }
 
   /** Reconnected to a different folder: the old tabs describe paths that no
@@ -3050,12 +3089,12 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     showEditor();
   }
 
-  /** One open tab, after the agent came back: is the file still there, and did
+  /** One open tab, after the code-agent came back: is the file still there, and did
    *  it change while we were away? */
   async function reconcileAfterReconnect(tab: FileTab): Promise<void> {
     if (!isDirty(tab)) return void syncWithDisk(tab);
 
-    const onDisk = await agent
+    const onDisk = await codeAgent
       .call<FileRead>("fs.read", { path: tab.path })
       .then((f) => f.text?.replace(/\r\n/g, "\n") ?? null)
       .catch(() => null);
@@ -3075,28 +3114,40 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  second, with a trailing run so the last burst is never the one missed. */
   let lastGitRefresh = 0;
   let gitRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-  function refreshGitViews(): void {
+  /** Whether any of the reports folded into the next refresh said the refs moved.
+   *  Kept across the coalescing above, or a trailing run would forget that the
+   *  burst it stands for included a commit. */
+  let refsMoved = false;
+  function refreshGitViews(moved: boolean): void {
+    refsMoved ||= moved;
     const waited = Date.now() - lastGitRefresh;
     if (waited < 1000) {
       if (!gitRefreshTimer) {
         gitRefreshTimer = setTimeout(() => {
           gitRefreshTimer = null;
-          refreshGitViews();
+          refreshGitViews(false);
         }, 1000 - waited);
       }
       return;
     }
     lastGitRefresh = Date.now();
+    const historyStale = refsMoved;
+    refsMoved = false;
     void refreshStatus();
     void gitPanel.refresh();
-    void history.refresh();
+    // The history is commits and the refs that point at them. Staging a file
+    // rewrites the index and nothing else, and re-reading every loaded commit
+    // for that was most of what a refresh cost.
+    if (historyStale) void history.refresh();
   }
 
-  agent.on("fs.change", (data) => {
+  codeAgent.on("fs.change", (data) => {
     const { paths } = data as FsChange;
-    // The watcher collapses everything under .git into one sentinel.
-    if (paths.includes(".git")) refreshGitViews();
-    const fsPaths = paths.filter((p) => p !== ".git");
+    // The watcher collapses everything under .git into one sentinel, and adds a
+    // second when what changed was HEAD or a ref. "*" is a burst too large to
+    // itemise: it says nothing about refs, so it is assumed to include them.
+    if (paths.includes(".git") || paths.includes(".git#refs")) refreshGitViews(paths.includes(".git#refs") || paths.includes("*"));
+    const fsPaths = paths.filter((p) => p !== ".git" && p !== ".git#refs");
     if (!fsPaths.length) return;
 
     void tree.refresh(fsPaths);
@@ -3115,7 +3166,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  app used to leave a tab that looked perfectly healthy and would write
    *  itself back to the old path on the next save. */
   async function syncWithDisk(tab: FileTab): Promise<void> {
-    const exists = await agent
+    const exists = await codeAgent
       .call<{ dir: boolean }>("fs.stat", { path: tab.path })
       .then(() => true)
       .catch(() => false);
@@ -3158,7 +3209,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  `open(path, true)` would activate it: correct for the tab someone is
    *  looking at, and an ambush for the five others behind it. */
   async function reloadQuietly(tab: FileTab): Promise<void> {
-    const file = await agent.call<FileRead>("fs.read", { path: tab.path }).catch(() => null);
+    const file = await codeAgent.call<FileRead>("fs.read", { path: tab.path }).catch(() => null);
     // Windowed, binary and oversized tabs are read-only and are re-read the
     // ordinary way when they are next opened; there is nothing to lose in them.
     if (!file || file.text === null || file.binary || file.tooLarge || tab.window) return;
@@ -3222,12 +3273,12 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
   async function connectTo(url: string): Promise<void> {
     try {
-      await agent.connect(url);
-      report("agent", "agent connected");
+      await codeAgent.connect(url);
+      report("code-agent", "code-agent connected");
     } catch (e) {
-      reportError("agent", e);
+      reportError("code-agent", e);
       const message = e instanceof Error ? e.message : String(e);
-      // One agent serves one tab unless it was started otherwise. That is a
+      // One code-agent serves one tab unless it was started otherwise. That is a
       // deliberate default, and the way past it is a flag documented only in
       // the README — so the refusal now carries the command itself.
       if (/already serving another tab/i.test(message)) await offerAllowMultiple(url);
@@ -3240,13 +3291,13 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  "see the README" is the answer that sent people to the README. */
   async function offerAllowMultiple(url: string): Promise<void> {
     const root = loadRecents().find((r) => r.url === url)?.root;
-    const command = root ? `enc-tool-agent --allow-multiple --root "${root}"` : "enc-tool-agent --allow-multiple";
+    const command = root ? `enc-tool-code-agent --allow-multiple --root "${root}"` : "enc-tool-code-agent --allow-multiple";
     const ok = await modalConfirm({
-      title: "That agent is already serving another tab",
-      detail: `Close the other tab, or restart the agent so it accepts more than one:\n\n${command}`,
+      title: "That code-agent is already serving another tab",
+      detail: `Close the other tab, or restart the code-agent so it accepts more than one:\n\n${command}`,
       okLabel: "copy the command",
     });
-    if (ok) await copyToClipboard(command, "Command", (m, isError) => report("agent", m, { isError }));
+    if (ok) await copyToClipboard(command, "Command", (m, isError) => report("code-agent", m, { isError }));
   }
 
   // ── recent workspaces ──
@@ -3256,11 +3307,11 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   // are remembered by name, and the URL is an implementation detail again.
   interface Recent {
     url: string;
-    /** The absolute path the agent reported, which is what a person recognises. */
+    /** The absolute path the code-agent reported, which is what a person recognises. */
     root: string;
     at: number;
   }
-  const RECENTS_KEY = "enc-agent-recents";
+  const RECENTS_KEY = "enc-code-agent-recents";
   const MAX_RECENTS = 6;
 
   function loadRecents(): Recent[] {
@@ -3274,7 +3325,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
   function rememberWorkspace(url: string, root: string): void {
     if (!url || !root) return;
-    // Keyed by folder, not by URL: the agent prints a new token every start, and
+    // Keyed by folder, not by URL: the code-agent prints a new token every start, and
     // six entries for one folder is not a list of recent workspaces.
     const rest = loadRecents().filter((r) => r.root !== root);
     const next = [{ url, root, at: Date.now() }, ...rest].slice(0, MAX_RECENTS);
@@ -3292,59 +3343,59 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  and only the last one needs a text field. */
   function connectMenu(e: MouseEvent): void {
     const items: MenuItem[] = [];
-    if (agent.state === "online") {
-      const root = agent.info?.root ?? "";
+    if (codeAgent.state === "online") {
+      const root = codeAgent.info?.root ?? "";
       items.push({
         label: `Disconnect from ${folderName(root)}`,
         run: () => {
-          agent.disconnect();
-          report("agent", `disconnected from ${root || "the agent"}`);
+          codeAgent.disconnect();
+          report("code-agent", `disconnected from ${root || "the code-agent"}`);
         },
       });
     }
     for (const r of loadRecents()) {
-      if (agent.state === "online" && r.root === agent.info?.root) continue;
+      if (codeAgent.state === "online" && r.root === codeAgent.info?.root) continue;
       items.push({
         label: folderName(r.root),
         hint: ago(r.at),
-        separated: items.length === (agent.state === "online" ? 1 : 0),
+        separated: items.length === (codeAgent.state === "online" ? 1 : 0),
         run: () => void connectTo(r.url),
       });
     }
-    if (agent.state === "online") {
+    if (codeAgent.state === "online") {
       items.push({
-        label: "Open a different folder in this agent…",
+        label: "Open a different folder in this code-agent…",
         hint: "no restart",
         separated: items.length > 0,
         run: () => void changeRoot(),
       });
     }
-    items.push({ label: "Connect to another agent…", separated: items.length > 0, run: () => void connect() });
+    items.push({ label: "Connect to another code-agent…", separated: items.length > 0, run: () => void connect() });
     showMenu(e.clientX, e.clientY, items);
   }
 
-  /** Point the running agent at another folder.
+  /** Point the running code-agent at another folder.
    *
-   *  Switching projects used to mean stopping the agent and starting a second
+   *  Switching projects used to mean stopping the code-agent and starting a second
    *  one, which is a terminal round trip for something the editor can ask for.
-   *  The agent decides whether it may: by default only within the folder it was
+   *  The code-agent decides whether it may: by default only within the folder it was
    *  started on, and wider only where the person who started it said so with
    *  --allow-root. So this asks, and reports the refusal in those terms rather
    *  than pretending the path was wrong.
    */
   async function changeRoot(): Promise<void> {
-    const current = agent.info?.root ?? "";
+    const current = codeAgent.info?.root ?? "";
     const path = await modalPrompt({
       title: "Open a different folder",
-      hint: "An absolute path on the machine the agent runs on. The agent will refuse anything outside what it was allowed at startup (--allow-root).",
+      hint: "An absolute path on the machine the code-agent runs on. The code-agent will refuse anything outside what it was allowed at startup (--allow-root).",
       value: current,
       okLabel: "open",
     });
     if (!path || path === current) return;
     try {
-      const info = await agent.call<AgentInfo>("agent.setRoot", { path });
-      agent.info = info;
-      report("agent", `workspace is now ${info.root}`);
+      const info = await codeAgent.call<CodeAgentInfo>("code-agent.setRoot", { path });
+      codeAgent.info = info;
+      report("code-agent", `workspace is now ${info.root}`);
       // Everything on screen describes the old folder. The tabs are the only
       // part worth keeping a decision about, so they are closed the same way
       // disconnecting closes them — a buffer whose path means something else
@@ -3354,7 +3405,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       // restarts the watcher.
       await onOnline();
     } catch (e) {
-      reportError("agent.setRoot", e);
+      reportError("code-agent.setRoot", e);
     }
   }
 
@@ -3367,7 +3418,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     return `${Math.floor(d / 86400)}d ago`;
   }
 
-  /** An agent URL sitting on the clipboard, if there is one, if we are allowed
+  /** A code-agent URL sitting on the clipboard, if there is one, if we are allowed
    *  to look, and if the answer arrives quickly.
    *
    *  Strictly an optimisation. Reading the clipboard needs a permission the
@@ -3387,7 +3438,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       const read = navigator.clipboard.readText();
       const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), 500));
       const text = (await Promise.race([read, timeout]))?.trim();
-      return text && isAgentUrl(text) ? text : null;
+      return text && isCodeAgentUrl(text) ? text : null;
     } catch {
       return null;
     }
@@ -3396,16 +3447,16 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   async function connect(): Promise<void> {
     const fromClipboard = await clipboardUrl();
     const url = await modalPrompt({
-      title: "Local agent URL",
-      value: fromClipboard ?? agent.savedUrl(),
+      title: "Local code-agent URL",
+      value: fromClipboard ?? codeAgent.savedUrl(),
       placeholder: "ws://127.0.0.1:5001/ws?token=…",
-      // Masked by default: this URL carries the agent's token, and the dialog
+      // Masked by default: this URL carries the code-agent's token, and the dialog
       // is open precisely when someone is sharing a screen or pasting a
       // screenshot into a ticket. The eye shows it when the port needs reading.
       password: true,
       hint: fromClipboard
-        ? "Taken from your clipboard — the agent put it there when it started. It contains the agent's token, so it is hidden until you show it."
-        : "Run `enc-tool agent` in the folder you want to edit, then paste the URL it prints. It contains a token, so it is hidden until you show it.",
+        ? "Taken from your clipboard — the code-agent put it there when it started. It contains the code-agent's token, so it is hidden until you show it."
+        : "Run `enc-tool code-agent` in the folder you want to edit, then paste the URL it prints. It contains a token, so it is hidden until you show it.",
       okLabel: "connect",
     });
     if (!url) return;
@@ -3414,20 +3465,20 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
   // Paste anywhere on the tab to connect.
   //
-  // The agent copies its URL to the clipboard as it starts, so this is the
+  // The code-agent copies its URL to the clipboard as it starts, so this is the
   // other half of that: Ctrl+V, rather than open the dialog, clear the stale
   // URL, paste, confirm. Listening on the document because a paste fires at
   // whatever holds focus — usually <body> — and events bubble up, not down.
   //
   // Two guards keep it from stealing a paste that meant something else: it does
-  // nothing while an agent is connected, when a pasted URL is far more likely
+  // nothing while a code-agent is connected, when a pasted URL is far more likely
   // to be content the user is editing, and nothing when the caret is in a field
-  // or in the editor. Text that is not an agent URL is left alone regardless.
+  // or in the editor. Text that is not a code-agent URL is left alone regardless.
   document.addEventListener("paste", (e) => {
-    if (!host.classList.contains("active") || agent.state === "online") return;
+    if (!host.classList.contains("active") || codeAgent.state === "online") return;
     if ((e.target as HTMLElement | null)?.closest("input, textarea, [contenteditable=true]")) return;
     const text = e.clipboardData?.getData("text")?.trim();
-    if (!text || !isAgentUrl(text)) return;
+    if (!text || !isCodeAgentUrl(text)) return;
     e.preventDefault();
     void connectTo(text);
   });
@@ -3449,8 +3500,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
   // Only transitions matter: reconnect attempts fire repeatedly while offline.
   let wasOnline = false;
-  const onAgentState = (): void => {
-    const online = agent.state === "online";
+  const onCodeAgentState = (): void => {
+    const online = codeAgent.state === "online";
     if (online !== wasOnline) {
       wasOnline = online;
       if (online) void onOnline();
@@ -3461,7 +3512,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   };
   // Start in the empty state rather than an editable blank document.
   showEmptyEditor();
-  onAgentState();
+  onCodeAgentState();
 
   return {
     setTheme: (dark) => {
@@ -3470,6 +3521,6 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     },
     connect,
     focus: () => editor.focus(),
-    onAgentState,
+    onCodeAgentState,
   };
 }

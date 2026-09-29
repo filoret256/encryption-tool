@@ -1,4 +1,4 @@
-/** Prebuilt-agent distribution: `bun run download:smoke`.
+/** Prebuilt-code-agent distribution: `bun run download:smoke`.
  *
  *  Two things are checked here, and neither is cosmetic.
  *
@@ -17,10 +17,10 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync, inflateRawSync } from "node:zlib";
-import { iter } from "../src/agent/proc.ts";
+import { iter } from "../src/code-agent/proc.ts";
 import { pack } from "./archive.ts";
 import { VERSION } from "../src/version.ts";
-import { isAgentUrl } from "../src/web/code/agent.ts";
+import { isCodeAgentUrl } from "../src/web/code/code-agent.ts";
 
 const results: { name: string; ok: boolean; note: string }[] = [];
 function check(name: string, ok: boolean, note = ""): void {
@@ -39,11 +39,11 @@ const payload = new Uint8Array(200_000);
 for (let i = 0; i < payload.length; i++) payload[i] = (i * 2654435761) & 0xff;
 const noise = new Uint8Array(64_000);
 crypto.getRandomValues(noise);
-const text = new TextEncoder().encode("#!/bin/sh\nexec agent\n");
+const text = new TextEncoder().encode("#!/bin/sh\nexec code-agent\n");
 
 {
   const gz = pack("tar.gz", [
-    { name: "enc-tool-agent", data: payload, mode: 0o755 },
+    { name: "enc-tool-code-agent", data: payload, mode: 0o755 },
     { name: "README", data: text, mode: 0o644 },
   ]);
   const raw = new Uint8Array(gunzipSync(gz));
@@ -66,7 +66,7 @@ const text = new TextEncoder().encode("#!/bin/sh\nexec agent\n");
 
   check(
     "tar.gz: header, size, mode and checksum are well formed",
-    name === "enc-tool-agent" && mode === "0000755" && size === payload.length && magic === "ustar" && sum === stated,
+    name === "enc-tool-code-agent" && mode === "0000755" && size === payload.length && magic === "ustar" && sum === stated,
     `name=${name} mode=${mode} size=${size} magic=${magic} cksum ${sum === stated ? "matches" : `${sum} != ${stated}`}`,
   );
   check("tar.gz: the payload round-trips byte for byte", sha256(body) === sha256(payload), `${size} bytes`);
@@ -81,7 +81,7 @@ const text = new TextEncoder().encode("#!/bin/sh\nexec agent\n");
 }
 
 {
-  const z = pack("zip", [{ name: "enc-tool-agent.exe", data: payload }]);
+  const z = pack("zip", [{ name: "enc-tool-code-agent.exe", data: payload }]);
   const view = new DataView(z.buffer, z.byteOffset, z.byteLength);
   const sig = view.getUint32(0, true);
   const method = view.getUint16(8, true);
@@ -126,27 +126,29 @@ const text = new TextEncoder().encode("#!/bin/sh\nexec agent\n");
 const PORT = 5093;
 const MIRROR_PORT = 5094;
 const EMPTY_PORT = 5095;
-const dir = await mkdtemp(join(tmpdir(), "enc-agents-"));
-const empty = await mkdtemp(join(tmpdir(), "enc-agents-empty-"));
+const MANIFEST_PORT = 5290;
+const BARE_MANIFEST_PORT = 5390;
+const dir = await mkdtemp(join(tmpdir(), "enc-code-agents-"));
+const empty = await mkdtemp(join(tmpdir(), "enc-code-agents-empty-"));
 
-const archive = pack("tar.gz", [{ name: "enc-tool-agent", data: payload, mode: 0o755 }]);
-const file = `enc-tool-agent-${VERSION}-linux-x64.tar.gz`;
+const archive = pack("tar.gz", [{ name: "enc-tool-code-agent", data: payload, mode: 0o755 }]);
+const file = `enc-tool-code-agent-${VERSION}-linux-x64.tar.gz`;
 await writeFile(join(dir, file), archive);
 await writeFile(join(dir, "secret.txt"), "not for download\n");
 await writeFile(
-  join(dir, "agents.json"),
+  join(dir, "code-agents.json"),
   JSON.stringify({
     version: VERSION,
     builds: [
       {
         id: "linux-x64", os: "linux", arch: "x64", label: "Linux (x64)",
-        exe: "enc-tool-agent", kind: "tar.gz", file,
+        exe: "enc-tool-code-agent", kind: "tar.gz", file,
         size: archive.length, sha256: sha256(archive),
       },
       // Listed but absent: a partial mirror must not produce a broken link.
       {
         id: "windows-x64", os: "windows", arch: "x64", label: "Windows (x64)",
-        exe: "enc-tool-agent.exe", kind: "zip", file: `enc-tool-agent-${VERSION}-windows-x64.zip`,
+        exe: "enc-tool-code-agent.exe", kind: "zip", file: `enc-tool-code-agent-${VERSION}-windows-x64.zip`,
         size: 1, sha256: "00",
       },
     ],
@@ -174,10 +176,10 @@ async function serve(port: number, env: Record<string, string>): Promise<{ kill:
 
 const servers: { kill: () => void }[] = [];
 try {
-  servers.push(await serve(PORT, { AGENT_DIR: dir }));
+  servers.push(await serve(PORT, { CODE_AGENT_DIR: dir }));
   const base = `http://127.0.0.1:${PORT}`;
 
-  const listing = (await fetch(`${base}/agent/downloads`).then((r) => r.json())) as {
+  const listing = (await fetch(`${base}/code-agent/downloads`).then((r) => r.json())) as {
     version: string;
     builds: Build[];
   };
@@ -188,7 +190,7 @@ try {
   );
   check(
     "a local build points at this server",
-    listing.builds[0]?.url === `/agent/download/${file}`,
+    listing.builds[0]?.url === `/code-agent/download/${file}`,
     listing.builds[0]?.url ?? "no build",
   );
 
@@ -215,13 +217,13 @@ try {
     "%2E%2E%2F%2E%2E%2Fpackage.json",
     "..%2Fsecret.txt",
     "%2Fetc%2Fpasswd",
-    "agents.json",
+    "code-agents.json",
     "secret.txt",
-    `enc-tool-agent-${VERSION}-windows-x64.zip`,
+    `enc-tool-code-agent-${VERSION}-windows-x64.zip`,
   ];
   const leaked: string[] = [];
   for (const name of escapes) {
-    const r = await fetch(`${base}/agent/download/${name}`);
+    const r = await fetch(`${base}/code-agent/download/${name}`);
     if (r.ok) leaked.push(name);
     await r.arrayBuffer();
   }
@@ -232,24 +234,56 @@ try {
   );
 
   // ── a mirror instead of local files ──
-  servers.push(await serve(MIRROR_PORT, { AGENT_DIR: empty, AGENT_DOWNLOAD_BASE: "https://cdn.example.com/agents/" }));
-  const mirrored = (await fetch(`http://127.0.0.1:${MIRROR_PORT}/agent/downloads`).then((r) => r.json())) as {
+  servers.push(await serve(MIRROR_PORT, { CODE_AGENT_DIR: empty, CODE_AGENT_DOWNLOAD_BASE: "https://cdn.example.com/code-agents/" }));
+  const mirrored = (await fetch(`http://127.0.0.1:${MIRROR_PORT}/code-agent/downloads`).then((r) => r.json())) as {
     builds: Build[];
   };
   check(
     "a mirror is advertised for every known platform",
     mirrored.builds.length === 5 &&
-      mirrored.builds.every((b) => b.url.startsWith("https://cdn.example.com/agents/enc-tool-agent-")) &&
+      mirrored.builds.every((b) => b.url.startsWith("https://cdn.example.com/code-agents/enc-tool-code-agent-")) &&
       mirrored.builds.every((b) => b.sha256 === undefined),
     `${mirrored.builds.length} builds, trailing slash trimmed, no checksums claimed for files we have not seen`,
   );
-  const denied = await fetch(`http://127.0.0.1:${MIRROR_PORT}/agent/download/${file}`);
+  const denied = await fetch(`http://127.0.0.1:${MIRROR_PORT}/code-agent/download/${file}`);
   await denied.arrayBuffer();
   check("a mirror configuration serves no local files", denied.status === 404, `status ${denied.status}`);
 
+  // ── a manifest without archives, and a mirror ──
+  //
+  // The image carries the checksums and the mirror carries the files. What
+  // matters is where the checksum comes from: the build that made the image, not
+  // the host serving the download, so the mirror cannot vouch for itself.
+  const manifestOnly = await mkdtemp(join(tmpdir(), "enc-code-agents-manifest-"));
+  await writeFile(join(manifestOnly, "code-agents.json"), await Bun.file(join(dir, "code-agents.json")).text());
+  servers.push(await serve(MANIFEST_PORT, { CODE_AGENT_DIR: manifestOnly, CODE_AGENT_DOWNLOAD_BASE: "https://cdn.example.com/code-agents" }));
+  const vouched = (await fetch(`http://127.0.0.1:${MANIFEST_PORT}/code-agent/downloads`).then((r) => r.json())) as {
+    builds: Build[];
+  };
+  const linux = vouched.builds.find((b) => b.id === "linux-x64");
+  check(
+    "a manifest with a mirror lists its builds with the manifest's checksums",
+    vouched.builds.length === 2 &&
+      linux?.sha256 === sha256(archive) &&
+      linux?.size === archive.length &&
+      vouched.builds.every((b) => b.url === `https://cdn.example.com/code-agents/${b.file}`),
+    `${vouched.builds.length} builds, links to the mirror, sha256 and size from code-agents.json`,
+  );
+  const stillDenied = await fetch(`http://127.0.0.1:${MANIFEST_PORT}/code-agent/download/${file}`);
+  await stillDenied.arrayBuffer();
+  check("and still serves no local files", stillDenied.status === 404, `status ${stillDenied.status}`);
+  // Without a mirror the same directory lists nothing: a link to a file that is
+  // not there is worse than no link.
+  servers.push(await serve(BARE_MANIFEST_PORT, { CODE_AGENT_DIR: manifestOnly }));
+  const unlinked = (await fetch(`http://127.0.0.1:${BARE_MANIFEST_PORT}/code-agent/downloads`).then((r) => r.json())) as {
+    builds: Build[];
+  };
+  check("a manifest with no archives and no mirror lists nothing", unlinked.builds.length === 0, `${unlinked.builds.length} builds`);
+  await rm(manifestOnly, { recursive: true, force: true });
+
   // ── nothing published at all ──
-  servers.push(await serve(EMPTY_PORT, { AGENT_DIR: empty }));
-  const none = (await fetch(`http://127.0.0.1:${EMPTY_PORT}/agent/downloads`).then((r) => r.json())) as {
+  servers.push(await serve(EMPTY_PORT, { CODE_AGENT_DIR: empty }));
+  const none = (await fetch(`http://127.0.0.1:${EMPTY_PORT}/code-agent/downloads`).then((r) => r.json())) as {
     builds: Build[];
   };
   check(
@@ -267,8 +301,8 @@ try {
   const ALLOWED = "https://tool.example.test";
   const FOREIGN = "https://evil.example.test";
 
-  const startAgent = async (port: number, extra: string[], env: Record<string, string> = {}): Promise<() => void> => {
-    const proc = Bun.spawn(["bun", "src/agent/cli.ts", ...extra, "--port", String(port), "--token", "smoke"], {
+  const startCodeAgent = async (port: number, extra: string[], env: Record<string, string> = {}): Promise<() => void> => {
+    const proc = Bun.spawn(["bun", "src/code-agent/cli.ts", ...extra, "--port", String(port), "--token", "smoke"], {
       cwd: process.cwd(),
       env: { ...process.env, ...env },
       stdout: "pipe",
@@ -284,8 +318,8 @@ try {
     return () => proc.kill();
   };
 
-  const stopFlag = await startAgent(5096, ["--root", dir, "--allow-origin", ALLOWED]);
-  const stopEnv = await startAgent(5097, ["--root", dir], {
+  const stopFlag = await startCodeAgent(5096, ["--root", dir, "--allow-origin", ALLOWED]);
+  const stopEnv = await startCodeAgent(5097, ["--root", dir], {
     ENC_TOOL_ALLOW_ORIGIN: `${ALLOWED}/, https://second.example.test`,
   });
   try {
@@ -302,7 +336,7 @@ try {
     const otherLocal = await at(5096, "/ping", "http://localhost:9999");
     await Promise.all([allowed.text(), foreign.text(), appPort.text(), otherLocal.text()]);
     check(
-      "the agent answers the allowed origin and refuses others",
+      "the code-agent answers the allowed origin and refuses others",
       allowed.status === 200 && foreign.status === 403 && appPort.status === 200 && otherLocal.status === 403,
       `allowed ${allowed.status}, foreign ${foreign.status}, app port ${appPort.status}, other local port ${otherLocal.status}`,
     );
@@ -317,13 +351,13 @@ try {
     // app. It used to be the way past the check entirely.
     const noOrigin = await fetch("http://127.0.0.1:5096/ping");
     await noOrigin.text();
-    const stopOpenAgent = await startAgent(5092, ["--root", dir, "--allow-no-origin"]);
+    const stopOpenCodeAgent = await startCodeAgent(5092, ["--root", dir, "--allow-no-origin"]);
     let withFlag: Response;
     try {
       withFlag = await fetch("http://127.0.0.1:5092/ping");
       await withFlag.text();
     } finally {
-      stopOpenAgent();
+      stopOpenCodeAgent();
     }
     check(
       "a client sending no Origin is refused unless the flag says otherwise",
@@ -350,8 +384,8 @@ try {
         });
       });
 
-    const stopLocked = await startAgent(5090, ["--root", dir, "--allow-origin", ALLOWED]);
-    const stopShared = await startAgent(5089, ["--root", dir, "--allow-origin", ALLOWED, "--allow-multiple"]);
+    const stopLocked = await startCodeAgent(5090, ["--root", dir, "--allow-origin", ALLOWED]);
+    const stopShared = await startCodeAgent(5089, ["--root", dir, "--allow-origin", ALLOWED, "--allow-multiple"]);
     let lockResult = "";
     let sharedResult = "";
     try {
@@ -372,7 +406,7 @@ try {
       if (typeof secondShared !== "string") secondShared.close();
 
       check(
-        "the agent serves one client at a time, and --allow-multiple lifts it",
+        "the code-agent serves one client at a time, and --allow-multiple lifts it",
         lockResult === "refused" && reclaimed === "CONNECTED" && sharedResult === "CONNECTED",
         `second client ${lockResult}, after release ${reclaimed}, with --allow-multiple ${sharedResult}`,
       );
@@ -429,20 +463,20 @@ try {
     );
     // ── 4. the folder argument the panel now hands out ──
     //
-    // The instructions say `./enc-tool-agent <folder>`, so one binary can serve
+    // The instructions say `./enc-tool-code-agent <folder>`, so one binary can serve
     // every repository. That path has to work, and getting it wrong must not
     // quietly fall back to exposing the current directory instead.
-    const stopPositional = await startAgent(5098, [dir, "--allow-origin", ALLOWED]);
+    const stopPositional = await startCodeAgent(5098, [dir, "--allow-origin", ALLOWED]);
     try {
       const info = await at(5098, "/ping", ALLOWED);
       await info.text();
-      check("the folder can be passed as the first argument", info.status === 200, `agent up on the folder named by argument, not by cwd`);
+      check("the folder can be passed as the first argument", info.status === 200, `code-agent up on the folder named by argument, not by cwd`);
     } finally {
       stopPositional();
     }
 
     const runCli = async (args: string[]): Promise<{ code: number; out: string }> => {
-      const p = Bun.spawn(["bun", "src/agent/cli.ts", ...args], {
+      const p = Bun.spawn(["bun", "src/code-agent/cli.ts", ...args], {
         cwd: process.cwd(),
         stdout: "pipe",
         stderr: "pipe",
@@ -459,12 +493,12 @@ try {
       "a mistyped option or a folder given twice is refused, not guessed",
       typo.code === 2 && /unknown option/.test(typo.out) &&
         twice.code === 2 && twicePositional.code === 2 && /given twice/.test(twice.out),
-      "otherwise the agent would silently expose the current directory",
+      "otherwise the code-agent would silently expose the current directory",
     );
 
     // ── 5. getting the URL out of the terminal ──
     //
-    // The agent copies its URL to the clipboard as it starts, because the token
+    // The code-agent copies its URL to the clipboard as it starts, because the token
     // is new every run and that line would otherwise be selected by hand every
     // time. --no-clipboard has to be a real flag rather than an unknown option,
     // and the URL has to keep being printed either way — the clipboard is the
@@ -479,7 +513,7 @@ try {
     // Piped output is not a terminal, so nothing here touches the developer's
     // clipboard — which is also what keeps the smoke suites from stomping it.
     const banner = await new Promise<string>((resolve) => {
-      const p = Bun.spawn(["bun", "src/agent/cli.ts", dir, "--port", "5091"], {
+      const p = Bun.spawn(["bun", "src/code-agent/cli.ts", dir, "--port", "5091"], {
         cwd: process.cwd(),
         stdout: "pipe",
         stderr: "ignore",
@@ -515,15 +549,15 @@ try {
     const bad = [
       "ws://evil.example/ws?token=abc123", // not loopback
       "ws://127.0.0.1:5001/ws", // no token
-      "ws://127.0.0.1:5001/other?token=abc", // not the agent's path
+      "ws://127.0.0.1:5001/other?token=abc", // not the code-agent's path
       "http://127.0.0.1:5001/ws?token=abc", // not a socket
       "ws://127.0.0.1.evil.example/ws?token=a", // loopback as a prefix only
       "not a url at all",
       "",
     ];
     check(
-      "the auto-connect matcher accepts the agent's URL and nothing else",
-      good.every((u) => isAgentUrl(u)) && bad.every((u) => !isAgentUrl(u)),
+      "the auto-connect matcher accepts the code-agent's URL and nothing else",
+      good.every((u) => isCodeAgentUrl(u)) && bad.every((u) => !isCodeAgentUrl(u)),
       `${good.length} accepted, ${bad.length} rejected`,
     );
   } finally {

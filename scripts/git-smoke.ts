@@ -9,10 +9,10 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Text } from "@codemirror/state";
-import { git, startAgent, type Harness } from "./harness.ts";
+import { git, startCodeAgent, type Harness } from "./harness.ts";
 import { findConflicts } from "../src/web/code/conflicts.ts";
 import { hunkPatches } from "../src/web/code/hunkpatch.ts";
-import type { Branch, Commit, CommitDetail, DiffPair, FileRead, GitStatus } from "../src/agent/protocol.ts";
+import type { Branch, Commit, CommitDetail, DiffPair, FileRead, GitStatus } from "../src/code-agent/protocol.ts";
 
 const PORT = 5097;
 const results: { name: string; ok: boolean; note: string }[] = [];
@@ -47,7 +47,7 @@ await w("notes.txt", "untracked scratch\n");
 
 let h: Harness | null = null;
 try {
-  h = await startAgent(root, PORT);
+  h = await startCodeAgent(root, PORT);
   const call = h.call.bind(h);
 
   // ── status: the four groups the panel renders ──
@@ -208,7 +208,7 @@ try {
   //
   // hunkPatches() writes unified diffs by hand, and the only opinion that
   // counts about a unified diff is git's. So every case below is applied for
-  // real, through the agent, and the index is read back: a patch git rejects
+  // real, through the code-agent, and the index is read back: a patch git rejects
   // fails here rather than in front of someone trying to stage line 40.
   //
   // The reverse direction is checked with the same patch, because unstaging is

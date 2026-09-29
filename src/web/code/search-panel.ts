@@ -1,13 +1,13 @@
 /** Project-wide search and replace.
  *
- *  The scan itself happens in the agent (ripgrep when present, a `git ls-files`
+ *  The scan itself happens in the code-agent (ripgrep when present, a `git ls-files`
  *  walk otherwise) and streams back hit by hit, so results fill in instead of
  *  arriving all at once at the end. Replace is done here rather than in the
- *  agent because it has to respect which individual matches the user dismissed,
+ *  code-agent because it has to respect which individual matches the user dismissed,
  *  which only the result list knows.
  */
-import type { AgentClient } from "./agent.ts";
-import type { FileRead, SearchHit, SearchSummary } from "../../agent/protocol.ts";
+import type { CodeAgentClient } from "./code-agent.ts";
+import type { FileRead, SearchHit, SearchSummary } from "../../code-agent/protocol.ts";
 import { VirtualList } from "./vlist.ts";
 import { esc, modalConfirm, showMenu } from "./ui.ts";
 import { iconClose, iconReplace } from "./icons.ts";
@@ -93,7 +93,7 @@ export class SearchPanel {
   private rows: Row[] = [];
   /** Where F4 is in the result list. */
   private at = -1;
-  /** The last summary from the agent, kept so the line can be recomputed as
+  /** The last summary from the code-agent, kept so the line can be recomputed as
    *  matches are dismissed — it used to keep claiming the original number
    *  after half the hits had been waved away. */
   private summary: SearchSummary | null = null;
@@ -112,7 +112,7 @@ export class SearchPanel {
 
   constructor(
     private readonly host: HTMLElement,
-    private readonly agent: AgentClient,
+    private readonly codeAgent: CodeAgentClient,
     private readonly cb: SearchCallbacks,
   ) {
     host.classList.add("sp");
@@ -235,15 +235,15 @@ export class SearchPanel {
     if (this.debounce) clearTimeout(this.debounce);
     const query = this.$<HTMLInputElement>(".js-query").value;
 
-    // Supersede whatever is still scanning; the agent stops it at the next hit.
-    if (this.activeId) void this.agent.call("cancel", { target: this.activeId }).catch(() => undefined);
+    // Supersede whatever is still scanning; the code-agent stops it at the next hit.
+    if (this.activeId) void this.codeAgent.call("cancel", { target: this.activeId }).catch(() => undefined);
     this.results.clear();
     this.dismissed.clear();
     this.matches = 0;
     this.rebuild();
 
-    if (!query || this.agent.state !== "online") {
-      this.setSummary(query ? "agent is not connected" : "");
+    if (!query || this.codeAgent.state !== "online") {
+      this.setSummary(query ? "code-agent is not connected" : "");
       return;
     }
     if (this.opts.regex && !isValidRegex(query, this.opts)) {
@@ -256,7 +256,7 @@ export class SearchPanel {
     // regular expression does not end up in the list.
     rememberQuery(query);
 
-    const { id, promise } = this.agent.callTracked<SearchSummary>(
+    const { id, promise } = this.codeAgent.callTracked<SearchSummary>(
       "search",
       {
         query,
@@ -313,7 +313,7 @@ export class SearchPanel {
 
   /** The count as it stands now.
    *
-   *  Counted off the rows rather than off the agent's total, so dismissing a
+   *  Counted off the rows rather than off the code-agent's total, so dismissing a
    *  match changes the number. Reporting what the scan found while the list
    *  shows something else is the summary disagreeing with the thing it
    *  summarises; the scan's own total is still named when the two differ, since
@@ -445,7 +445,7 @@ export class SearchPanel {
     for (const [path, hits] of live) {
       if (this.cancelReplace) break;
       try {
-        const file = await this.agent.call<FileRead>("fs.read", { path });
+        const file = await this.codeAgent.call<FileRead>("fs.read", { path });
         if (file.text === null) {
           skipped += hits.length;
           continue;
@@ -471,7 +471,7 @@ export class SearchPanel {
         }
 
         if (touched) {
-          await this.agent.call("fs.write", { path, text: parts.join("") });
+          await this.codeAgent.call("fs.write", { path, text: parts.join("") });
           files++;
           done += touched;
           written.push(`${path} — ${touched}`);
@@ -541,7 +541,7 @@ function renderReplacement(
   return rep;
 }
 
-/** The regex source the agent searched with, rebuilt here so replace behaves
+/** The regex source the code-agent searched with, rebuilt here so replace behaves
  *  identically to the scan. */
 export function patternSource(query: string, o: Options): string {
   const src = o.regex ? query : escapeRe(query);

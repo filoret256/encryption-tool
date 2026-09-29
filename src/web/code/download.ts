@@ -1,10 +1,10 @@
-/** "Get the agent" panel.
+/** "Get the code-agent" panel.
  *
  *  The code tab is the only part of the app that needs a process on the user's
  *  own machine, and the app itself usually runs in a container where no such
- *  process can exist. So the deployment ships cross-compiled agents and this
+ *  process can exist. So the deployment ships cross-compiled code-agents and this
  *  panel hands the right one over: the archive for the detected platform, the
- *  exact command to run it against *this* origin, and the checksum — the agent
+ *  exact command to run it against *this* origin, and the checksum — the code-agent
  *  gets filesystem access, so being able to verify what you downloaded is not
  *  a nicety.
  *
@@ -65,7 +65,7 @@ async function guessTarget(): Promise<string> {
 
 const mb = (n: number): string => `${(n / 1048576).toFixed(0)} MB`;
 
-/** The two lines that get someone from a downloaded archive to a running agent,
+/** The two lines that get someone from a downloaded archive to a running code-agent,
  *  with this page's origin already filled in.
  *
  *  The project folder is passed as an argument rather than reached with `cd`,
@@ -73,7 +73,7 @@ const mb = (n: number): string => `${(n / 1048576).toFixed(0)} MB`;
  *  into each. Forward slashes throughout: PowerShell accepts them too, so one
  *  shape of path works on all three platforms. */
 function commands(b: Build, origin: string): string {
-  // Loopback origins are allowed unconditionally by the agent, so the flag
+  // Loopback origins are allowed unconditionally by the code-agent, so the flag
   // would be noise when the app is served from localhost.
   const local = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|$)/.test(origin);
   const allow = local ? "" : ` --allow-origin ${origin}`;
@@ -89,7 +89,7 @@ function commands(b: Build, origin: string): string {
 function caveat(b: Build): string {
   switch (b.os) {
     case "macos":
-      return "Unpacking with <code>tar</code> in Terminal keeps macOS from quarantining the binary. Extract it in Finder instead and you will need <code>xattr -d com.apple.quarantine ./enc-tool-agent</code> first.";
+      return "Unpacking with <code>tar</code> in Terminal keeps macOS from quarantining the binary. Extract it in Finder instead and you will need <code>xattr -d com.apple.quarantine ./enc-tool-code-agent</code> first.";
     case "windows":
       return "The binary is unsigned, so SmartScreen may warn on first run. Starting it from a terminal, as above, avoids the prompt.";
     default:
@@ -97,24 +97,24 @@ function caveat(b: Build): string {
   }
 }
 
-export interface AgentDownload {
+export interface CodeAgentDownload {
   /** Called on every tab switch; the manifest is fetched on the first reveal. */
   setVisible(visible: boolean): void;
   /** Open the download popover from somewhere else — the code tab's first
-   *  screen, which is where someone without an agent actually is. */
+   *  screen, which is where someone without a code-agent actually is. */
   open(): void;
 }
 
-export function mountAgentDownload(host: HTMLElement): AgentDownload {
-  host.className = "agent-dl";
+export function mountCodeAgentDownload(host: HTMLElement): CodeAgentDownload {
+  host.className = "code-agent-dl";
   host.hidden = true;
   host.innerHTML = `
-    <button class="agent-dl-chip" type="button" aria-haspopup="dialog" aria-expanded="false"
-            title="Download the local agent for your machine">⤓ get agent</button>
-    <div class="agent-dl-pop" hidden></div>`;
+    <button class="code-agent-dl-chip" type="button" aria-haspopup="dialog" aria-expanded="false"
+            title="Download the local code-agent for your machine">⤓ get code-agent</button>
+    <div class="code-agent-dl-pop" hidden></div>`;
 
-  const chip = host.querySelector<HTMLButtonElement>(".agent-dl-chip")!;
-  const pop = host.querySelector<HTMLElement>(".agent-dl-pop")!;
+  const chip = host.querySelector<HTMLButtonElement>(".code-agent-dl-chip")!;
+  const pop = host.querySelector<HTMLElement>(".code-agent-dl-pop")!;
 
   let manifest: Manifest | null = null;
   let loading: Promise<void> | null = null;
@@ -150,7 +150,7 @@ export function mountAgentDownload(host: HTMLElement): AgentDownload {
   function load(): Promise<void> {
     return (loading ??= (async () => {
       try {
-        const res = await fetch("/agent/downloads");
+        const res = await fetch("/code-agent/downloads");
         if (!res.ok) throw new Error(String(res.status));
         manifest = (await res.json()) as Manifest;
       } catch {
@@ -169,54 +169,54 @@ export function mountAgentDownload(host: HTMLElement): AgentDownload {
     const builds = manifest?.builds ?? [];
     const build = builds.find((b) => b.id === selected);
     if (!build) {
-      pop.innerHTML = `<div class="agent-dl-head">No prebuilt agents are published here.</div>
-        <p class="agent-dl-note">Run <code>bun run agent</code> from a checkout instead.</p>`;
+      pop.innerHTML = `<div class="code-agent-dl-head">No prebuilt code-agents are published here.</div>
+        <p class="code-agent-dl-note">Run <code>bun run code-agent</code> from a checkout instead.</p>`;
       return;
     }
 
     const others = builds.filter((b) => b.id !== build.id);
     pop.innerHTML = `
-      <div class="agent-dl-head">Run the agent on your machine</div>
-      <p class="agent-dl-note">The editor needs a small process next to your files — this page cannot
+      <div class="code-agent-dl-head">Run the code-agent on your machine</div>
+      <p class="code-agent-dl-note">The editor needs a small process next to your files — this page cannot
         open folders or run <code>git</code> on its own.</p>
-      <a class="t-btn t-btn-primary agent-dl-get" href="${esc(build.url)}">⤓ ${esc(build.label)}${
+      <a class="t-btn t-btn-primary code-agent-dl-get" href="${esc(build.url)}">⤓ ${esc(build.label)}${
         build.size ? ` · ${mb(build.size)}` : ""
       }</a>
       ${
         others.length
-          ? `<div class="agent-dl-others">${others
+          ? `<div class="code-agent-dl-others">${others
               .map((b) => `<button type="button" data-id="${esc(b.id)}">${esc(b.label)}</button>`)
               .join("")}</div>`
           : ""
       }
-      <div class="agent-dl-steps">
-        <div class="agent-dl-steps-head">
+      <div class="code-agent-dl-steps">
+        <div class="code-agent-dl-steps-head">
           <span>then, in a terminal</span>
-          <button type="button" class="t-btn agent-dl-copy">copy</button>
+          <button type="button" class="t-btn code-agent-dl-copy">copy</button>
         </div>
         <pre>${esc(commands(build, location.origin))}</pre>
       </div>
-      <p class="agent-dl-note">${caveat(build)}</p>
+      <p class="code-agent-dl-note">${caveat(build)}</p>
       ${
         build.sha256
-          ? `<div class="agent-dl-sum" title="${esc(build.sha256)}"><span>sha256</span>
+          ? `<div class="code-agent-dl-sum" title="${esc(build.sha256)}"><span>sha256</span>
              <code>${esc(build.sha256.slice(0, 16))}…</code>
-             <button type="button" class="t-btn agent-dl-copy-sum">copy</button></div>`
+             <button type="button" class="t-btn code-agent-dl-copy-sum">copy</button></div>`
           : ""
       }
-      <p class="agent-dl-note">Paste the <code>ws://127.0.0.1…</code> URL it prints into
+      <p class="code-agent-dl-note">Paste the <code>ws://127.0.0.1…</code> URL it prints into
         <b>connect…</b> above.</p>`;
 
-    for (const b of pop.querySelectorAll<HTMLButtonElement>(".agent-dl-others button")) {
+    for (const b of pop.querySelectorAll<HTMLButtonElement>(".code-agent-dl-others button")) {
       b.addEventListener("click", () => {
         selected = b.dataset.id!;
         render();
       });
     }
-    pop.querySelector(".agent-dl-copy")?.addEventListener("click", (e) => {
+    pop.querySelector(".code-agent-dl-copy")?.addEventListener("click", (e) => {
       void copy(commands(build, location.origin), e.currentTarget as HTMLElement);
     });
-    pop.querySelector(".agent-dl-copy-sum")?.addEventListener("click", (e) => {
+    pop.querySelector(".code-agent-dl-copy-sum")?.addEventListener("click", (e) => {
       void copy(build.sha256 ?? "", e.currentTarget as HTMLElement);
     });
   }

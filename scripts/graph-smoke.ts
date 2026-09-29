@@ -9,9 +9,9 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { git, startAgent, type Harness } from "./harness.ts";
+import { git, startCodeAgent, type Harness } from "./harness.ts";
 import { computeGraph, continuationSvg, laneSvg, type GraphRow } from "../src/web/code/graph.ts";
-import type { Commit } from "../src/agent/protocol.ts";
+import type { Commit } from "../src/code-agent/protocol.ts";
 
 const PORT = 5096;
 const results: { name: string; ok: boolean; note: string }[] = [];
@@ -58,7 +58,7 @@ await git(root, "checkout", "-q", "main");
 
 let h: Harness | null = null;
 try {
-  h = await startAgent(root, PORT);
+  h = await startCodeAgent(root, PORT);
   const commits = await h.call<Commit[]>("git.log", { all: true, limit: 100 });
   const rows = computeGraph(commits);
 

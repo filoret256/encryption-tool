@@ -1,15 +1,15 @@
 /** Project search and replace: `bun run search:smoke`.
  *
- *  Covers the agent side (streaming hits, the four modifiers, globs,
+ *  Covers the code-agent side (streaming hits, the four modifiers, globs,
  *  cancellation) and the pure parts of the client side (preserve case, and the
  *  per-line replacement that `Replace all` is built on).
  */
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { git, startAgent, type Harness } from "./harness.ts";
+import { git, startCodeAgent, type Harness } from "./harness.ts";
 import { patternSource, preserveCase, replaceInLine } from "../src/web/code/search-panel.ts";
-import type { SearchHit, SearchSummary } from "../src/agent/protocol.ts";
+import type { SearchHit, SearchSummary } from "../src/code-agent/protocol.ts";
 
 const PORT = 5095;
 const results: { name: string; ok: boolean; note: string }[] = [];
@@ -46,7 +46,7 @@ type Search = { hits: SearchHit[]; summary: SearchSummary };
 
 let h: Harness | null = null;
 try {
-  h = await startAgent(root, PORT);
+  h = await startCodeAgent(root, PORT);
 
   const run = async (params: Record<string, unknown>): Promise<Search> => {
     const call = h!.call<SearchSummary>("search", {
@@ -119,7 +119,7 @@ try {
   );
 
   // ── the two engines must agree ──
-  // Start a second agent with ripgrep filtered out of PATH so it falls back to
+  // Start a second code-agent with ripgrep filtered out of PATH so it falls back to
   // the `git ls-files` walk, then compare the two result sets hit for hit.
   // Skipped, loudly, when ripgrep is not installed — there is nothing to compare
   // against and the rest of the suite must still run anywhere.
@@ -130,7 +130,7 @@ try {
       .split(";")
       .filter((dir) => !/ripgrep/i.test(dir))
       .join(";");
-    const other = await startAgent(root, PORT + 1, {
+    const other = await startCodeAgent(root, PORT + 1, {
       ...(process.env as Record<string, string>),
       PATH: strippedPath,
       Path: strippedPath, // Windows env keys are case-insensitive; Bun's map is not

@@ -6,9 +6,9 @@ import { yamlDiagnostics } from "./yaml-lint.ts";
 import { prefersDark, rememberTheme, watchSystemTheme } from "./theme.ts";
 import { mountNotifier, type Notice } from "./notify.ts";
 import { ansible, helm } from "../crypto/index.ts";
-import { AgentClient } from "./code/agent.ts";
+import { CodeAgentClient } from "./code/code-agent.ts";
 import { mountBadge } from "./code/caps.ts";
-import { mountAgentDownload, type AgentDownload } from "./code/download.ts";
+import { mountCodeAgentDownload, type CodeAgentDownload } from "./code/download.ts";
 import type { CodeTab } from "./code.ts";
 
 /** The code tab is not a crypto tab — it has its own layout and no editor in
@@ -20,12 +20,12 @@ const editors = {} as Record<Tab, TabEditor>;
 let currentTab: AnyTab = "ansible";
 let isDark = false;
 
-// The agent client lives in the main bundle so the capability badge is correct
+// The code-agent client lives in the main bundle so the capability badge is correct
 // from first paint, before the code chunk is ever fetched.
-const agent = new AgentClient(() => onAgentState());
+const codeAgent = new CodeAgentClient(() => onCodeAgentState());
 let codeTab: CodeTab | null = null;
 let refreshBadge: (() => void) | null = null;
-let agentDownload: AgentDownload | null = null;
+let codeAgentDownload: CodeAgentDownload | null = null;
 
 // ── Notifications ──
 // A stack, not a slot: see notify.ts for why an error may not expire on a
@@ -43,10 +43,10 @@ function notify(notice: Notice): void {
 }
 
 // ── Crypto ──
-// Runs here on WebCrypto rather than over the /helm/* and /ansible/* endpoints.
+// Runs here on WebCrypto; the server has no crypto endpoints.
 // Two reasons: the password never leaves this machine, and the crypto tabs keep
 // working with no network at all, which is what makes the installed app
-// genuinely offline. The endpoints stay for API clients.
+// genuinely offline.
 const SCHEMES: Record<Tab, { encrypt(text: string, password: string): Promise<string>; decrypt(text: string, password: string): Promise<string> }> = {
   ansible,
   helm,
@@ -236,10 +236,10 @@ function switchTab(tab: AnyTab): void {
     document.getElementById(`${t}-tab`)!.classList.toggle("active", t === tab);
     document.querySelector(`.tab-${t}`)!.classList.toggle("active", t === tab);
   }
-  // Nothing but the editor needs a local agent, so the download button and the
+  // Nothing but the editor needs a local code-agent, so the download button and the
   // capability badge only appear where they mean something.
   document.getElementById("code-tools")!.hidden = tab !== "code";
-  agentDownload?.setVisible(tab === "code");
+  codeAgentDownload?.setVisible(tab === "code");
   if (tab === "code") {
     void openCodeTab();
     return;
@@ -249,9 +249,9 @@ function switchTab(tab: AnyTab): void {
 }
 
 // ── Code tab (lazily loaded chunk) ──
-function onAgentState(): void {
+function onCodeAgentState(): void {
   refreshBadge?.();
-  codeTab?.onAgentState();
+  codeTab?.onCodeAgentState();
 }
 
 async function openCodeTab(): Promise<void> {
@@ -264,13 +264,13 @@ async function openCodeTab(): Promise<void> {
       const url = "/public/code.js";
       const mod = (await import(url)) as typeof import("./code.ts");
       codeTab = mod.mountCodeTab(host, {
-        agent,
+        codeAgent,
         isDark: () => isDark,
         notify,
         dismissNotices: () => notifier.dismissAll(),
         dismissScope: (scope) => notifier.dismissScope(scope),
         onCapsChanged: () => refreshBadge?.(),
-      getAgent: () => agentDownload?.open(),
+      getCodeAgent: () => codeAgentDownload?.open(),
       });
       codeTab.setTheme(isDark);
     } catch (e) {
@@ -421,13 +421,13 @@ function init(): void {
     refreshBadge?.();
   });
 
-  agentDownload = mountAgentDownload(document.getElementById("agent-dl")!);
+  codeAgentDownload = mountCodeAgentDownload(document.getElementById("code-agent-dl")!);
 
-  // The badge reports on the local agent, so it sits with the code tab's tools
+  // The badge reports on the local code-agent, so it sits with the code tab's tools
   // rather than in the header's right-hand group.
   refreshBadge = mountBadge(
     document.getElementById("cap-badge")!,
-    agent,
+    codeAgent,
     async () => {
       switchTab("code");
       await openCodeTab();
@@ -448,10 +448,10 @@ function init(): void {
   refreshBadge();
   void registerServiceWorker();
 
-  // Reconnect to the agent the user last used. Failure is silent — the badge
+  // Reconnect to the code-agent the user last used. Failure is silent — the badge
   // already reports it, and a crypto-only visitor should see no error.
-  const saved = agent.savedUrl();
-  if (saved) void agent.connect(saved).catch(() => undefined);
+  const saved = codeAgent.savedUrl();
+  if (saved) void codeAgent.connect(saved).catch(() => undefined);
 
   // Bind data-action buttons declaratively (index.html uses data-* attrs, no inline JS).
   document.querySelectorAll<HTMLElement>("[data-action]").forEach((el) => {

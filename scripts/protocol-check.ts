@@ -1,10 +1,10 @@
-/** Guard against the two agents' wire types drifting apart:
+/** Guard against the two code-agents' wire types drifting apart:
  *  `bun run protocol:check`.
  *
- *  src/agent/protocol.ts is the definition the browser is compiled against;
- *  agent-go/protocol.go is a hand-written mirror of it. Nothing in either
+ *  src/code-agent/protocol.ts is the definition the browser is compiled against;
+ *  code-agent-go/protocol.go is a hand-written mirror of it. Nothing in either
  *  language can notice when one gains a field and the other does not — the
- *  symptom is a panel that renders blank against one agent and fills in against
+ *  symptom is a panel that renders blank against one code-agent and fills in against
  *  the other, which is a miserable thing to debug months later.
  *
  *  So the field names are compared here, per type, and a difference fails the
@@ -14,10 +14,10 @@
  */
 import { readFile } from "node:fs/promises";
 
-const TS_FILE = "src/agent/protocol.ts";
-const GO_FILE = "agent-go/protocol.go";
+const TS_FILE = "src/code-agent/protocol.ts";
+const GO_FILE = "code-agent-go/protocol.go";
 
-/** Frame envelopes the Go agent handles without a tagged struct. Listed
+/** Frame envelopes the Go code-agent handles without a tagged struct. Listed
  *  explicitly so the omission is a decision on the record rather than a gap
  *  nobody noticed.
  *
@@ -70,13 +70,13 @@ function parseGo(source: string): Map<string, string[]> {
 // ── the op tables ─────────────────────────────────────────────────────────
 //
 // Types matching is not enough, and this is not theoretical: `git.remote` grew
-// a `mode` parameter, it was wired into the Go agent and forgotten in the
+// a `mode` parameter, it was wired into the Go code-agent and forgotten in the
 // TypeScript one, every type still lined up, and the symptom was a pull that
-// silently went on merging. The op names and the parameter names each agent
+// silently went on merging. The op names and the parameter names each code-agent
 // reads are the other half of the wire contract.
 
-const TS_OPS_FILE = "src/agent/main.ts";
-const GO_OPS_FILE = "agent-go/server.go";
+const TS_OPS_FILE = "src/code-agent/main.ts";
+const GO_OPS_FILE = "code-agent-go/server.go";
 
 /** An op name -> the parameter names that implementation reads for it. */
 type OpTable = Map<string, Set<string>>;
@@ -89,7 +89,9 @@ type OpTable = Map<string, Set<string>>;
  */
 function opBodies(source: string, from: string): Map<string, string> {
   const body = decomment(source.slice(source.indexOf(from)));
-  const re = /"([a-z]+\.[A-Za-z]+)"\s*:/g;
+  // A hyphen is allowed in the namespace: `code-agent.info` is an op, and a
+  // pattern that stopped at the letters silently left it out of the comparison.
+  const re = /"([a-z][a-z-]*\.[A-Za-z]+)"\s*:/g;
   const found: { name: string; at: number }[] = [];
   for (let m = re.exec(body); m; m = re.exec(body)) found.push({ name: m[1], at: m.index + m[0].length });
   const out = new Map<string, string>();
@@ -117,8 +119,8 @@ function opTable(source: string, from: string, params: (h: string) => Set<string
 
 const ts = parseTs(await readFile(TS_FILE, "utf8"));
 const go = parseGo(await readFile(GO_FILE, "utf8"));
-const tsOps = opTable(await readFile(TS_OPS_FILE, "utf8"), "agent.info", tsParams);
-const goOps = opTable(await readFile(GO_OPS_FILE, "utf8"), "agent.info", goParams);
+const tsOps = opTable(await readFile(TS_OPS_FILE, "utf8"), "code-agent.info", tsParams);
+const goOps = opTable(await readFile(GO_OPS_FILE, "utf8"), "code-agent.info", goParams);
 
 if (ts.size === 0) throw new Error(`${TS_FILE} parsed to zero interfaces — the format changed`);
 if (go.size === 0) throw new Error(`${GO_FILE} parsed to zero structs — the format changed`);
@@ -178,7 +180,7 @@ for (const [name, tsP] of tsOps) {
   opsCompared++;
   // Only parameters *read from the request* are compared. A handler is free to
   // call whatever it likes internally; what has to agree is the set of names
-  // the two agents will look for in the same frame.
+  // the two code-agents will look for in the same frame.
   const missing = onlyIn(tsP, goP);
   const extra = onlyIn(goP, tsP);
   if (missing.length || extra.length) {

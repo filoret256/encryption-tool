@@ -5,10 +5,11 @@
  *  impossible rather than unlikely:
  *
  *    - the crypto tabs run WebCrypto in the page, so plaintext and passwords
- *      never leave the browser at all;
+ *      never leave the browser at all — the server has no crypto endpoints,
+ *      which is checked below rather than assumed;
  *    - the server keeps no per-request state and no session, so there is
  *      nothing for two requests to share;
- *    - the code tab talks only to an agent on the user's own loopback
+ *    - the code tab talks only to a code-agent on the user's own loopback
  *      interface, jailed to one folder.
  *
  *  Each of those is checked here rather than asserted.
@@ -17,17 +18,19 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFile } from "node:fs/promises";
-import { iter } from "../src/agent/proc.ts";
-import { AGENT_PORT_MAX, AGENT_PORT_MIN, AGENT_PORT_RANGE } from "../src/ports.ts";
-import { git, startAgent, type Harness } from "./harness.ts";
+import { iter } from "../src/code-agent/proc.ts";
+import { CODE_AGENT_PORT_MAX, CODE_AGENT_PORT_MIN, CODE_AGENT_PORT_RANGE } from "../src/ports.ts";
+import { git, startCodeAgent, type Harness } from "./harness.ts";
 import { ansible, helm } from "../src/crypto/index.ts";
-import type { FileRead, SearchSummary } from "../src/agent/protocol.ts";
+import type { FileRead, SearchSummary } from "../src/code-agent/protocol.ts";
 import { esc } from "../src/web/code/ui.ts";
 
 const SERVER_PORT = 5091;
-const AGENT_A = 5089;
-const AGENT_B = 5088;
-const USERS = 60;
+const CODE_AGENT_A = 5089;
+const CODE_AGENT_B = 5088;
+// Each user costs several 600 000-round key derivations, so this is the number
+// that keeps the run to seconds while still being far more than "a couple".
+const USERS = 24;
 
 const results: { name: string; ok: boolean; note: string }[] = [];
 function check(name: string, ok: boolean, note = ""): void {
@@ -52,53 +55,57 @@ const server = Bun.spawn(["bun", "src/server.ts"], {
 }
 const base = `http://127.0.0.1:${SERVER_PORT}`;
 
-let agentA: Harness | null = null;
-let agentB: Harness | null = null;
+let codeAgentA: Harness | null = null;
+let codeAgentB: Harness | null = null;
 const rootA = await mkdtemp(join(tmpdir(), "enc-userA-"));
 const rootB = await mkdtemp(join(tmpdir(), "enc-userB-"));
 
 try {
-  // ── 1. concurrent API users must never see each other's data ──
-  // The endpoints stay for API clients, so hammer them the way many people at
-  // once would and check every answer belongs to the request that asked.
-  const post = async (path: string, body: unknown): Promise<{ result?: string; error?: string }> =>
-    (await fetch(base + path, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    }).then((r) => r.json())) as { result?: string; error?: string };
-
-  for (const scheme of ["ansible", "helm"] as const) {
+  // ── 1. concurrent users must never see each other's data ──
+  // The crypto modules are what the page runs, and they hold no state between
+  // calls. Hammer them the way many tabs at once would and check every answer
+  // belongs to the call that asked.
+  for (const scheme of [ansible, helm]) {
+    const name = scheme === ansible ? "ansible" : "helm";
     const users = Array.from({ length: USERS }, (_, i) => ({
       text: `user-${i} secret payload ${"x".repeat(i)}`,
       password: `password-of-user-${i}`,
     }));
 
-    const ciphertexts = await Promise.all(users.map((u) => post(`/${scheme}/encrypt`, u)));
-    const decrypted = await Promise.all(
-      ciphertexts.map((c, i) => post(`/${scheme}/decrypt`, { text: c.result, password: users[i].password })),
-    );
-    const roundTrip = decrypted.every((d, i) => d.result === users[i].text);
+    const ciphertexts = await Promise.all(users.map((u) => scheme.encrypt(u.text, u.password)));
+    const decrypted = await Promise.all(ciphertexts.map((c, i) => scheme.decrypt(c, users[i].password)));
+    const roundTrip = decrypted.every((d, i) => d === users[i].text);
 
     // And a ciphertext must not open with someone else's password.
     const crossed = await Promise.all(
-      ciphertexts.map((c, i) => post(`/${scheme}/decrypt`, { text: c.result, password: users[(i + 1) % USERS].password })),
+      ciphertexts.map((c, i) => scheme.decrypt(c, users[(i + 1) % USERS].password).then((r) => r, () => undefined)),
     );
-    const leaked = crossed.filter((d, i) => d.result !== undefined && d.result === users[i].text);
+    const leaked = crossed.filter((d, i) => d !== undefined && d === users[i].text);
 
     check(
-      `${scheme}: ${USERS} concurrent users get only their own data`,
+      `${name}: ${USERS} concurrent users get only their own data`,
       roundTrip && leaked.length === 0,
       `${USERS} round trips correct, ${leaked.length} leaked under a foreign password`,
     );
   }
 
+  // The server used to expose these, and a password sent to one crossed the
+  // network. Gone is the claim; a 404 that still carries the policy headers is
+  // the proof, and the headers are checked with the other routes below.
+  const gone: [string, Response][] = [];
+  for (const path of ["/helm/encrypt", "/helm/decrypt", "/ansible/encrypt", "/ansible/decrypt"]) {
+    gone.push([`POST ${path}`, await fetch(`${base}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: "x", password: "y" }),
+    })]);
+  }
+  await Promise.all(gone.map(([, r]) => r.text()));
+  const answered = gone.filter(([, r]) => r.status !== 404).map(([n, r]) => `${n} → ${r.status}`);
+  check("the server has no crypto endpoints", answered.length === 0, answered.length ? answered.join(", ") : "all four answer 404");
+
   // ── 2. no session, no cookie, nothing cacheable by a shared proxy ──
-  const encRes = await fetch(`${base}/ansible/encrypt`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text: "x", password: "y" }),
-  });
+  const encRes = await fetch(`${base}/code-agent/downloads`);
   await encRes.text();
   const shellRes = await fetch(`${base}/`);
   const htmlShell = await shellRes.text();
@@ -106,13 +113,13 @@ try {
     (h) => encRes.headers.get(h) !== null,
   );
   check(
-    "crypto responses carry no session or cache identity",
+    "API responses carry no session or cache identity",
     identifying.length === 0 && !(encRes.headers.get("cache-control") ?? "").includes("public"),
     identifying.length ? `unexpected: ${identifying.join(", ")}` : "no set-cookie, no etag, not publicly cacheable",
   );
   check("the shell sets no cookie either", shellRes.headers.get("set-cookie") === null, "static, identical for everyone");
 
-  // The agent's URL and token live in localStorage, and that agent is a
+  // The code-agent's URL and token live in localStorage, and that code-agent is a
   // filesystem bridge — so script injection on this origin would be script
   // injection into someone's working directory. The policy is what stops a
   // stolen token from being usable by injected code.
@@ -132,30 +139,30 @@ try {
   );
   const connectSrc = (csp.split(";").find((d) => d.trim().startsWith("connect-src")) ?? "").trim();
   const sources = connectSrc.split(" ").filter(Boolean).slice(1);
-  // The agent binds the first free port in this range (src/ports.ts), so the
+  // The code-agent binds the first free port in this range (src/ports.ts), so the
   // policy has to cover the whole of it — the ends are what a second and a
-  // tenth agent land on, and either one missing is a tab that cannot connect.
-  const missingAgentPorts = [AGENT_PORT_MIN, AGENT_PORT_MAX].flatMap((p) =>
+  // tenth code-agent land on, and either one missing is a tab that cannot connect.
+  const missingCodeAgentPorts = [CODE_AGENT_PORT_MIN, CODE_AGENT_PORT_MAX].flatMap((p) =>
     ["ws", "http"].map((s) => `${s}://127.0.0.1:${p}`).filter((src) => !connectSrc.includes(src)),
   );
   check(
-    "the policy still permits the loopback agent, across the whole port range",
-    missingAgentPorts.length === 0,
-    missingAgentPorts.length ? `missing ${missingAgentPorts.join(", ")}` : `ws:// and http:// on ${AGENT_PORT_RANGE}`,
+    "the policy still permits the loopback code-agent, across the whole port range",
+    missingCodeAgentPorts.length === 0,
+    missingCodeAgentPorts.length ? `missing ${missingCodeAgentPorts.join(", ")}` : `ws:// and http:// on ${CODE_AGENT_PORT_RANGE}`,
   );
 
   // The page cannot read its own policy, and a refused connection is
-  // indistinguishable from an absent agent without this: the violation report
+  // indistinguishable from an absent code-agent without this: the violation report
   // that would tell them apart arrives in a queued task, after the failure has
-  // already been reported to the user. See src/web/code/agent.ts.
-  const metaPorts = /<meta name="agent-ports" content="([^"]*)"/.exec(htmlShell)?.[1] ?? "";
+  // already been reported to the user. See src/web/code/code-agent.ts.
+  const metaPorts = /<meta name="code-agent-ports" content="([^"]*)"/.exec(htmlShell)?.[1] ?? "";
   const listed = metaPorts.split(",").filter(Boolean);
   check(
     "the shell names those ports, so the tab can explain a refusal",
     listed.length > 0 && listed.every((p) => connectSrc.includes(`ws://127.0.0.1:${p}`)),
-    listed.length ? `${listed.length} ports, every one of them in connect-src` : "no agent-ports meta in the shell",
+    listed.length ? `${listed.length} ports, every one of them in connect-src` : "no code-agent-ports meta in the shell",
   );
-  // The point of pinning it: injected script gets a channel to the agent, not
+  // The point of pinning it: injected script gets a channel to the code-agent, not
   // to every other thing the user happens to be running on loopback.
   const unpinned = sources.filter((src) => src !== "'self'" && !/:[0-9]{1,5}$/.test(src));
   check(
@@ -205,23 +212,109 @@ try {
   const fresh: [string, Response][] = [
     ["GET /public/main.js", await fetch(`${base}/public/main.js`)],
     ["GET /manifest.webmanifest", await fetch(`${base}/manifest.webmanifest`)],
-    ["GET /agent/downloads", await fetch(`${base}/agent/downloads`)],
-    ["GET /agent/download/<unknown>", await fetch(`${base}/agent/download/nope.zip`)],
+    ["GET /code-agent/downloads", await fetch(`${base}/code-agent/downloads`)],
+    ["GET /code-agent/download/<unknown>", await fetch(`${base}/code-agent/download/nope.zip`)],
+    // A percent-escape that does not decode used to throw out of the route, and
+    // what answered was Bun's development error page: stack, working directory
+    // and source lines, with none of the policy headers.
+    ["GET /code-agent/download/<bad escape>", await fetch(`${base}/code-agent/download/%E0%A4%A`)],
     ["GET /<unknown>", await fetch(`${base}/no-such-route`)],
-    [
-      "POST /helm/encrypt (bad body)",
-      await fetch(`${base}/helm/encrypt`, { method: "POST", headers: { "content-type": "application/json" }, body: "{" }),
-    ],
+    ["POST /helm/encrypt (removed)", await fetch(`${base}/helm/encrypt`, { method: "POST", headers: { "content-type": "application/json" }, body: "{" })],
   ];
+  const badEscape = fresh.find(([name]) => name === "GET /code-agent/download/<bad escape>")![1];
+  const badEscapeBody = await badEscape.clone().text();
+  const leaks = ["cwd", "stack", "at route", "server.ts", process.cwd()].filter((s) => badEscapeBody.includes(s));
+  check(
+    "a malformed URL is a plain 404, not a debug page",
+    badEscape.status === 404 && leaks.length === 0 && badEscapeBody.length < 200,
+    leaks.length ? `the body mentions ${leaks.join(", ")}` : `${badEscape.status}, ${badEscapeBody.length} bytes, nothing about the server`,
+  );
   await Promise.all(fresh.map(([, r]) => r.text()));
   // shellRes and encRes are drained above; only their headers are read here.
-  const everyRoute: [string, Response][] = [["GET /", shellRes], ["POST /ansible/encrypt", encRes], ...fresh];
+  const everyRoute: [string, Response][] = [["GET /", shellRes], ["GET /code-agent/downloads", encRes], ...fresh];
   const bare = everyRoute.filter(([, r]) => policy.some((h) => r.headers.get(h) === null)).map(([name]) => name);
   check(
     "no route can answer without the policy headers",
     bare.length === 0,
     bare.length ? `served bare: ${bare.join(", ")}` : `${everyRoute.length} routes checked, 404s and rejected bodies included`,
   );
+
+  // ── 2a. what was made cheaper must still be right ──
+  //
+  // The shell is built per request because it carries that request's nonce, and
+  // the policy is stamped on every response. Both were rebuilt from scratch each
+  // time and are now assembled from parts prepared once — which is exactly the
+  // kind of change that goes wrong quietly, by sharing a nonce or leaving the
+  // placeholder in. So: a fresh nonce every time, the same one in the header and
+  // the page, no placeholder left, and a policy that differs between two
+  // responses in the nonce alone.
+  {
+    const nonces = new Set<string>();
+    const problems: string[] = [];
+    const policies: string[] = [];
+    for (let i = 0; i < 25; i++) {
+      const r = await fetch(`${base}/`);
+      const html = await r.text();
+      const policy = r.headers.get("content-security-policy") ?? "";
+      const inHeader = /'nonce-([^']+)'/.exec(policy)?.[1];
+      const inPage = /name="csp-nonce" content="([^"]*)"/.exec(html)?.[1];
+      if (!inHeader || inHeader !== inPage) problems.push(`#${i}: header ${inHeader} vs page ${inPage}`);
+      if (html.includes("__CSP_NONCE__") || html.includes("__CODE_AGENT_PORTS__")) problems.push(`#${i}: a placeholder survived`);
+      if (inHeader) nonces.add(inHeader);
+      policies.push(policy.replace(/'nonce-[^']+'/, "'nonce-X'"));
+    }
+    const ports = /name="code-agent-ports" content="([^"]*)"/.exec(await (await fetch(`${base}/`)).text())?.[1];
+    check(
+      "every shell gets its own nonce, in the header and in the page",
+      problems.length === 0 && nonces.size === 25,
+      problems.length ? problems.slice(0, 2).join("; ") : `25 responses, 25 distinct nonces, ports ${ports}`,
+    );
+    const notFound = await fetch(`${base}/no-such-route`);
+    await notFound.text();
+    const policy404 = (notFound.headers.get("content-security-policy") ?? "").replace(/'nonce-[^']+'/, "'nonce-X'");
+    check(
+      "the policy is the same on every response but for the nonce",
+      new Set([...policies, policy404]).size === 1 && policy404.includes("connect-src 'self' ws://127.0.0.1:5001"),
+      `${policy404.length} bytes, identical on 25 shells and a 404`,
+    );
+  }
+
+  // A cold server: the first request for a bundle used to compress it, on the
+  // event loop, while the person waited — brotli at quality 9 on a 1.3 MB file.
+  // It is done at startup now. Timed against the second request, on a server
+  // started for the purpose, because the shared one above has already served it.
+  {
+    const cold = Bun.spawn(["bun", "src/server.ts"], {
+      cwd: process.cwd(),
+      env: { ...process.env, PORT: "5591" },
+      stdout: "pipe",
+      stderr: "inherit",
+      stdin: "ignore",
+    });
+    try {
+      const dec = new TextDecoder();
+      let banner = "";
+      for await (const bytes of iter(cold.stdout as ReadableStream<Uint8Array>)) {
+        banner += dec.decode(bytes, { stream: true });
+        if (banner.includes("listening")) break;
+      }
+      const timed = async (): Promise<number> => {
+        const t0 = performance.now();
+        const r = await fetch("http://127.0.0.1:5591/public/code.js", { headers: { "accept-encoding": "br" } });
+        await r.arrayBuffer();
+        return performance.now() - t0;
+      };
+      const first = await timed();
+      const second = await timed();
+      check(
+        "the first request for a bundle does not pay for compressing it",
+        first < second + 30,
+        `first ${first.toFixed(1)} ms, second ${second.toFixed(1)} ms (compressing it takes ~55 ms and more)`,
+      );
+    } finally {
+      cold.kill();
+    }
+  }
 
   // ── 2b. the other half of the CSP ──
   //
@@ -290,7 +383,7 @@ try {
     posts.length ? `still references ${posts.join(", ")}` : "encryption happens in the page, nothing is sent",
   );
 
-  // ── 4. two agents, two folders, no crossing ──
+  // ── 4. two code-agents, two folders, no crossing ──
   await writeFile(join(rootA, "secret-a.txt"), "user A private\n", "utf8");
   await writeFile(join(rootB, "secret-b.txt"), "user B private\n", "utf8");
   for (const r of [rootA, rootB]) {
@@ -301,12 +394,12 @@ try {
     await git(r, "commit", "-qm", "fixture");
   }
 
-  agentA = await startAgent(rootA, AGENT_A);
-  agentB = await startAgent(rootB, AGENT_B);
+  codeAgentA = await startCodeAgent(rootA, CODE_AGENT_A);
+  codeAgentB = await startCodeAgent(rootB, CODE_AGENT_B);
 
-  const aOwn = await agentA.call<FileRead>("fs.read", { path: "secret-a.txt" });
-  const bOwn = await agentB.call<FileRead>("fs.read", { path: "secret-b.txt" });
-  check("each agent serves its own folder", aOwn.text?.includes("user A") === true && bOwn.text?.includes("user B") === true, "both read their own file");
+  const aOwn = await codeAgentA.call<FileRead>("fs.read", { path: "secret-a.txt" });
+  const bOwn = await codeAgentB.call<FileRead>("fs.read", { path: "secret-b.txt" });
+  check("each code-agent serves its own folder", aOwn.text?.includes("user A") === true && bOwn.text?.includes("user B") === true, "both read their own file");
 
   // Reaching the other user's folder, by name and by traversal.
   const escapes = [
@@ -318,16 +411,16 @@ try {
   const outcomes: string[] = [];
   for (const path of escapes) {
     try {
-      const r = await agentA.call<FileRead>("fs.read", { path });
+      const r = await codeAgentA.call<FileRead>("fs.read", { path });
       outcomes.push(r.text?.includes("user B") ? `LEAKED via ${path}` : `empty for ${path}`);
     } catch (e) {
       outcomes.push((e as Error).message.slice(0, 28));
     }
   }
-  check("one agent cannot read the other's folder", !outcomes.some((o) => o.startsWith("LEAKED")), outcomes.join(" | "));
+  check("one code-agent cannot read the other's folder", !outcomes.some((o) => o.startsWith("LEAKED")), outcomes.join(" | "));
 
   // A project-wide search must not wander outside the workspace either.
-  const searchA = agentA.call<SearchSummary>("search", { query: "private", matchCase: false, wholeWord: false, regex: false });
+  const searchA = codeAgentA.call<SearchSummary>("search", { query: "private", matchCase: false, wholeWord: false, regex: false });
   const summaryA = await searchA;
   const hitPaths = searchA.chunks.map((c) => (c as { hit: { path: string } }).hit?.path).filter(Boolean);
   check(
@@ -336,12 +429,12 @@ try {
     `${summaryA.files} file(s): ${[...new Set(hitPaths)].join(", ")}`,
   );
 
-  // ── 5. two connections to one agent keep separate in-flight state ──
+  // ── 5. two connections to one code-agent keep separate in-flight state ──
   // Request ids are per connection, so one connection must not be able to
   // cancel — or otherwise reach into — another's work.
-  const second = await startAgent(rootA, AGENT_A + 10);
+  const second = await startCodeAgent(rootA, CODE_AGENT_A + 10);
   try {
-    const running = agentA.call<SearchSummary>("search", { query: "e", matchCase: false, wholeWord: false, regex: false });
+    const running = codeAgentA.call<SearchSummary>("search", { query: "e", matchCase: false, wholeWord: false, regex: false });
     const foreign = await second.call<{ cancelled: boolean }>("cancel", { target: running.id });
     const mine = await running;
     check(
@@ -361,15 +454,15 @@ try {
   // its turn — so what this asserts is that waiting is all it does. Every reply
   // still arrives, still carries its own request's id, and still says the same
   // thing it would have said alone.
-  const alone = await agentA.call<{ files: number }>("search", { query: "private", matchCase: false, wholeWord: false, regex: false });
+  const alone = await codeAgentA.call<{ files: number }>("search", { query: "private", matchCase: false, wholeWord: false, regex: false });
   // Captured, because narrowing of a module-level `let` does not survive into
   // a closure — and every one of these calls is made from one.
-  const agent = agentA;
+  const codeAgent = codeAgentA;
   const burst = await Promise.all(
     Array.from({ length: 24 }, (_, i) =>
       i % 2 === 0
-        ? agent.call<{ files: number }>("search", { query: "private", matchCase: false, wholeWord: false, regex: false })
-        : agent.call<{ files: number }>("git.status", {}).then(() => ({ files: alone.files })),
+        ? codeAgent.call<{ files: number }>("search", { query: "private", matchCase: false, wholeWord: false, regex: false })
+        : codeAgent.call<{ files: number }>("git.status", {}).then(() => ({ files: alone.files })),
     ),
   );
   check(
@@ -378,21 +471,21 @@ try {
     `24 concurrent search/git.status calls, every reply matching the same call made alone (${alone.files} file)`,
   );
 
-  // ── 6. the agent is not reachable from the network ──
+  // ── 6. the code-agent is not reachable from the network ──
   const lan = Object.values(networkInterfaces())
     .flat()
     .find((i) => i && i.family === "IPv4" && !i.internal)?.address;
   if (!lan) {
-    check("the agent is unreachable off-machine", true, "SKIPPED — no non-loopback IPv4 on this host");
+    check("the code-agent is unreachable off-machine", true, "SKIPPED — no non-loopback IPv4 on this host");
   } else {
     let reachable = false;
     try {
-      const r = await fetch(`http://${lan}:${AGENT_A}/ping`, { signal: AbortSignal.timeout(2500) });
+      const r = await fetch(`http://${lan}:${CODE_AGENT_A}/ping`, { signal: AbortSignal.timeout(2500) });
       reachable = r.ok;
     } catch {
       reachable = false;
     }
-    check("the agent is unreachable off-machine", !reachable, `bound to loopback only; ${lan}:${AGENT_A} refused`);
+    check("the code-agent is unreachable off-machine", !reachable, `bound to loopback only; ${lan}:${CODE_AGENT_A} refused`);
   }
 
   // ── 7. same plaintext and password never produce the same ciphertext ──
@@ -408,8 +501,8 @@ try {
 } catch (e) {
   check("unexpected error", false, e instanceof Error ? `${e.message}\n${e.stack}` : String(e));
 } finally {
-  agentA?.close();
-  agentB?.close();
+  codeAgentA?.close();
+  codeAgentB?.close();
   server.kill();
   await rm(rootA, { recursive: true, force: true }).catch(() => undefined);
   await rm(rootB, { recursive: true, force: true }).catch(() => undefined);

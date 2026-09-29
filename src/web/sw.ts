@@ -2,12 +2,11 @@
  *
  *  Scope notes that matter here:
  *   - the crypto tabs run on WebCrypto in the page, so they need no network at
- *     all; the /helm/* and /ansible/* endpoints remain for API clients and,
- *     being POST, are never cached;
- *   - the code tab talks to the local agent on 127.0.0.1, a different origin.
+ *     all, and the server has no crypto endpoints to cache or to call;
+ *   - the code tab talks to the local code-agent on 127.0.0.1, a different origin.
  *     Cross-origin requests are passed straight through — caching or delaying
  *     them would break the editor for no benefit;
- *   - the code tab talks to the local agent on 127.0.0.1, a different origin.
+ *   - the code tab talks to the local code-agent on 127.0.0.1, a different origin.
  *
  *  Assets have fixed names — no content hashing, because the compiled binary
  *  embeds them by path. That used to mean serving them stale-while-revalidate
@@ -84,7 +83,7 @@ sw.addEventListener("fetch", (event) => {
   const req = event.request;
   if (req.method !== "GET") return; // crypto POSTs always go to the network
   const url = new URL(req.url);
-  if (url.origin !== sw.location.origin) return; // the local agent lives elsewhere
+  if (url.origin !== sw.location.origin) return; // the local code-agent lives elsewhere
 
   if (req.mode === "navigate") {
     event.respondWith(networkFirst(req));

@@ -11,6 +11,10 @@ server.exe
 # logs / env
 *.log
 .env
+
+# the release-signing private key (scripts/release-key.ts writes it to the
+# current directory by default); the .pub.pem beside it is meant to be shared
+release-key.pem
 .claude
 backlog.md
 ./backlog.md
@@ -19,5 +23,5 @@ to-do.md
 ux*.md
 ./ux*.md
 
-# cross-compiled agent binaries (bun run agents:build)
+# cross-compiled code-agent binaries (bun run code-agents:build)
 dist/

@@ -1,6 +1,6 @@
-/** Shared test harness: boot a real agent and talk to it over the same
+/** Shared test harness: boot a real code-agent and talk to it over the same
  *  WebSocket protocol the browser uses. */
-import { iter } from "../src/agent/proc.ts";
+import { iter } from "../src/code-agent/proc.ts";
 
 export interface Harness {
   /** The returned promise also carries the streamed chunks and the request id,
@@ -9,12 +9,12 @@ export interface Harness {
   close(): void;
 }
 
-/** `env` lets a test start the agent with a doctored PATH — that is how the
+/** `env` lets a test start the code-agent with a doctored PATH — that is how the
  *  ripgrep and fallback search engines get compared against each other. */
-export async function startAgent(root: string, port: number, env?: Record<string, string>): Promise<Harness> {
-  // No Origin header comes from a Bun WebSocket, and the agent refuses such a
-  // client unless told otherwise — see --allow-no-origin in src/agent/main.ts.
-  const proc = Bun.spawn(["bun", "src/agent/cli.ts", "--root", root, "--port", String(port), "--allow-no-origin"], {
+export async function startCodeAgent(root: string, port: number, env?: Record<string, string>): Promise<Harness> {
+  // No Origin header comes from a Bun WebSocket, and the code-agent refuses such a
+  // client unless told otherwise — see --allow-no-origin in src/code-agent/main.ts.
+  const proc = Bun.spawn(["bun", "src/code-agent/cli.ts", "--root", root, "--port", String(port), "--allow-no-origin"], {
     cwd: process.cwd(),
     env: env ?? (process.env as Record<string, string>),
     stdout: "pipe",
@@ -33,7 +33,7 @@ export async function startAgent(root: string, port: number, env?: Record<string
       break;
     }
   }
-  if (!url) throw new Error(`agent did not print a URL:\n${buf}`);
+  if (!url) throw new Error(`code-agent did not print a URL:\n${buf}`);
 
   const ws = new WebSocket(url);
   const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; chunks: unknown[] }>();
@@ -72,7 +72,7 @@ export async function startAgent(root: string, port: number, env?: Record<string
   };
 }
 
-/** Run git directly (test setup), bypassing the agent. */
+/** Run git directly (test setup), bypassing the code-agent. */
 export async function git(cwd: string, ...args: string[]): Promise<string> {
   const p = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe", stdin: "ignore" });
   const [out, err, code] = await Promise.all([

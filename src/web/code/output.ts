@@ -1,4 +1,4 @@
-/** The output log: everything the agent and git actually said.
+/** The output log: everything the code-agent and git actually said.
  *
  *  Before this, git spoke through a toast that held one line for 2.2 seconds.
  *  A rejected push is seven lines. A failed pull is a warning glued to an
@@ -150,7 +150,7 @@ export class OutputLog {
   private render(): void {
     this.countEl.textContent = this.entries.length ? `${this.entries.length} entries` : "";
     if (!this.entries.length) {
-      this.body.innerHTML = `<p class="output-empty">Nothing yet. Everything git and the agent say lands here.</p>`;
+      this.body.innerHTML = `<p class="output-empty">Nothing yet. Everything git and the code-agent say lands here.</p>`;
       return;
     }
     this.body.innerHTML = this.entries

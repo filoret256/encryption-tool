@@ -1,6 +1,6 @@
 /** Blame: who last touched each line, in a gutter beside it.
  *
- *  The agent has answered `git.blame` since the first version; nothing in the
+ *  The code-agent has answered `git.blame` since the first version; nothing in the
  *  UI ever asked. "When and why did this line change" was a question you left
  *  the tool to answer, which for the one person on the team who lives in commit
  *  history made the editor a read-only viewer.

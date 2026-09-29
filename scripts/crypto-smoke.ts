@@ -2,9 +2,13 @@
  *
  *  The encryptors moved from node:crypto to WebCrypto so the same modules can
  *  run in the browser. The thing that must not change is the wire format, so
- *  the checks that matter here are the cross-compatibility ones: the reference
- *  implementation below is the previous node:crypto code, and ciphertext has to
- *  pass in both directions between it and the new implementation.
+ *  the checks that matter here are the cross-compatibility ones: the references
+ *  below are independent node:crypto code, and ciphertext has to pass in both
+ *  directions between them and the WebCrypto implementation.
+ *
+ *  Ansible Vault has one format, fixed by the CLI. The helm tab has two: v1 is
+ *  what it used to write (CBC, no MAC, 10 000 rounds) and is still opened, v2
+ *  is what it writes now (GCM, 600 000 rounds).
  */
 import { createCipheriv, createDecipheriv, createHmac, pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
 import { ansible, helm } from "../src/crypto/index.ts";
@@ -42,6 +46,29 @@ const refHelm = {
     const d = createDecipheriv("aes-256-cbc", key, iv);
     d.setAutoPadding(false);
     return unpad(Buffer.concat([d.update(raw.subarray(32)), d.final()])).toString("utf8");
+  },
+};
+
+const refHelmV2 = {
+  encrypt(text: string, password: string): string {
+    const salt = randomBytes(16);
+    const iv = randomBytes(12);
+    const key = pbkdf2Sync(Buffer.from(password, "utf8"), salt, 600000, 32, "sha256");
+    const c = createCipheriv("aes-256-gcm", key, iv);
+    c.setAAD(Buffer.from("helm:v2"));
+    const ct = Buffer.concat([c.update(Buffer.from(text, "utf8")), c.final()]);
+    return "helm:v2:" + Buffer.concat([salt, iv, ct, c.getAuthTag()]).toString("base64");
+  },
+  decrypt(text: string, password: string): string {
+    const raw = Buffer.from(text.slice("helm:v2:".length), "base64");
+    const salt = raw.subarray(0, 16);
+    const iv = raw.subarray(16, 28);
+    const tag = raw.subarray(raw.length - 16);
+    const key = pbkdf2Sync(Buffer.from(password, "utf8"), salt, 600000, 32, "sha256");
+    const d = createDecipheriv("aes-256-gcm", key, iv);
+    d.setAAD(Buffer.from("helm:v2"));
+    d.setAuthTag(tag);
+    return Buffer.concat([d.update(raw.subarray(28, raw.length - 16)), d.final()]).toString("utf8");
   },
 };
 
@@ -93,11 +120,22 @@ try {
     check("round trip: " + label, h === text && a === text, text.length + " chars, both schemes");
   }
 
-  for (const [label, text] of SAMPLES.slice(0, 5)) {
-    const fromRef = await helm.decrypt(refHelm.encrypt(text, PW), PW);
-    const toRef = refHelm.decrypt(await helm.encrypt(text, PW), PW);
-    check("helm interops with node:crypto: " + label, fromRef === text && toRef === text, "decrypts both ways");
+  // v2 against an independent implementation, both ways — 600 000 rounds each,
+  // so three samples rather than five.
+  for (const [label, text] of SAMPLES.slice(0, 3)) {
+    const fromRef = await helm.decrypt(refHelmV2.encrypt(text, PW), PW);
+    const toRef = refHelmV2.decrypt(await helm.encrypt(text, PW), PW);
+    check("helm v2 interops with node:crypto: " + label, fromRef === text && toRef === text, "decrypts both ways");
   }
+  // v1 is read-only now, and must stay readable: it is what the tab wrote until
+  // this format existed, and the only thing that can open it is this code.
+  for (const [label, text] of SAMPLES.slice(0, 5)) {
+    const opened = await helm.decrypt(refHelm.encrypt(text, PW), PW);
+    check("helm v1 (legacy) ciphertext still opens: " + label, opened === text, "written by the previous implementation");
+  }
+  const written = await helm.encrypt("shape", PW);
+  const rawLen = Buffer.from(written.slice("helm:v2:".length), "base64").length;
+  check("helm writes v2, not v1", written.startsWith("helm:v2:") && rawLen === 16 + 12 + "shape".length + 16, `${written.slice(0, 12)}… ${rawLen} bytes = salt 16 + iv 12 + 5 + tag 16`);
   for (const [label, text] of SAMPLES.slice(0, 5)) {
     const fromRef = await ansible.decrypt(refAnsible.encrypt(text, PW), PW);
     const toRef = refAnsible.decrypt(await ansible.encrypt(text, PW), PW);
@@ -124,32 +162,44 @@ try {
   }
   check("vault: wrong password always rejected", vaultMsg === "Invalid password or corrupted data", vaultMsg || "no error thrown");
 
-  // Helm is unauthenticated CBC: detection relies on the PKCS#7 padding being
-  // wrong, which it is ~255/256 of the time. Asserting a single attempt throws
-  // would be a test that fails once every few hundred runs. The invariant that
-  // actually holds is that it never yields the real plaintext.
-  const TRIES = 256;
-  let threw = 0;
-  let leaked = 0;
-  for (let i = 0; i < TRIES; i++) {
-    const secret = "secret payload " + i;
+  // v2 is authenticated, so a wrong password is a deterministic rejection —
+  // unlike v1, where detection rode on the CBC padding being wrong (~255/256).
+  const messageOf = async (run: () => Promise<unknown>): Promise<string> => {
     try {
-      const out = await helm.decrypt(await helm.encrypt(secret, PW), "wrong");
-      if (out === secret) leaked++;
-    } catch {
-      threw++;
+      await run();
+      return "(no error)";
+    } catch (e) {
+      return e instanceof Error ? e.message : String(e);
     }
-  }
-  check(
-    "helm: wrong password never yields the plaintext",
-    leaked === 0 && threw >= TRIES * 0.9,
-    threw + "/" + TRIES + " rejected on padding, " + leaked + " leaked (CBC is unauthenticated by design)",
-  );
+  };
+  const sealed = await helm.encrypt("secret payload", PW);
+  const wrong = await Promise.all(Array.from({ length: 8 }, () => messageOf(() => helm.decrypt(sealed, "wrong"))));
+  check("helm v2: wrong password always rejected", wrong.every((m) => m === "Invalid password or corrupted data"), wrong[0]);
 
-  const body = vault.split("\n").slice(1).join("");
-  const at = body.length - 8;
-  const flipped = (parseInt(body[at], 16) ^ 1).toString(16);
-  const tampered = "$ANSIBLE_VAULT;1.1;AES256\n" + body.slice(0, at) + flipped + body.slice(at + 1);
+  // Every region of the message is covered: the version label, the salt (which
+  // changes the key), the IV, the ciphertext and the tag. Before v2 the same
+  // edit to the IV changed the plaintext without any error at all.
+  const body = Buffer.from(sealed.slice("helm:v2:".length), "base64");
+  const tamperAt = async (name: string, offset: number): Promise<void> => {
+    const copy = Buffer.from(body);
+    copy[offset] ^= 1;
+    const msg = await messageOf(() => helm.decrypt("helm:v2:" + copy.toString("base64"), PW));
+    check(`helm v2: a changed ${name} is rejected`, msg === "Invalid password or corrupted data", msg);
+  };
+  await tamperAt("salt byte", 0);
+  await tamperAt("IV byte", 16);
+  await tamperAt("ciphertext byte", 28);
+  await tamperAt("tag byte", body.length - 1);
+  const relabelled = await messageOf(() => helm.decrypt("helm:v3:" + sealed.slice("helm:v2:".length), PW));
+  check("helm: an unknown version is named, not misread", /^Unsupported helm format version: helm:v3:$/.test(relabelled), relabelled);
+  const truncated = await messageOf(() => helm.decrypt("helm:v2:AAAA", PW));
+  check("helm v2: a truncated message is rejected", truncated === "Invalid encrypted data", truncated);
+  check("helm v2: surrounding whitespace is tolerated", (await helm.decrypt(`\n  ${sealed}  \n`, PW)) === "secret payload", "pasted text often carries it");
+
+  const vaultBody = vault.split("\n").slice(1).join("");
+  const at = vaultBody.length - 8;
+  const flipped = (parseInt(vaultBody[at], 16) ^ 1).toString(16);
+  const tampered = "$ANSIBLE_VAULT;1.1;AES256\n" + vaultBody.slice(0, at) + flipped + vaultBody.slice(at + 1);
   let tamperMsg = "";
   try {
     await ansible.decrypt(tampered, PW);

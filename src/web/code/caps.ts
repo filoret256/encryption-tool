@@ -2,11 +2,11 @@
  *
  *  The useful distinction is not "browser tab vs installed PWA" — those run the
  *  same code with nearly identical powers. What actually decides whether the
- *  code tab works is: is the agent reachable, does this engine allow a loopback
+ *  code tab works is: is the code-agent reachable, does this engine allow a loopback
  *  socket from an https page, and is git installed. The badge reports exactly
  *  that, and every control that needs a capability carries `data-requires`.
  */
-import type { AgentClient } from "./agent.ts";
+import type { CodeAgentClient } from "./code-agent.ts";
 import { VERSION } from "../../version.ts";
 import { esc } from "./ui.ts";
 
@@ -17,14 +17,14 @@ export interface Caps {
   /** Launched from the home screen / installed window rather than a tab. */
   installed: boolean;
   /** WebKit blocks ws://127.0.0.1 from an https page, so the code tab cannot
-   *  reach an agent there at all. Reported up front instead of as a timeout. */
+   *  reach a code-agent there at all. Reported up front instead of as a timeout. */
   loopbackBlocked: boolean;
-  agent: boolean;
-  /** The connected agent matches this build. Users download the agent once and
+  codeAgent: boolean;
+  /** The connected code-agent matches this build. Users download the code-agent once and
    *  keep it, so the two drift apart on their own; without this the mismatch
    *  would surface later as an unexplained "unknown op". True while offline,
    *  where there is nothing to compare. */
-  agentCurrent: boolean;
+  codeAgentCurrent: boolean;
   git: boolean;
   ripgrep: boolean;
   watch: boolean;
@@ -37,15 +37,15 @@ function isWebKit(): boolean {
   return /AppleWebKit/.test(ua) && !/Chrome|Chromium|Edg|OPR|Firefox/.test(ua);
 }
 
-export function detect(agent: AgentClient): Caps {
-  const info = agent.info;
+export function detect(codeAgent: CodeAgentClient): Caps {
+  const info = codeAgent.info;
   return {
     secure: window.isSecureContext,
     serviceWorker: "serviceWorker" in navigator,
     installed: window.matchMedia?.("(display-mode: standalone)").matches ?? false,
     loopbackBlocked: isWebKit() && window.location.protocol === "https:",
-    agent: agent.state === "online",
-    agentCurrent: agent.state !== "online" || info?.version === VERSION,
+    codeAgent: codeAgent.state === "online",
+    codeAgentCurrent: codeAgent.state !== "online" || info?.version === VERSION,
     git: Boolean(info?.gitVersion),
     ripgrep: Boolean(info?.ripgrep),
     watch: Boolean(info?.watch),
@@ -56,40 +56,47 @@ interface Row {
   key: keyof Caps;
   label: string;
   /** Shown when the capability is missing: what is lost and how to get it. A
-   *  function when the useful text depends on what the agent reported. */
-  fix: string | ((agent: AgentClient) => string);
-  /** Rows that only mean something while an agent is connected. */
-  needsAgent?: boolean;
+   *  function when the useful text depends on what the code-agent reported. */
+  fix: string | ((codeAgent: CodeAgentClient) => string);
+  /** Rows that only mean something while a code-agent is connected. */
+  needsCodeAgent?: boolean;
 }
 
 const ROWS: Row[] = [
-  { key: "agent", label: "local agent", fix: "Run `enc-tool agent` in your project folder, then paste its URL here." },
+  { key: "codeAgent", label: "local code-agent", fix: "Run `enc-tool code-agent` in your project folder, then paste its URL here." },
   {
-    key: "agentCurrent",
-    label: "agent up to date",
-    needsAgent: true,
-    fix: (agent) =>
-      `The agent is ${agent.info?.version ?? "an unknown version"}, this app is ${VERSION}. Download the current one from "get agent" on the code tab.`,
+    key: "codeAgentCurrent",
+    label: "code-agent up to date",
+    needsCodeAgent: true,
+    fix: (codeAgent) =>
+      `The code-agent is ${codeAgent.info?.version ?? "an unknown version"}, this app is ${VERSION}. Download the current one from "get code-agent" on the code tab.`,
   },
-  // These three are properties of the machine the agent runs on, so with no
-  // agent connected the honest answer is "we have not asked yet" — not "✗".
+  // These three are properties of the machine the code-agent runs on, so with no
+  // code-agent connected the honest answer is "we have not asked yet" — not "✗".
   // The badge used to tell people to install git on a machine that had it and
   // declare file watching unavailable on a platform that supports it, purely
   // because a socket was down.
-  { key: "git", label: "git", needsAgent: true, fix: "Install git and restart the agent — version control is unavailable without it." },
-  { key: "ripgrep", label: "ripgrep", needsAgent: true, fix: "Optional. Without it project search uses a slower built-in scan." },
-  { key: "watch", label: "live file watching", needsAgent: true, fix: "Unavailable on this platform — refresh the tree manually after external changes." },
+  {
+    key: "git",
+    label: "git",
+    needsCodeAgent: true,
+    // "Install git" is the wrong advice for a machine that has one: the code-agent
+    // says when it is there but too old to use, and that is what to show.
+    fix: (codeAgent) => codeAgent.info?.gitProblem ?? "Install git and restart the code-agent — version control is unavailable without it.",
+  },
+  { key: "ripgrep", label: "ripgrep", needsCodeAgent: true, fix: "Optional. Without it project search uses a slower built-in scan." },
+  { key: "watch", label: "live file watching", needsCodeAgent: true, fix: "Unavailable on this platform — refresh the tree manually after external changes." },
   { key: "secure", label: "secure context", fix: "Serve the app over HTTPS; without it the service worker cannot install." },
   { key: "installed", label: "installed as an app", fix: "Optional. Install from the browser menu for a standalone window." },
 ];
 
 export const HINTS: Record<string, string> = {
-  agent: "Requires the local agent",
-  git: "Requires git on the agent machine",
+  codeAgent: "Requires the local code-agent",
+  git: "Requires git on the code-agent machine",
 };
 
 /** Disable and mark every control whose capability is missing. Controls opt in
- *  with `data-requires="agent"`, so this stays a single pass over the DOM. */
+ *  with `data-requires="codeAgent"`, so this stays a single pass over the DOM. */
 export function applyRequirements(root: ParentNode, caps: Caps): void {
   for (const el of root.querySelectorAll<HTMLElement>("[data-requires]")) {
     const need = el.dataset.requires as keyof Caps;
@@ -98,7 +105,7 @@ export function applyRequirements(root: ParentNode, caps: Caps): void {
     // back when the capability arrives.
     //
     // It used to be cleared instead — `el.title = ""` — which meant that
-    // connecting an agent silently stripped the labels off exactly the controls
+    // connecting a code-agent silently stripped the labels off exactly the controls
     // that have nothing but an icon: search, source control, history, reload.
     // They are unlabelled only after everything starts working, which is why
     // this was easy to miss and maddening to use.
@@ -116,12 +123,12 @@ export interface PwaHooks {
 }
 
 /** Render the header chip plus its popover. Returns an update function so the
- *  caller can refresh it whenever the agent's state changes. */
-export function mountBadge(host: HTMLElement, agent: AgentClient, onConnect: () => void, pwa?: PwaHooks): () => void {
+ *  caller can refresh it whenever the code-agent's state changes. */
+export function mountBadge(host: HTMLElement, codeAgent: CodeAgentClient, onConnect: () => void, pwa?: PwaHooks): () => void {
   host.className = "cap-badge";
   host.innerHTML = `
     <button class="cap-chip" type="button" aria-haspopup="dialog" aria-expanded="false">
-      <span class="cap-dot"></span><span class="cap-text">agent</span>
+      <span class="cap-dot"></span><span class="cap-text">code-agent</span>
     </button>
     <div class="cap-pop" hidden></div>`;
 
@@ -143,31 +150,31 @@ export function mountBadge(host: HTMLElement, agent: AgentClient, onConnect: () 
   });
 
   return function update(): void {
-    const caps = detect(agent);
+    const caps = detect(codeAgent);
     const status = caps.loopbackBlocked
       ? "blocked"
-      : agent.state === "online"
+      : codeAgent.state === "online"
         ? "online"
-        : agent.state === "connecting"
+        : codeAgent.state === "connecting"
           ? "connecting"
-          : agent.state === "error"
+          : codeAgent.state === "error"
             ? "error"
             : "offline";
 
     host.dataset.status = status;
     dot.textContent = { online: "●", connecting: "◐", error: "✕", offline: "◌", blocked: "✕" }[status];
-    text.textContent = status === "online" ? (agent.info?.root.split(/[/\\]/).pop() ?? "agent") : "agent";
+    text.textContent = status === "online" ? (codeAgent.info?.root.split(/[/\\]/).pop() ?? "code-agent") : "code-agent";
     chip.title =
       status === "online"
-        ? `Connected — ${agent.info?.root}`
+        ? `Connected — ${codeAgent.info?.root}`
         : status === "blocked"
           ? "This browser blocks loopback connections from an https page"
-          : agent.lastError || "Agent not connected";
+          : codeAgent.lastError || "Code-agent not connected";
 
     pop.innerHTML = `
-      <div class="cap-head">${esc(headline(status, agent.lastError))}</div>
-      <ul class="cap-list">${ROWS.map((r) => row(r, caps, agent, !r.needsAgent || caps.agent)).join("")}</ul>
-      ${status === "online" ? "" : `<button class="t-btn cap-connect" type="button">connect to agent…</button>`}
+      <div class="cap-head">${esc(headline(status, codeAgent.lastError))}</div>
+      <ul class="cap-list">${ROWS.map((r) => row(r, caps, codeAgent, !r.needsCodeAgent || caps.codeAgent)).join("")}</ul>
+      ${status === "online" ? "" : `<button class="t-btn cap-connect" type="button">connect to code-agent…</button>`}
       ${pwa?.canInstall() ? `<button class="t-btn cap-install" type="button">install as an app</button>` : ""}`;
 
     pop.querySelector<HTMLButtonElement>(".cap-connect")?.addEventListener("click", () => {
@@ -186,25 +193,25 @@ export function mountBadge(host: HTMLElement, agent: AgentClient, onConnect: () 
 function headline(status: string, error: string): string {
   switch (status) {
     case "online": return "All local features available";
-    case "connecting": return "Connecting to the agent…";
-    case "blocked": return "This browser cannot reach a local agent";
-    case "error": return error || "Agent connection failed";
-    default: return "Editing and git need the local agent";
+    case "connecting": return "Connecting to the code-agent…";
+    case "blocked": return "This browser cannot reach a local code-agent";
+    case "error": return error || "Code-agent connection failed";
+    default: return "Editing and git need the local code-agent";
   }
 }
 
-function row(r: Row, caps: Caps, agent: AgentClient, known: boolean): string {
+function row(r: Row, caps: Caps, codeAgent: CodeAgentClient, known: boolean): string {
   // Three states, not two. "?" is not a failure and carries no advice — there
   // is nothing to advise about a machine nobody has spoken to.
   if (!known) {
     return `<li class="unknown">
       <span class="cap-mark">?</span>
       <span class="cap-label">${esc(r.label)}</span>
-      <span class="cap-fix">Unknown until an agent is connected.</span>
+      <span class="cap-fix">Unknown until a code-agent is connected.</span>
     </li>`;
   }
   const on = Boolean(caps[r.key]);
-  const fix = typeof r.fix === "function" ? r.fix(agent) : r.fix;
+  const fix = typeof r.fix === "function" ? r.fix(codeAgent) : r.fix;
   return `<li class="${on ? "on" : "off"}">
     <span class="cap-mark">${on ? "✓" : "✗"}</span>
     <span class="cap-label">${esc(r.label)}</span>

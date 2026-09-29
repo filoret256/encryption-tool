@@ -9,7 +9,7 @@
  *  of lanes where each slot holds the oid that lane is still waiting for, and
  *  never move a lane sideways so lines stay straight and stable between rows.
  */
-import type { Commit } from "../../agent/protocol.ts";
+import type { Commit } from "../../code-agent/protocol.ts";
 import { ROW_H } from "./ui.ts";
 
 export const LANE_W = 12;

@@ -84,7 +84,7 @@
 
 * { box-sizing: border-box; }
 /* Components set display on their own host element, which outranks the user
-   agent stylesheet; without this, toggling el.hidden does nothing. */
+   code-agent stylesheet; without this, toggling el.hidden does nothing. */
 [hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; }
 body {
@@ -955,53 +955,53 @@ body {
 .needs-cap { opacity: .55; border-style: dashed; border-width: 1px; border-color: var(--text-muted); }
 .cap-install { width: 100%; margin-top: 6px; }
 
-/* ── Code-tab tools: agent download + capability badge ────────────────────
+/* ── Code-tab tools: code-agent download + capability badge ────────────────────
    Sit between the tabs and the header's right-hand group. `margin-right:auto`
    claims the free space of the header's space-between, which keeps them next
    to the tabs instead of centred between the two groups. */
 .code-tools { display: flex; align-items: center; gap: 8px; margin: 0 auto 0 10px; }
-.agent-dl { position: relative; }
-.agent-dl-chip {
+.code-agent-dl { position: relative; }
+.code-agent-dl-chip {
   display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
   padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px;
   background: var(--btn); color: var(--text-muted); font-family: var(--mono); font-size: var(--fs-xs);
 }
-.agent-dl-chip:hover { background: var(--btn-hover); color: var(--text); }
-.agent-dl-pop {
+.code-agent-dl-chip:hover { background: var(--btn-hover); color: var(--text); }
+.code-agent-dl-pop {
   position: absolute; left: 0; top: calc(100% + 6px); z-index: 30; width: 360px; padding: 12px;
   background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, .3);
 }
-.agent-dl-head { font-size: var(--fs-sm); margin-bottom: 6px; }
-.agent-dl-note { margin: 6px 0 0; font-size: var(--fs-xs); line-height: 1.5; color: var(--text-muted); }
-.agent-dl-note code { font-family: var(--mono); font-size: var(--fs-xs); }
-.agent-dl-get {
+.code-agent-dl-head { font-size: var(--fs-sm); margin-bottom: 6px; }
+.code-agent-dl-note { margin: 6px 0 0; font-size: var(--fs-xs); line-height: 1.5; color: var(--text-muted); }
+.code-agent-dl-note code { font-family: var(--mono); font-size: var(--fs-xs); }
+.code-agent-dl-get {
   display: flex; margin-top: 10px; text-decoration: none;
   font-family: var(--mono); font-size: var(--fs-sm);
 }
-.agent-dl-others { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
-.agent-dl-others button {
+.code-agent-dl-others { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.code-agent-dl-others button {
   cursor: pointer; padding: 2px 7px; font-family: var(--mono); font-size: var(--fs-xs);
   color: var(--text-muted); background: transparent;
   border: 1px solid var(--border); border-radius: 4px;
 }
-.agent-dl-others button:hover { background: var(--btn-hover); color: var(--text); }
-.agent-dl-steps { margin-top: 10px; }
-.agent-dl-steps-head {
+.code-agent-dl-others button:hover { background: var(--btn-hover); color: var(--text); }
+.code-agent-dl-steps { margin-top: 10px; }
+.code-agent-dl-steps-head {
   display: flex; align-items: center; justify-content: space-between;
   font-size: var(--fs-xs); color: var(--text-muted); margin-bottom: 4px;
 }
-.agent-dl-steps pre {
+.code-agent-dl-steps pre {
   margin: 0; padding: 8px; overflow-x: auto;
   font-family: var(--mono); font-size: var(--fs-xs); line-height: 1.6;
   background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
 }
-.agent-dl-sum {
+.code-agent-dl-sum {
   display: flex; align-items: center; gap: 6px; margin-top: 8px;
   font-size: var(--fs-xs); color: var(--text-muted);
 }
-.agent-dl-sum code { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; }
-.agent-dl-sum button, .agent-dl-steps-head button {
+.code-agent-dl-sum code { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; }
+.code-agent-dl-sum button, .code-agent-dl-steps-head button {
   height: var(--ctl-xs); padding: 0 8px; font-size: var(--fs-xs);
 }
 
@@ -1105,8 +1105,8 @@ body {
 .cf-btn:focus-visible,
 .code-tab-close:focus-visible,
 .cap-chip:focus-visible,
-.agent-dl-chip:focus-visible,
-.agent-dl-others button:focus-visible,
+.code-agent-dl-chip:focus-visible,
+.code-agent-dl-others button:focus-visible,
 .ctx-menu button:focus-visible,
 .sp-globs summary:focus-visible,
 .hist-toggle input:focus-visible {
@@ -1174,7 +1174,7 @@ body {
   .code-main { min-height: 45vh; }
 
   /* Both were fixed widths that overflow a 360px viewport. */
-  .cap-pop, .agent-dl-pop { width: min(360px, calc(100vw - 24px)); }
+  .cap-pop, .code-agent-dl-pop { width: min(360px, calc(100vw - 24px)); }
 }
 
 /* ── Touch ────────────────────────────────────────────────────────────────
@@ -1274,9 +1274,9 @@ body {
 }
 
 /* ── Offline and out-of-date buffers ──────────────────────────────────────
-   The strip that appears above the editor when the agent is gone. It says the
+   The strip that appears above the editor when the code-agent is gone. It says the
    one thing that matters at that moment: the work is still here. Muted rather
-   than alarming — a dropped agent is a normal event (a restart, a sleeping
+   than alarming — a dropped code-agent is a normal event (a restart, a sleeping
    laptop), and the state it leaves behind is safe. */
 .offline-bar {
   display: flex; align-items: center; gap: 10px; flex: 0 0 auto;

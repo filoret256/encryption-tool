@@ -8,9 +8,10 @@
  *  Virtualization is ~40 lines here rather than a dependency because the row
  *  height is constant, which is the only hard part of the general problem.
  */
-import type { DirEntry, StatusEntry } from "../../agent/protocol.ts";
+import type { DirEntry, StatusEntry } from "../../code-agent/protocol.ts";
 import { copyToClipboard, esc, modalPrompt, showMenu, ROW_H, type MenuItem } from "./ui.ts";
 import { fileIcon } from "./file-icons.ts";
+import { singleFlight } from "./singleflight.ts";
 
 const ROW = ROW_H;
 /** Rows rendered above and below the viewport to hide scroll tearing. */
@@ -61,7 +62,7 @@ export interface TreeOps {
 
 /** The last file operation, kept so it can be taken back.
  *
- *  Only the two that are reversible. A delete is a real delete — the agent has
+ *  Only the two that are reversible. A delete is a real delete — the code-agent has
  *  no trash — and the confirmation says so; offering "undo" for it would be a
  *  promise nothing here can keep. */
 type Undoable =
@@ -76,7 +77,7 @@ export interface TreeCallbacks {
   /** Says an action went through — used where the result is invisible, such as
    *  a copy to the clipboard. */
   notify(message: string, isError?: boolean): void;
-  /** Absolute path of the folder the agent is serving, for "copy absolute
+  /** Absolute path of the folder the code-agent is serving, for "copy absolute
    *  path". Null while nothing is connected, in which case only the
    *  repository-relative path can be offered. */
   workspaceRoot(): string | null;
@@ -264,14 +265,26 @@ export class FileTree {
 
   /** Reload the directories touched by a watcher event. "*" reloads everything
    *  that is currently expanded. */
-  async refresh(paths: string[]): Promise<void> {
+  refresh(paths: string[]): Promise<void> {
+    // Coalesced like the panels: a build reports a path every few milliseconds,
+    // and each report used to re-list the folder it was in, one after another.
+    // The paths of the calls folded into one run are merged, not dropped — the
+    // run that follows re-lists every folder any of them named.
+    for (const p of paths) this.pendingRefresh.add(p);
+    return this.refreshFlight();
+  }
+
+  private readonly pendingRefresh = new Set<string>();
+  private readonly refreshFlight = singleFlight(async () => {
+    const paths = [...this.pendingRefresh];
+    this.pendingRefresh.clear();
     const dirs = new Set(paths.includes("*") ? this.expandedPaths() : paths.map(dirname));
     for (const d of dirs) {
       const node = this.find(d);
       if (node?.expanded) await this.expand(node, true);
     }
     this.rebuild();
-  }
+  });
 
   /** Which folders are open, so a session can be put back the way it was. */
   expandedPaths(): string[] {
@@ -795,7 +808,7 @@ export class FileTree {
 
   /** Copy one file.
    *
-   *  Read then write, because that is what the agent offers. It means a folder
+   *  Read then write, because that is what the code-agent offers. It means a folder
    *  and a binary cannot be copied this way, and both are refused by name
    *  rather than half-done: a copy that silently produced an empty file would
    *  be worse than one that did not happen. */
@@ -827,14 +840,14 @@ export class FileTree {
    *
    *  Text only, and said so: `fs.write` takes a string, so an image or an
    *  archive dropped here would arrive mangled. Refusing by name is the honest
-   *  answer until the agent can take bytes. */
+   *  answer until the code-agent can take bytes. */
   private async importFiles(files: File[], target: TreeNode): Promise<void> {
     const skipped: string[] = [];
     let added = 0;
     for (const file of files) {
       try {
         const text = await file.text();
-        // A NUL byte is the same test the agent uses to call a file binary.
+        // A NUL byte is the same test the code-agent uses to call a file binary.
         if (text.includes("\0")) {
           skipped.push(file.name);
           continue;
@@ -976,7 +989,7 @@ export class FileTree {
 
       // History first: "when did this change" is asked far more often than
       // "how does this differ from that", and it used to be answerable only in
-      // a terminal even though the agent could already answer it.
+      // a terminal even though the code-agent could already answer it.
       items.push({ label: "File history", run: () => this.cb.fileHistory(node.path), separated: true });
       if (!node.dir) items.push({ label: "Blame", run: () => this.cb.blame(node.path) });
       // Scoping a search used to mean knowing that the include field takes a

@@ -1,7 +1,7 @@
 /** Finding a Go toolchain, in the one place both the build script and the
  *  smoke test can agree on.
  *
- *  Go is not needed to work on the web app or the TypeScript agent, so its
+ *  Go is not needed to work on the web app or the TypeScript code-agent, so its
  *  absence is never fatal here — callers decide whether to skip or to fail.
  *  GO_BIN exists for the common case of a toolchain unpacked somewhere that is
  *  not on PATH.

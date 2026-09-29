@@ -6,7 +6,7 @@
  *  not trusted from the manifest), the worker is served from the root scope
  *  with a cache policy that lets it be replaced, and the shell links it all up.
  */
-import { iter } from "../src/agent/proc.ts";
+import { iter } from "../src/code-agent/proc.ts";
 
 const PORT = 5094;
 const base = `http://127.0.0.1:${PORT}`;
@@ -106,7 +106,7 @@ try {
     ["install", "activate", "fetch", "message"].every((e) => swBody.includes(`"${e}"`) || swBody.includes(`'${e}'`)),
     `${(swBody.length / 1024).toFixed(1)} KB`,
   );
-  // Caching a cross-origin request would break the agent connection probe.
+  // Caching a cross-origin request would break the code-agent connection probe.
   check("worker leaves other origins alone", swBody.includes("origin"), "origin check present in the bundle");
 
   // ── the shell links it together ──

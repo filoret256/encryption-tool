@@ -13,7 +13,7 @@ import { EditorView, lineNumbers } from "@codemirror/view";
 import { Chunk, MergeView, goToNextChunk, goToPreviousChunk, unifiedMergeView } from "@codemirror/merge";
 import { defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
-import type { DiffPair } from "../../agent/protocol.ts";
+import type { DiffPair } from "../../code-agent/protocol.ts";
 import { grammarFor } from "./grammars.ts";
 import { cmBase, cmDark } from "../cm-theme.ts";
 import { esc, startTrimmed } from "./ui.ts";

@@ -1,14 +1,15 @@
 /** Source-control panel: status, staging, commits, branches, remotes.
  *
- *  Every action is one call into the agent, which runs the system git. That is
+ *  Every action is one call into the code-agent, which runs the system git. That is
  *  why rebase, revert and reset are here at all — they are not reimplemented,
  *  they are the real commands, so their semantics are git's and not an
  *  approximation of them.
  */
-import type { AgentClient } from "./agent.ts";
-import type { Branch, Commit, CommitDetail, CommitFile, GitOperation, GitStatus, ReflogEntry, StatusEntry } from "../../agent/protocol.ts";
+import type { CodeAgentClient } from "./code-agent.ts";
+import type { Branch, Commit, CommitDetail, CommitFile, GitOperation, GitStatus, ReflogEntry, StatusEntry } from "../../code-agent/protocol.ts";
 import { esc, modalChoice, modalConfirm, modalPrompt, setHtmlKeepingScroll, showMenu, startTrimmed, type MenuItem } from "./ui.ts";
 import { pickRef } from "./refpicker.ts";
+import { singleFlight } from "./singleflight.ts";
 import { iconBranch, iconCheck, iconDiscard, iconFetch, iconMinus, iconMore, iconPlus, iconPull, iconPush } from "./icons.ts";
 
 export interface GitPanelCallbacks {
@@ -56,7 +57,7 @@ function conflictTitle(op: GitOperation | null): string {
 
 /** One entry of `git stash list`.
  *
- *  The agent has listed, applied and dropped stashes by name since the first
+ *  The code-agent has listed, applied and dropped stashes by name since the first
  *  version; the panel offered "stash" and "pop latest" and nothing else, so a
  *  second `stash push` put the first one somewhere the UI could not name. */
 interface Stash {
@@ -67,7 +68,7 @@ interface Stash {
   subject: string;
 }
 
-/** `%gd%x00%ct%x00%gs` per line, which is what the agent asks git for. */
+/** `%gd%x00%ct%x00%gs` per line, which is what the code-agent asks git for. */
 function parseStashes(raw: string): Stash[] {
   const out: Stash[] = [];
   for (const line of raw.split("\n")) {
@@ -185,7 +186,7 @@ const loadPref = <T extends string>(key: string, allowed: readonly T[], fallback
  *  One person's machine holds a trunk-based repository and a gitflow one, and
  *  the right answer for pull is not the same in both — a single remembered
  *  choice means whichever they answered first is silently applied to the other.
- *  Keyed by the workspace path the agent reports.
+ *  Keyed by the workspace path the code-agent reports.
  */
 const loadPullModes = (): Record<string, PullMode> => {
   try {
@@ -224,7 +225,7 @@ export function mergeSource(subject: string): string {
 
 /** What a merge that did not stop on a conflict actually did.
  *
- *  The agent runs git with LC_ALL=C, so these phrases are git's own and not a
+ *  The code-agent runs git with LC_ALL=C, so these phrases are git's own and not a
  *  translation. Anything unrecognised falls back to naming the ref, which is
  *  still more than "merged" said. */
 function mergeOutcome(ref: string, output: string, mode: "default" | "no-ff" | "squash" = "default"): string {
@@ -263,10 +264,10 @@ export class GitPanel {
   private pullModes = loadPullModes();
 
   /** Which folder the remembered strategy belongs to. Falls back to a fixed
-   *  key before the agent has said where it is pointed, so a pull made in that
+   *  key before the code-agent has said where it is pointed, so a pull made in that
    *  window is still remembered somewhere rather than nowhere. */
   private get folderKey(): string {
-    return this.agent.info?.root ?? "(unknown)";
+    return this.codeAgent.info?.root ?? "(unknown)";
   }
 
   /** The strategy chosen for this folder, if one has been. */
@@ -284,6 +285,8 @@ export class GitPanel {
    *  is the thing to offer. */
   private hasRemote = false;
   private remotesFor: string | null = null;
+  /** The folder whose git identity is known to be complete; see load(). */
+  private identityFor: string | null = null;
   /** The prepared message already put in the box, so a box the user has since
    *  emptied is not refilled on the next watcher event. */
   private preparedOffered: string | null = null;
@@ -310,7 +313,7 @@ export class GitPanel {
 
   constructor(
     private readonly host: HTMLElement,
-    private readonly agent: AgentClient,
+    private readonly codeAgent: CodeAgentClient,
     private readonly cb: GitPanelCallbacks,
   ) {
     host.classList.add("gp");
@@ -357,8 +360,13 @@ export class GitPanel {
 
   // ── data ────────────────────────────────────────────────────────────────
 
-  async refresh(): Promise<void> {
-    if (this.agent.state !== "online" || !this.agent.info?.gitVersion) {
+  /** Reload the panel. Coalesced — one load in flight, one behind it — because
+   *  a change under `.git` asks for this, and a load is five git processes. A
+   *  caller still gets an answer from a load that began after it asked. */
+  readonly refresh = singleFlight(() => this.load());
+
+  private async load(): Promise<void> {
+    if (this.codeAgent.state !== "online" || !this.codeAgent.info?.gitVersion) {
       this.status = null;
       this.render();
       return;
@@ -369,14 +377,21 @@ export class GitPanel {
       // it leaves "no remote", which hides an offer rather than making a wrong
       // one.
       const askRemotes = this.remotesFor !== this.folderKey;
+      // The identity is asked for the same way, until it is found. Two `git
+      // config` processes on every refresh to re-learn that someone is still
+      // called what they were; a missing one is asked again each time, because
+      // that is the state the warning is about and the one a person fixes.
+      const askIdentity = this.identityFor !== this.folderKey;
       const [status, branches, identity, stashes, remotes] = await Promise.all([
-        this.agent.call<GitStatus>("git.status"),
-        this.agent.call<Branch[]>("git.branches"),
-        this.agent.call<{ name: string | null; email: string | null }>("git.identity"),
+        this.codeAgent.call<GitStatus>("git.status"),
+        this.codeAgent.call<Branch[]>("git.branches"),
+        askIdentity
+          ? this.codeAgent.call<{ name: string | null; email: string | null }>("git.identity")
+          : Promise.resolve(null),
         // A repository with no stashes answers with an empty string, not an
         // error, so this never needs its own failure path.
-        this.agent.call<string>("git.stash", { action: "list" }).catch(() => ""),
-        askRemotes ? this.agent.call<{ name: string }[]>("git.remotes").catch(() => []) : Promise.resolve(null),
+        this.codeAgent.call<string>("git.stash", { action: "list" }).catch(() => ""),
+        askRemotes ? this.codeAgent.call<{ name: string }[]>("git.remotes").catch(() => []) : Promise.resolve(null),
       ]);
       this.status = status;
       this.branches = branches;
@@ -394,15 +409,18 @@ export class GitPanel {
 
       this.offerPreparedMessage(status.preparedMessage ?? null);
       // The strategy is per folder, and which folder this is only becomes known
-      // once the agent has answered — so the button's tag is settled here
+      // once the code-agent has answered — so the button's tag is settled here
       // rather than in the constructor.
       this.showPullMode();
 
       // git refuses to commit without an identity; say so before the failure.
-      const warn = this.$<HTMLElement>(".js-warn");
-      const missing = !identity.name || !identity.email;
-      warn.hidden = !missing;
-      warn.textContent = missing ? "git user.name / user.email are not set — commits will fail." : "";
+      if (identity) {
+        const warn = this.$<HTMLElement>(".js-warn");
+        const missing = !identity.name || !identity.email;
+        warn.hidden = !missing;
+        warn.textContent = missing ? "git user.name / user.email are not set — commits will fail." : "";
+        this.identityFor = missing ? null : this.folderKey;
+      }
     } catch (e) {
       this.status = null;
       const message = e instanceof Error ? e.message : String(e);
@@ -439,7 +457,7 @@ export class GitPanel {
   /** Open or close a stash, reading its file list the first time.
    *
    *  A stash is a commit whose first parent is the commit it was taken on, so
-   *  `git.commitDetail` answers this with no new agent code — and its files
+   *  `git.commitDetail` answers this with no new code-agent code — and its files
    *  open in the same diff as any other commit's. */
   private async toggleStash(ref: string): Promise<void> {
     if (this.openStash === ref) {
@@ -453,7 +471,7 @@ export class GitPanel {
     this.render();
     if (this.stashFiles.has(ref)) return;
     try {
-      const detail = await this.agent.call<CommitDetail>("git.commitDetail", { oid: ref });
+      const detail = await this.codeAgent.call<CommitDetail>("git.commitDetail", { oid: ref });
       this.stashFiles.set(ref, detail.files);
     } catch (e) {
       this.stashFiles.set(ref, []);
@@ -926,8 +944,8 @@ export class GitPanel {
   private async apply(action: string, group: Group, paths: string[]): Promise<void> {
     if (!paths.length || this.busy) return;
     try {
-      if (action === "stage") await this.agent.call("git.stage", { paths });
-      else if (action === "unstage") await this.agent.call("git.unstage", { paths });
+      if (action === "stage") await this.codeAgent.call("git.stage", { paths });
+      else if (action === "unstage") await this.codeAgent.call("git.unstage", { paths });
       else if (action === "discard") {
         const what = paths.length === 1 ? paths[0] : `${paths.length} files`;
         const ok = await modalConfirm({
@@ -942,8 +960,8 @@ export class GitPanel {
         if (!ok) return;
         // `git checkout --` cannot restore a file git has never seen; deleting
         // it is what "discard" means for an untracked entry.
-        if (group === "untracked") await this.agent.call("fs.delete", { paths });
-        else await this.agent.call("git.discard", { paths });
+        if (group === "untracked") await this.codeAgent.call("fs.delete", { paths });
+        else await this.codeAgent.call("git.discard", { paths });
       }
       await this.refresh();
       this.cb.afterChange();
@@ -1033,9 +1051,9 @@ export class GitPanel {
   /** The full message of HEAD — subject, then body. */
   private async lastMessage(): Promise<string | null> {
     try {
-      const [head] = await this.agent.call<Commit[]>("git.log", { limit: 1 });
+      const [head] = await this.codeAgent.call<Commit[]>("git.log", { limit: 1 });
       if (!head) return null;
-      const detail = await this.agent.call<CommitDetail>("git.commitDetail", { oid: head.oid });
+      const detail = await this.codeAgent.call<CommitDetail>("git.commitDetail", { oid: head.oid });
       const body = detail.body.trim();
       return body ? `${head.subject}\n\n${body}` : head.subject;
     } catch {
@@ -1051,7 +1069,7 @@ export class GitPanel {
     const { x, y } = { x: e.clientX, y: e.clientY };
     let recent: Commit[] = [];
     try {
-      recent = await this.agent.call<Commit[]>("git.log", { limit: 12 });
+      recent = await this.codeAgent.call<Commit[]>("git.log", { limit: 12 });
     } catch (err) {
       return this.cb.toast(err instanceof Error ? err.message : String(err), true);
     }
@@ -1120,7 +1138,7 @@ export class GitPanel {
       });
       if (!ok) return;
       try {
-        await this.agent.call("git.stage", { paths: [...new Set(stageable.map((e) => e.path))] });
+        await this.codeAgent.call("git.stage", { paths: [...new Set(stageable.map((e) => e.path))] });
       } catch (e) {
         return this.cb.toast(e instanceof Error ? e.message : String(e), true);
       }
@@ -1129,10 +1147,10 @@ export class GitPanel {
     const staged = amend ? 0 : this.groups().staged.length || stageable.length;
     try {
       // git prints "[develop 592633f] subject" and a file tally; with LC_ALL=C
-      // in the agent that first line is stable enough to quote the hash out of.
+      // in the code-agent that first line is stable enough to quote the hash out of.
       // Saying only "committed" left the one question a person asks next — did
       // it take, and what went in — answered nowhere but the log.
-      const out = String(await this.agent.call<string>("git.commit", { message, amend }) ?? "");
+      const out = String(await this.codeAgent.call<string>("git.commit", { message, amend }) ?? "");
       box.value = "";
       this.onMessageInput();
       const oid = /^\[[^\]]*?\s([0-9a-f]{7,40})\]/m.exec(out)?.[1];
@@ -1196,7 +1214,7 @@ export class GitPanel {
    *  list what the user is looking at in a terminal beside it. */
   private async freshRefs(): Promise<Branch[]> {
     try {
-      this.branches = await this.agent.call<Branch[]>("git.branches");
+      this.branches = await this.codeAgent.call<Branch[]>("git.branches");
     } catch {
       /* keep the last known list — a stale picker beats no picker */
     }
@@ -1277,12 +1295,12 @@ export class GitPanel {
     });
     if (!name) return;
     try {
-      await this.agent.call("git.branchDelete", { name });
+      await this.codeAgent.call("git.branchDelete", { name });
       this.cb.toast(`deleted ${name}`);
     } catch (e) {
       // Only one failure has a second chance worth offering. Everything else —
       // a name that does not exist, a branch checked out in a worktree, an
-      // agent that went away — used to be dressed up as "not fully merged" and
+      // code-agent that went away — used to be dressed up as "not fully merged" and
       // answered with a force-delete button.
       const message = e instanceof Error ? e.message : String(e);
       if (!/not fully merged/i.test(message)) {
@@ -1325,8 +1343,8 @@ export class GitPanel {
     });
     // `git push <remote> :<branch>` — the refspec with an empty source, which
     // is git\x27s own way of saying "delete that ref over there". Using it keeps
-    // this to the arguments the agent already accepts, rather than a new
-    // protocol flag that both agent implementations would have to grow.
+    // this to the arguments the code-agent already accepts, rather than a new
+    // protocol flag that both code-agent implementations would have to grow.
     if (ok) await this.remote("push", { remote, ref: `:${branch}` });
   }
 
@@ -1362,7 +1380,7 @@ export class GitPanel {
     }
 
     try {
-      await this.agent.call("git.stash", { action: "push", message: `before ${what}` });
+      await this.codeAgent.call("git.stash", { action: "push", message: `before ${what}` });
       this.cb.toast("changes stashed");
       await this.refresh();
       return true;
@@ -1424,7 +1442,7 @@ export class GitPanel {
 
   private async merge(ref: string, mode: "default" | "no-ff" | "squash" = "default"): Promise<void> {
     try {
-      const r = await this.agent.call<{ conflict: boolean; output: string }>("git.merge", {
+      const r = await this.codeAgent.call<{ conflict: boolean; output: string }>("git.merge", {
         ref,
         noFf: mode === "no-ff",
         squash: mode === "squash",
@@ -1451,7 +1469,7 @@ export class GitPanel {
 
   private async rebase(ref: string): Promise<void> {
     try {
-      const r = await this.agent.call<{ conflict: boolean; output: string }>("git.rebase", { action: "start", ref });
+      const r = await this.codeAgent.call<{ conflict: boolean; output: string }>("git.rebase", { action: "start", ref });
       this.cb.report(
         r.conflict ? "rebase stopped with conflicts — resolve them below, then continue" : `rebased onto ${ref}`,
         r.output,
@@ -1473,7 +1491,7 @@ export class GitPanel {
     // to resolve MERGE_HEAD and REBASE_HEAD — and REBASE_HEAD survives a
     // *finished* rebase, so the menu went on offering "Continue rebase" and
     // "Abort rebase" for the rest of the session, both of which could only
-    // answer "fatal: no rebase in progress". The agent now reads the state git
+    // answer "fatal: no rebase in progress". The code-agent now reads the state git
     // actually keeps for the question (see git.ts: operation()).
     const op = st?.operation ?? null;
 
@@ -1683,13 +1701,13 @@ export class GitPanel {
     this.setBusy(action);
 
     const progress = this.$<HTMLElement>(".js-progress");
-    const { id, promise } = this.agent.callTracked("git.remote", { action, ...opts }, (chunk) => {
+    const { id, promise } = this.codeAgent.callTracked("git.remote", { action, ...opts }, (chunk) => {
       const line = (chunk as { progress?: string }).progress;
       if (line) this.$(".js-progress-text").textContent = line;
     });
     progress.querySelector(".js-cancel")!.addEventListener("click", () => {
       this.$(".js-progress-text").textContent = `stopping ${action}…`;
-      void this.agent.call("cancel", { target: id }).catch(() => undefined);
+      void this.codeAgent.call("cancel", { target: id }).catch(() => undefined);
     });
 
     // What the branch looked like before, so the report can be about what
@@ -1793,7 +1811,7 @@ export class GitPanel {
     await this.run("git.stash", { action, ref }, `${ref} ${action === "drop" ? "dropped" : action === "pop" ? "popped" : "applied"}`);
   }
 
-  /** Run one agent op, report it, then reload everything that may have moved. */
+  /** Run one code-agent op, report it, then reload everything that may have moved. */
   // ── remotes ───────────────────────────────────────────────────────────
   //
   // Listing them was always possible; changing them was not, so adding a
@@ -1803,7 +1821,7 @@ export class GitPanel {
   private async manageRemotes(x: number, y: number): Promise<void> {
     let remotes: { name: string; url: string }[] = [];
     try {
-      remotes = await this.agent.call<{ name: string; url: string }[]>("git.remotes");
+      remotes = await this.codeAgent.call<{ name: string; url: string }[]>("git.remotes");
     } catch (e) {
       return this.cb.toast(e instanceof Error ? e.message : String(e), true);
     }
@@ -1906,7 +1924,7 @@ export class GitPanel {
   private async undoMenu(x: number, y: number): Promise<void> {
     let entries: ReflogEntry[] = [];
     try {
-      entries = await this.agent.call<ReflogEntry[]>("git.reflog", { limit: 25 });
+      entries = await this.codeAgent.call<ReflogEntry[]>("git.reflog", { limit: 25 });
     } catch (e) {
       return this.cb.toast(e instanceof Error ? e.message : String(e), true);
     }
@@ -1950,7 +1968,7 @@ export class GitPanel {
     try {
       // Most of these answer with git's stdout; a few answer with an object
       // carrying it. Either way it is the transcript for the log.
-      const result = await this.agent.call<unknown>(op, params);
+      const result = await this.codeAgent.call<unknown>(op, params);
       const output =
         typeof result === "string" ? result
         : typeof (result as { output?: unknown })?.output === "string" ? ((result as { output: string }).output)

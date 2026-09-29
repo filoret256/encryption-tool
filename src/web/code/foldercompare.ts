@@ -15,7 +15,7 @@
  *  because a CRLF and an LF copy of one file have different sizes and are not a
  *  difference anybody asked about.
  */
-import type { DirEntry } from "../../agent/protocol.ts";
+import type { DirEntry } from "../../code-agent/protocol.ts";
 
 export type EntryState = "left" | "right" | "differs" | "same";
 
@@ -50,7 +50,7 @@ const MAX_FILES = 4000;
 const READ_LIMIT = 1 << 20;
 
 interface Walked {
-  /** relative path → size in bytes (-1 when the agent did not report one) */
+  /** relative path → size in bytes (-1 when the code-agent did not report one) */
   files: Map<string, number>;
   truncated: boolean;
 }

@@ -3,13 +3,14 @@
  *  Loading is capped and extended on demand — `git log` on a large repository
  *  is fast, but shipping 50k commits through the socket and into the DOM is not.
  */
-import type { AgentClient } from "./agent.ts";
-import type { Branch, Commit, CommitDetail, GitStatus } from "../../agent/protocol.ts";
+import type { CodeAgentClient } from "./code-agent.ts";
+import type { Branch, Commit, CommitDetail, GitStatus } from "../../code-agent/protocol.ts";
 import { copyToClipboard, esc, modalConfirm, modalPrompt, setHtmlKeepingScroll, showMenu, startTrimmed, type MenuItem } from "./ui.ts";
 import { computeGraph, continuationSvg, laneSvg, LANE_W, type GraphRow } from "./graph.ts";
 import { iconRefresh } from "./icons.ts";
 import { OP_SCOPE } from "./git-panel.ts";
 import { pickRef } from "./refpicker.ts";
+import { singleFlight } from "./singleflight.ts";
 
 const PAGE = 100;
 /** How far `reveal` will page looking for one commit — a thousand back, which
@@ -98,10 +99,10 @@ function matches(c: Commit, f: Filter): boolean {
  *  cd1e044 …`, with nothing to say they were a stash — and meanwhile the
  *  *second* stash was not shown at all, because only the top one carries a ref.
  *
- *  Filtered here rather than with `--exclude=refs/stash` in the agent because
+ *  Filtered here rather than with `--exclude=refs/stash` in the code-agent because
  *  the ref decoration identifies the stash exactly, and its extra parents are
  *  reachable only through it: no guessing, and no change to a protocol the Go
- *  agent would also have to grow.
+ *  code-agent would also have to grow.
  *
  *  Stashes have a home of their own — the list in the source-control panel.
  */
@@ -175,7 +176,7 @@ export class HistoryPanel {
 
   constructor(
     private readonly host: HTMLElement,
-    private readonly agent: AgentClient,
+    private readonly codeAgent: CodeAgentClient,
     private readonly cb: HistoryCallbacks,
   ) {
     host.classList.add("hist");
@@ -273,7 +274,7 @@ export class HistoryPanel {
    *  so reaching the tenth page walked the first nine again — in git, over the
    *  socket, and through the parser — every time. */
   private page(limit: number, skip: number): Promise<Commit[]> {
-    return this.agent.call<Commit[]>("git.log", {
+    return this.codeAgent.call<Commit[]>("git.log", {
       limit,
       skip,
       // `--all` and a path are not contradictory, but the answer to "who
@@ -319,8 +320,14 @@ export class HistoryPanel {
     }
   }
 
-  async refresh(): Promise<void> {
-    if (this.agent.state !== "online" || !this.agent.info?.gitVersion) {
+  /** Reload the history. Coalesced — one load in flight, one behind it — because
+   *  every change under `.git` asks for it and it re-reads the whole window that
+   *  is loaded. A caller still gets an answer from a load that began after it
+   *  asked. */
+  readonly refresh = singleFlight(() => this.load());
+
+  private async load(): Promise<void> {
+    if (this.codeAgent.state !== "online" || !this.codeAgent.info?.gitVersion) {
       this.commits = [];
       return this.render();
     }
@@ -451,7 +458,7 @@ export class HistoryPanel {
     if (this.details.has(oid) && parent === undefined) return;
     const side = parent ?? this.parentChoice.get(oid) ?? 1;
     try {
-      this.details.set(oid, await this.agent.call<CommitDetail>("git.commitDetail", { oid, parent: side }));
+      this.details.set(oid, await this.codeAgent.call<CommitDetail>("git.commitDetail", { oid, parent: side }));
       this.parentChoice.set(oid, side);
     } catch (err) {
       this.cb.toast(err instanceof Error ? err.message : String(err), true);
@@ -706,7 +713,7 @@ export class HistoryPanel {
     const short = oid.slice(0, 7);
     let range: Commit[];
     try {
-      range = await this.agent.call<Commit[]>("git.log", { ref: `${oid}~1..HEAD`, limit: 200 });
+      range = await this.codeAgent.call<Commit[]>("git.log", { ref: `${oid}~1..HEAD`, limit: 200 });
     } catch {
       // No parent — this is the root commit, and there is nothing to reset to.
       this.cb.toast(`${short} has no parent, so there is nothing to squash it into.`, true);
@@ -724,7 +731,7 @@ export class HistoryPanel {
     // Anything already on the upstream is history other people may have. The
     // status knows how far ahead the branch is; beyond that point, squashing
     // rewrites commits that have been published.
-    const st = await this.agent.call<GitStatus>("git.status").catch(() => null);
+    const st = await this.codeAgent.call<GitStatus>("git.status").catch(() => null);
     const published = st?.upstream ? Math.max(0, range.length - (st.ahead ?? 0)) : 0;
     const dirty = (st?.entries ?? []).filter((e) => !e.untracked && !e.ignored).length;
 
@@ -746,7 +753,7 @@ export class HistoryPanel {
     if (!ok) return;
 
     try {
-      await this.agent.call("git.reset", { oid: `${oid}~1`, mode: "soft" });
+      await this.codeAgent.call("git.reset", { oid: `${oid}~1`, mode: "soft" });
     } catch (e) {
       this.cb.toast(e instanceof Error ? e.message : String(e), true);
       return;
@@ -785,7 +792,7 @@ export class HistoryPanel {
    *  trade. */
   private async compareRefWith(left: string): Promise<void> {
     try {
-      const refs = await this.agent.call<Branch[]>("git.branches");
+      const refs = await this.codeAgent.call<Branch[]>("git.branches");
       const right = await pickRef({
         title: `Compare ${left} with which ref?`,
         hint: "Lists what is on each side that is not on the other.",
@@ -802,7 +809,7 @@ export class HistoryPanel {
 
   private async run(op: string, params: Record<string, unknown>, okMessage: string): Promise<void> {
     try {
-      await this.agent.call(op, params);
+      await this.codeAgent.call(op, params);
       this.cb.toast(okMessage);
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);

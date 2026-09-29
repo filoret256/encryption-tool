@@ -15,13 +15,13 @@
  *  The list, the filtering and the keyboard belong to quickpick.ts; what is
  *  here is what makes a ref a ref rather than a generic row.
  */
-import type { Branch } from "../../agent/protocol.ts";
+import type { Branch } from "../../code-agent/protocol.ts";
 import { quickPick, type PickItem } from "./quickpick.ts";
 import { esc } from "./ui.ts";
 
 export interface PickRefOptions {
   title: string;
-  /** Everything the agent listed. Filtered per `kinds` below. */
+  /** Everything the code-agent listed. Filtered per `kinds` below. */
   refs: Branch[];
   /** Which sections to offer. Deleting a branch, for instance, has no business
    *  showing tags. */

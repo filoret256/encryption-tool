@@ -14,9 +14,9 @@
   <meta name="csp-nonce" content="__CSP_NONCE__" />
   <!-- The loopback ports connect-src permits, filled in per request by the
        server (src/server.ts: PORTS_SLOT). The code tab reads it to explain a
-       refused agent connection, which the browser otherwise reports as an
+       refused code-agent connection, which the browser otherwise reports as an
        ordinary failure to connect. -->
-  <meta name="agent-ports" content="__AGENT_PORTS__" />
+  <meta name="code-agent-ports" content="__CODE_AGENT_PORTS__" />
   <link rel="stylesheet" href="/public/main.css" />
 
   <!-- PWA. Two theme-colour tags so the browser chrome follows the user's
@@ -36,14 +36,14 @@
       <button class="tab tab-helm" data-action="switch" data-tab="helm">helm-encrypt</button>
       <button class="tab tab-code" data-action="switch" data-tab="code">code</button>
     </div>
-    <!-- Everything here concerns the local agent — where to get one, and what it
+    <!-- Everything here concerns the local code-agent — where to get one, and what it
          can currently do — so it belongs beside the tab that uses it. main.ts
          reveals the group with the code tab and hides it again otherwise. -->
     <div id="code-tools" class="code-tools" hidden>
-      <!-- Download point for the prebuilt local agent. Hides itself as well when
+      <!-- Download point for the prebuilt local code-agent. Hides itself as well when
            the deployment publishes none. -->
-      <div id="agent-dl" hidden></div>
-      <!-- Capability badge: reports whether the local agent, git and ripgrep are
+      <div id="code-agent-dl" hidden></div>
+      <!-- Capability badge: reports whether the local code-agent, git and ripgrep are
            reachable, and what is unavailable without them. Mounted by main.ts. -->
       <div id="cap-badge"></div>
     </div>

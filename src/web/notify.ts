@@ -69,7 +69,7 @@ export function mountNotifier(host: HTMLElement): Notifier {
   const trim = (): void => {
     const all = [...host.children] as HTMLElement[];
     const errors = all.filter((el) => el.classList.contains("error"));
-    // A run of failures — a fetch that fails on every retry, a status the agent
+    // A run of failures — a fetch that fails on every retry, a status the code-agent
     // cannot answer — used to stack without limit, because errors were exempt
     // from eviction entirely. They still outrank successes; they just have a
     // ceiling now.

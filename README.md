@@ -18,7 +18,7 @@ your machine.
 | Tab / Вкладка | Scheme / Схема | Wire format / Формат |
 |---------------|---------------|----------------------|
 | **ansible-vault** | PBKDF2-HMAC-SHA256 (10000) → AES-256-CTR + HMAC-SHA256 | `$ANSIBLE_VAULT;1.1;AES256` (interoperable with the `ansible-vault` CLI) |
-| **helm** | PBKDF2-HMAC-SHA256 (10000) → AES-256-CBC + PKCS#7 | `base64(salt[16] + iv[16] + ciphertext)` |
+| **helm** | PBKDF2-HMAC-SHA256 (600000) → AES-256-GCM | `helm:v2:` + `base64(salt[16] + iv[12] + ciphertext + tag[16])`. The older `base64(salt[16] + iv[16] + ciphertext)` (AES-256-CBC, 10000 rounds, no authentication) is still decrypted, never written |
 | **code** | — | Editor over a local folder, backed by the system `git` |
 
 ### Encryption tabs / Вкладки шифрования
@@ -57,12 +57,12 @@ your machine.
   регионом кнопки `accept current` / `accept incoming` / `accept both`, затем
   `save & mark resolved`
 - **Live file watching** — дерево и открытые файлы обновляются при изменениях на диске
-- **Get agent** — кнопка рядом с вкладками (только на этой вкладке): готовый бинарник
+- **Get code-agent** — кнопка рядом с вкладками (только на этой вкладке): готовый бинарник
   агента под вашу ОС, команда запуска с уже подставленным origin и SHA-256
 
 ---
 
-## The local agent / Локальный агент
+## The local code-agent / Локальный агент
 
 A browser tab cannot spawn a process, so "use the git installed in the OS" necessarily
 means a small helper running on the user's machine. That helper is **the same binary**
@@ -73,11 +73,11 @@ in a second mode.
 
 ```bash
 # point it at a folder — the binary can live anywhere
-enc-tool-agent ~/work/my-project
+enc-tool-code-agent ~/work/my-project
 # or run it inside one / или просто в нужной папке
-enc-tool-agent
+enc-tool-code-agent
 #   in dev / в деве:
-bun run agent -- ~/work/my-project
+bun run code-agent -- ~/work/my-project
 ```
 
 Передавать папку аргументом удобнее, чем копировать бинарник в каждый проект:
@@ -86,21 +86,21 @@ bun run agent -- ~/work/my-project
 It prints a `ws://127.0.0.1:5001/ws?token=…` URL — paste it into the code tab
 (`connect…`). The tab remembers it.
 
-The agent takes the **first free port in 5001-5010**, so a second folder in a
-second tab needs no flag: start another agent and it lands on 5002. That range
+The code-agent takes the **first free port in 5001-5010**, so a second folder in a
+second tab needs no flag: start another code-agent and it lands on 5002. That range
 is not arbitrary — it is exactly what the page's `connect-src` permits (see
-`AGENT_PORTS` below), and a port outside it is refused by the browser before a
-packet leaves, which from the tab looks the same as an agent that never started.
-`--port` still pins one explicitly, and the agent says so on stderr if that port
+`CODE_AGENT_PORTS` below), and a port outside it is refused by the browser before a
+packet leaves, which from the tab looks the same as a code-agent that never started.
+`--port` still pins one explicitly, and the code-agent says so on stderr if that port
 falls outside the range.
 
 Агент сам занимает первый свободный порт из 5001-5010 — для второй папки флаг
 не нужен. Порт вне диапазона браузер не пропустит: его запрещает `connect-src`
-страницы, если приложение не запущено с `AGENT_PORTS`.
+страницы, если приложение не запущено с `CODE_AGENT_PORTS`.
 
 > **Why a loopback URL works from a page served by a cloud host.** `127.0.0.1` is
 > resolved by the browser, on the machine the browser is running on — the page's
-> JavaScript executes there, so the socket goes to the user's own agent and the
+> JavaScript executes there, so the socket goes to the user's own code-agent and the
 > server never takes part. Installing the app as a PWA changes none of this: it is
 > the same engine and the same network stack, only a different window.
 >
@@ -130,7 +130,7 @@ falls outside the range.
 The token is new on every run, so that one line would otherwise be selected with
 the mouse every single time. Two halves meet in the middle:
 
-- **the agent copies it** as it starts, through the platform's own clipboard
+- **the code-agent copies it** as it starts, through the platform's own clipboard
   tool (`clip`, `pbcopy`, `wl-copy`/`xclip`/`xsel`), and says so in the banner.
   Only when stdout is a terminal — piped output belongs to a script, not to
   someone about to paste — and never with `--no-clipboard`;
@@ -138,8 +138,8 @@ the mouse every single time. Two halves meet in the middle:
   `connect…` dialog also prefills from the clipboard where the browser permits
   reading it, falling back to the last URL used.
 
-A paste is only acted on when it is the agent's own URL — a loopback host, the
-`/ws` path, a token — and only while no agent is connected and the caret is not
+A paste is only acted on when it is the code-agent's own URL — a loopback host, the
+`/ws` path, a token — and only while no code-agent is connected and the caret is not
 in a field or in the editor. Anything else is left to paste where it was aimed.
 
 Токен новый при каждом запуске, поэтому агент сам кладёт URL в буфер обмена, а
@@ -154,16 +154,16 @@ in a field or in the editor. Anything else is left to paste where it was aimed.
 **Requires:** `git` on `PATH`. **Optional:** `ripgrep` — без него поиск использует
 более медленный встроенный обход.
 
-### Getting the agent / Как получить агента
+### Getting the code-agent / Как получить агента
 
-The app itself normally runs in a container, and an agent there would be
+The app itself normally runs in a container, and a code-agent there would be
 pointless: it would expose the pod's filesystem rather than yours, and its
-loopback is not your browser's. So the image carries cross-compiled agents and
-hands them out — **⤓ get agent**, beside the tabs, shown only on the code tab.
+loopback is not your browser's. So the image carries cross-compiled code-agents and
+hands them out — **⤓ get code-agent**, beside the tabs, shown only on the code tab.
 
 Само приложение обычно работает в контейнере, где агент бессмысленен — он открыл
 бы файловую систему пода, а не вашу. Поэтому образ несёт кросс-собранные
-бинарники и раздаёт их: кнопка **⤓ get agent** рядом с вкладками, видна только на
+бинарники и раздаёт их: кнопка **⤓ get code-agent** рядом с вкладками, видна только на
 вкладке code.
 
 The panel picks the archive for your platform, states its size and SHA-256, and
@@ -187,56 +187,56 @@ unsigned, so Windows SmartScreen may still warn on first run.
 Build them yourself with:
 
 ```bash
-bun run agents:build                      # all five, ~14 MB, into dist/agents
-bun run agents:build --targets linux-x64  # or just one
-bun run agents:build --runtime bun        # the TypeScript agent instead (~166 MB)
+bun run code-agents:build                      # all five, ~14 MB, into dist/code-agents
+bun run code-agents:build --targets linux-x64  # or just one
+bun run code-agents:build --runtime bun        # the TypeScript code-agent instead (~166 MB)
 ```
 
-The agent that ships is the Go program in `agent-go/` — same protocol, about a
+The code-agent that ships is the Go program in `code-agent-go/` — same protocol, about a
 twelfth of the size, because a Bun binary has to embed the whole runtime. Both
 implementations are kept working and are tested against each other; see
-[Two agents](#two-agents--два-агента).
+[Two code-agents](#two-code-agents--два-агента).
 
-Агент, который раздаётся, — это Go-программа в `agent-go/`: тот же протокол и
+Агент, который раздаётся, — это Go-программа в `code-agent-go/`: тот же протокол и
 в двенадцать раз меньше, потому что бинарник Bun несёт в себе весь рантайм.
 
-Agents are versioned and users keep them, so a tab and its agent drift apart on
+Code-agents are versioned and users keep them, so a tab and its code-agent drift apart on
 their own. The capability badge compares the two and says so, instead of letting
 the mismatch surface later as an unexplained protocol error.
 
-### Two agents / Два агента
+### Two code-agents / Два агента
 
-There are two implementations of the same agent, and that is deliberate.
+There are two implementations of the same code-agent, and that is deliberate.
 
-`src/agent/` is the TypeScript one — the reference, and what `bun run agent`
-starts while you work on it. `agent-go/` is the Go port, and it is what gets
+`src/code-agent/` is the TypeScript one — the reference, and what `bun run code-agent`
+starts while you work on it. `code-agent-go/` is the Go port, and it is what gets
 built, packed and handed to users, because a compiled Bun binary embeds the
 whole JavaScript runtime: 25–40 MB per platform against roughly 3 MB.
 
 Two implementations of one protocol usually means two subtly different
 protocols. What keeps that from happening here is that neither has its own test
-suite. `bun run agent:smoke` starts both, drives both over a real WebSocket with
+suite. `bun run code-agent:smoke` starts both, drives both over a real WebSocket with
 the same requests, and then **compares their replies field for field** — not just
 that both passed, but that both returned the same JSON, down to the wording of a
 "file not found". A drift in a `git status` parser or a missing `null` fails the
 run and names the first differing byte.
 
 That is also how the port paid for itself early: comparing the two turned up a
-crash in the *TypeScript* agent, where a rejected argument (`git.checkout` with a
+crash in the *TypeScript* code-agent, where a rejected argument (`git.checkout` with a
 ref beginning with `-`) threw synchronously and killed the process — a denial of
 service reachable with exactly the input the validation existed to catch.
 
 Две реализации одного протокола обычно расходятся. Здесь этого не происходит
-потому, что у них нет отдельных тестов: `bun run agent:smoke` поднимает обе,
+потому, что у них нет отдельных тестов: `bun run code-agent:smoke` поднимает обе,
 гоняет одни и те же запросы и сравнивает ответы побайтно.
 
-The Go agent needs a toolchain only to build; users get a static binary that
+The Go code-agent needs a toolchain only to build; users get a static binary that
 needs nothing. Set `GO_BIN` if your Go is unpacked somewhere off `PATH`. Without
 any Go at all, the smoke suite says so and runs the TypeScript half.
 
 ### Security / Безопасность
 
-The agent is a filesystem bridge, so five things gate it:
+The code-agent is a filesystem bridge, so five things gate it:
 
 1. binds **`127.0.0.1` only** — never reachable from the network;
 2. a **token** is required on every connection;
@@ -245,16 +245,16 @@ The agent is a filesystem bridge, so five things gate it:
    and nothing else. A request with **no** `Origin` is refused unless
    `--allow-no-origin` says otherwise — a browser always sends one, so a missing
    `Origin` is never the app;
-4. the **`Host` header** must name this agent: `127.0.0.1`, `localhost` or `[::1]`
+4. the **`Host` header** must name this code-agent: `127.0.0.1`, `localhost` or `[::1]`
    on its own port. This is what stops DNS rebinding, where a name the attacker
    controls resolves to `127.0.0.1` and the request arrives here under it;
 5. every path is confined to the workspace — lexical checks plus a `realpath` test, so
    a symlink inside the folder cannot point out of it.
 
-One client at a time. The agent takes a single connection and refuses the rest
+One client at a time. The code-agent takes a single connection and refuses the rest
 while it is held — so it is always clear which page has the folder — and says so
 on stderr: `client connected … locked`, `refused a second client`,
-`client disconnected … unlocked`. A second tab is told the agent is busy rather
+`client disconnected … unlocked`. A second tab is told the code-agent is busy rather
 than left guessing why it will not connect. `--allow-multiple` lifts the limit
 for the case where two panes onto one folder is the point.
 
@@ -266,17 +266,17 @@ process per keystroke.
 
 Git is spawned with an argv array (never a shell) and `GIT_TERMINAL_PROMPT=0`.
 Credentials are never handled by this app: the system credential helper and your SSH
-agent do that, so no token ever reaches the browser or the server.
+code-agent do that, so no token ever reaches the browser or the server.
 
-> **Deployment note.** To reach an agent from a UI hosted elsewhere, each user runs
-> `enc-tool agent --allow-origin https://your-host`, or sets `ENC_TOOL_ALLOW_ORIGIN`
+> **Deployment note.** To reach a code-agent from a UI hosted elsewhere, each user runs
+> `enc-tool code-agent --allow-origin https://your-host`, or sets `ENC_TOOL_ALLOW_ORIGIN`
 > once instead of passing the flag every time. Any page from that origin can then
-> talk to that user's agent — trusting the server means trusting it with your working
+> talk to that user's code-agent — trusting the server means trusting it with your working
 > directory. Without either, only the app's own default port on `localhost` connects.
 >
 > Serving the app on some other local port? Name it: `--allow-origin http://localhost:3000`.
-> Every refusal is logged to the agent's stderr with the flag that would permit it,
-> because a rejected connection looks identical to a stopped agent from the browser.
+> Every refusal is logged to the code-agent's stderr with the flag that would permit it,
+> because a rejected connection looks identical to a stopped code-agent from the browser.
 
 ---
 
@@ -298,19 +298,19 @@ files needed to run it:
 ```bash
 bun run build
 bun run compile      # -> ./server (embeds public/, index.html, manifest, icons)
-bun run agents:build # optional: -> dist/agents, offered by the code tab
+bun run code-agents:build # optional: -> dist/code-agents, offered by the code tab
 ./server             # serves on :5000
-./server agent       # the local filesystem + git bridge
+./server code-agent       # the local filesystem + git bridge
 ```
 
-The agent archives stay on disk rather than being embedded — folding another
+The code-agent archives stay on disk rather than being embedded — folding another
 14 MB of executables into the executable that serves them helps nobody. Without them the
 download button simply does not appear.
 
 ### Docker
 
 Multi-stage build: Bun compiles the server binary, a second stage borrows the Go
-toolchain from the official image and cross-compiles all five agents from that
+toolchain from the official image and cross-compiles all five code-agents from that
 one Linux image (`CGO_ENABLED=0`, so no target SDK is involved), and both land in
 a minimal `debian:bookworm-slim` image.
 
@@ -319,31 +319,70 @@ docker build -t encryption-tool .
 docker run -p 5000:5000 encryption-tool
 ```
 
-The agents add about 3 MB each, so which ones ship is still a build argument —
+The code-agents add about 3 MB each, so which ones ship is still a build argument —
 and they are copied in before the server binary, as the slower-changing layer
 that should stay cached when only the app changes.
 
 ```bash
 # only what your users actually run
-docker build --build-arg AGENT_TARGETS=windows-x64,darwin-arm64 -t encryption-tool .
+docker build --build-arg CODE_AGENT_TARGETS=windows-x64,darwin-arm64 -t encryption-tool .
 
 # none at all, serving them from a mirror instead
-docker build --build-arg AGENT_TARGETS= -t encryption-tool .
-docker run -p 5000:5000 -e AGENT_DOWNLOAD_BASE=https://artifacts.internal/enc-tool encryption-tool
+docker build --build-arg CODE_AGENT_TARGETS= -t encryption-tool .
+docker run -p 5000:5000 -e CODE_AGENT_DOWNLOAD_BASE=https://artifacts.internal/enc-tool encryption-tool
 ```
 
 Cross-compilation fetches each target's runtime from Bun's CDN, so that stage
 needs network access.
 
+**Base images are pinned by digest** (`image:tag@sha256:…` in the `Dockerfile`), so
+a build pulls what was reviewed, not what a tag has come to mean. A pin never moves
+on its own, so update them on purpose — `bun scripts/pin-images.ts` reports which
+are behind (exit code 1, fit for a scheduled job) and `--write` rewrites them.
+
+**A mirror can carry the files while the image carries the checksums.** Put the
+`code-agents.json` from your own build in `CODE_AGENT_DIR` with no archives beside it and set
+`CODE_AGENT_DOWNLOAD_BASE`: the code tab links to the mirror and shows the manifest's
+SHA-256 and size. The checksum then comes from the build that made the image, not
+from the host that serves the download, so a swapped mirror cannot vouch for
+itself. Without `code-agents.json` the tab still links to the mirror, but claims no
+checksum for files it has not seen.
+
+**Releases can be signed.** Checksums protect against corruption and, with the
+arrangement above, against a swapped mirror; they do not say who made the list. A
+signature does:
+
+```bash
+bun scripts/release-key.ts --out ~/keys/enc-tool          # once: Ed25519 key pair
+bun scripts/build-code-agents.ts --sign-key ~/keys/enc-tool.pem # writes SHA256SUMS.sig
+bun scripts/verify-release.ts --key ~/keys/enc-tool.pub.pem dist/code-agents
+```
+
+Users without bun verify the same signature with OpenSSL 1.1.1 or later and
+`sha256sum`, and need nothing from this repository:
+
+```bash
+openssl pkeyutl -verify -pubin -inkey enc-tool.pub.pem -rawin -in SHA256SUMS -sigfile SHA256SUMS.sig
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+What this does not settle, and cannot from inside the repository: where the
+private key lives, and how users come to trust the public one. A public key fetched
+from the same place as the download proves nothing the download did not — publish it
+(or its fingerprint) somewhere else, and keep the private key off the build host
+and out of the image. The binaries themselves are still not Authenticode-signed or
+notarized, so Windows SmartScreen and macOS Gatekeeper will still warn; that needs
+a certificate and an Apple developer account.
+
 | Variable | Meaning |
 |----------|---------|
-| `AGENT_DIR` | where the archives and `agents.json` live (default: `/usr/local/share/enc-tool/agents`, then `dist/agents`) |
-| `AGENT_DOWNLOAD_BASE` | serve the archives from a mirror rather than from this image |
-| `AGENT_PORTS` | loopback ports the code tab may connect to — ports and `low-high` ranges, comma-separated (default: `5001-5010`) |
+| `CODE_AGENT_DIR` | where the archives and `code-agents.json` live (default: `/usr/local/share/enc-tool/code-agents`, then `dist/code-agents`) |
+| `CODE_AGENT_DOWNLOAD_BASE` | serve the archives from a mirror rather than from this image |
+| `CODE_AGENT_PORTS` | loopback ports the code tab may connect to — ports and `low-high` ranges, comma-separated (default: `5001-5010`) |
 
-`AGENT_PORTS` is what `connect-src` in the CSP permits, and the agent binds the
+`CODE_AGENT_PORTS` is what `connect-src` in the CSP permits, and the code-agent binds the
 first free port in the same range, so the two agree out of the box and several
-folders can be open at once. If your users start agents with `--port` outside
+folders can be open at once. If your users start code-agents with `--port` outside
 5001-5010, list those ports here — otherwise the browser refuses the connection
 before it is made, and the code tab says which port was blocked and which ones
 are allowed. A value that is not a port or a range stops the server at startup
@@ -361,7 +400,7 @@ Installable and works offline. `bun run icons` regenerates the icon set procedur
 - `manifest.webmanifest` + 192/512/maskable icons and an `apple-touch-icon` for iOS
 - service worker: network-first for the shell **and for scripts and styles**, with
   the cache as the offline fallback; icons and the manifest are
-  stale-while-revalidate; cross-origin requests pass straight through (the agent
+  stale-while-revalidate; cross-origin requests pass straight through (the code-agent
   lives on another origin)
 - the cache is keyed by the app version, so a release drops the previous one and
   the worker itself changes — which is what raises the update bar
@@ -380,7 +419,7 @@ WebCrypto), вкладка code — пока запущен локальный �
 
 ### Capability badge / Значок возможностей
 
-A chip in the header reports what is actually available — local agent, git, ripgrep,
+A chip in the header reports what is actually available — local code-agent, git, ripgrep,
 live watching, secure context, installed-as-app — with the reason and the fix for
 anything missing. Controls that need a missing capability are disabled and marked.
 
@@ -389,26 +428,26 @@ anything missing. Controls that need a missing capability are disabled and marke
 
 ---
 
-## API Endpoints / API эндпоинты
+## HTTP routes / HTTP-маршруты
 
-The UI no longer uses these — encryption happens in the page. They remain for API
-clients. Вкладки шифрования их не вызывают; эндпоинты оставлены для API-клиентов.
+The server does no cryptography. Encryption runs in the page, so a password never
+reaches it; earlier versions also exposed `POST /helm/*` and `POST /ansible/*` for API
+clients, and those are gone — they were unauthenticated, ran a key derivation per
+request, and were the one place a password could have crossed the network. Use the
+`ansible-vault` CLI, or import `src/crypto/` directly.
 
-| Endpoint / Эндпоинт | Method / Метод | Body / Тело запроса | Response / Ответ |
-|---------------------|----------------|---------------------|------------------|
-| `/helm/encrypt` | POST | `{text, password}` | `{result}` |
-| `/helm/decrypt` | POST | `{text, password}` | `{result}` |
-| `/ansible/encrypt` | POST | `{text, password}` | `{result}` |
-| `/ansible/decrypt` | POST | `{text, password}` | `{result}` |
+Сервер ничего не шифрует: шифрование идёт в странице, пароль до сервера не доходит.
+Эндпоинты `POST /helm/*` и `POST /ansible/*` удалены: они были без аутентификации,
+считали KDF на каждый запрос и были единственным местом, где пароль мог уйти по сети.
 
 Static routes: `/`, `/public/*`, `/sw.js`, `/manifest.webmanifest`.
 
-Agent distribution:
+Code-agent distribution:
 
 | Endpoint / Эндпоинт | Method | Response / Ответ |
 |---------------------|--------|------------------|
-| `/agent/downloads` | GET | `{version, builds[]}` — platform, size and SHA-256 of each published agent |
-| `/agent/download/<file>` | GET | the archive itself; only names present in `agents.json` are served |
+| `/code-agent/downloads` | GET | `{version, builds[]}` — platform, size and SHA-256 of each published code-agent |
+| `/code-agent/download/<file>` | GET | the archive itself; only names present in `code-agents.json` are served |
 
 ---
 
@@ -419,22 +458,22 @@ Nothing is shared between users, by construction rather than by convention:
 - **crypto** runs in the page — plaintext and passwords never reach the server;
 - **the server** keeps no state, no session and no cookie — there is nothing for two
   requests to share;
-- **the code tab** talks only to the user's own loopback agent, jailed to one folder,
-  and the CSP pins `connect-src` to that agent's port — not to loopback at large,
+- **the code tab** talks only to the user's own loopback code-agent, jailed to one folder,
+  and the CSP pins `connect-src` to that code-agent's port — not to loopback at large,
   which would be a channel to every other service on the machine;
-- **the download route** resolves a request only against the names in `agents.json`,
+- **the download route** resolves a request only against the names in `code-agents.json`,
   so nothing else on that directory's path is reachable through it;
 - every response carries a strict **CSP**: `script-src 'self'`, nothing remote, and
   no `'unsafe-inline'` in any directive. The one `<style>` the app creates at
   runtime — CodeMirror mounting its themes — is admitted by a per-request nonce
-  the shell carries; `connect-src` reaches the agent's port and nothing else on
+  the shell carries; `connect-src` reaches the code-agent's port and nothing else on
   loopback. Alongside it: `nosniff`, `no-referrer`, COOP, CORP, `X-Frame-Options`,
   HSTS and a `Permissions-Policy`; crypto responses are `Cache-Control: no-store`.
   All of them are stamped on the way out of the request handler, so a route cannot
   be added without them. HSTS carries no `includeSubDomains`: TLS is terminated by
   whatever proxy runs in front, and the app has no cookie a sibling host could reach.
 
-The CSP matters because the agent's token lives in `localStorage`: script injection on
+The CSP matters because the code-agent's token lives in `localStorage`: script injection on
 this origin would otherwise be script injection into someone's working directory.
 
 Проверяется тестами `bun run isolation:smoke` и `bun run download:smoke`, а не
@@ -444,14 +483,14 @@ this origin would otherwise be script injection into someone's working directory
 
 ## Testing / Тесты
 
-Every suite spawns real processes — a real server, a real agent, a real `git` — against
+Every suite spawns real processes — a real server, a real code-agent, a real `git` — against
 throwaway repositories. Ни один не использует моки.
 
 ```bash
 bun run crypto:smoke      # WebCrypto ports interoperate with the previous node:crypto code
 bun run isolation:smoke   # 60 concurrent users, jail escapes, loopback binding, CSP
-bun run agent:smoke       # both agents, same checks, replies diffed against each other
-bun run agent:test        # the Go agent's unit tests (WebSocket codec, RFC 6455 vector)
+bun run code-agent:smoke       # both code-agents, same checks, replies diffed against each other
+bun run code-agent:test        # the Go code-agent's unit tests (WebSocket codec, RFC 6455 vector)
 bun run protocol:check    # the two protocol definitions still describe the same wire
 bun run git:smoke         # staging, commits, branches, merge/rebase/revert/reset, conflicts
 bun run graph:smoke       # commit-graph lane layout and its SVG output
@@ -468,15 +507,15 @@ bunx tsc --noEmit
 ```
 .
 ├── src/
-│   ├── server.ts          # Bun HTTP server; `server agent` starts the bridge instead
-│   ├── version.ts         # stated once; the agent and the tab compare it
+│   ├── server.ts          # Bun HTTP server; `server code-agent` starts the bridge instead
+│   ├── version.ts         # stated once; the code-agent and the tab compare it
 │   ├── crypto/            # WebCrypto — runs in both Bun and the browser
-│   │   ├── helm.ts        # PBKDF2 + AES-256-CBC
+│   │   ├── helm.ts        # PBKDF2 + AES-256-GCM (reads the legacy CBC format)
 │   │   ├── ansible.ts     # PBKDF2 + AES-256-CTR + HMAC-SHA256
 │   │   ├── pkcs7.ts       # PKCS#7 padding
 │   │   ├── bytes.ts       # hex/base64/utf8, constant-time compare
 │   │   └── index.ts
-│   ├── agent/             # local filesystem + git bridge (loopback WebSocket)
+│   ├── code-agent/             # local filesystem + git bridge (loopback WebSocket)
 │   │   ├── main.ts        # server, auth, origin allowlist, op dispatch
 │   │   ├── jail.ts        # path containment (lexical + realpath)
 │   │   ├── proc.ts        # argv-only spawn, line streaming
@@ -485,10 +524,10 @@ bunx tsc --noEmit
 │   │   ├── git-write.ts   # staging, commits, branches, merge/rebase, remotes
 │   │   ├── search.ts      # ripgrep with a `git ls-files` fallback
 │   │   ├── watch.ts       # debounced recursive fs.watch
-│   │   ├── targets.ts     # the platforms agents are built for; shared naming
+│   │   ├── targets.ts     # the platforms code-agents are built for; shared naming
 │   │   └── protocol.ts    # wire types, shared with the browser — the definition
-│   │                      # both agents and the browser are written against
-├── agent-go/              # the agent that actually ships: same protocol, ~7 MB
+│   │                      # both code-agents and the browser are written against
+├── code-agent-go/              # the code-agent that actually ships: same protocol, ~7 MB
 │   ├── main.go            # CLI, startup banner, capability probes
 │   ├── server.go          # HTTP + WebSocket, auth, origin allowlist, op table
 │   ├── ws.go              # RFC 6455 server, hand-written, no dependency
@@ -500,12 +539,12 @@ bunx tsc --noEmit
 │       ├── main.ts        # crypto tabs, capability badge, service-worker lifecycle
 │       ├── code.ts        # entry for the lazily-loaded code tab bundle
 │       ├── code/          # explorer, tabs, search, git panel, history, graph,
-│       │                  # diff, conflicts, agent client, download panel
+│       │                  # diff, conflicts, code-agent client, download panel
 │       ├── sw.ts          # service worker
 │       ├── manifest.webmanifest, icons/
 │       └── index.html, style.css, editor.ts, yaml-lint.ts
 ├── scripts/
-│   ├── build-agents.ts    # cross-compile the agent and pack it for download
+│   ├── build-code-agents.ts    # cross-compile the code-agent and pack it for download
 │   ├── protocol-check.ts  # fails the build if the two protocol files disagree
 │   ├── go-toolchain.ts    # locating Go (GO_BIN), shared by build and test
 │   ├── go.ts              # passthrough: `bun scripts/go.ts test ./...`
@@ -515,7 +554,7 @@ bunx tsc --noEmit
 │   └── *-smoke.ts         # the eight test suites
 ├── THIRD-PARTY-LICENSES.md
 ├── package.json
-└── Dockerfile             # server binary + cross-compiled agents -> bookworm-slim
+└── Dockerfile             # server binary + cross-compiled code-agents -> bookworm-slim
 ```
 
 Two icon sets, kept apart on purpose. `src/web/code/icons.ts` is the activity
@@ -531,14 +570,14 @@ The licence travels with them in `THIRD-PARTY-LICENSES.md`.
 
 - **Backend:** Bun + TypeScript (`Bun.serve`, WebCrypto)
 - **Frontend:** CodeMirror 6 (+ `@codemirror/merge`), TypeScript, no framework
-- **Editor backend:** the system `git` and `ripgrep`, driven by the local agent
-- **Encryption:** AES-256-CBC, AES-256-CTR, HMAC-SHA256, PBKDF2 — via WebCrypto
+- **Editor backend:** the system `git` and `ripgrep`, driven by the local code-agent
+- **Encryption:** AES-256-GCM, AES-256-CTR, HMAC-SHA256, PBKDF2 (+ AES-256-CBC, read-only) — via WebCrypto
 - **Deployment:** standalone compiled binary on `debian:bookworm-slim`, PWA over HTTPS
 
 ### Browser support / Поддержка браузеров
 
 Chromium and Firefox are fully supported. **WebKit/Safari** blocks `ws://127.0.0.1`
-from an https page, so the code tab cannot reach an agent there — the capability badge
+from an https page, so the code tab cannot reach a code-agent there — the capability badge
 says so explicitly. Вкладки шифрования работают везде.
 
 ---

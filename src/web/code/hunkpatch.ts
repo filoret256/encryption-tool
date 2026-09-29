@@ -1,7 +1,7 @@
 /** Turning one change in a diff back into a patch git will apply.
  *
  *  Staging a single hunk is `git apply --cached` with a unified diff on stdin —
- *  there is no "stage lines 40 to 52" in git's porcelain. The agent grew
+ *  there is no "stage lines 40 to 52" in git's porcelain. The code-agent grew
  *  `git.applyPatch` for the delivery; this is the half that has to write a
  *  patch git accepts, which is stricter than it looks:
  *
@@ -80,7 +80,7 @@ function ranges(before: string, after: string, lenA: number, lenB: number): Rang
 
 /** One patch per change, in the order the diff view shows them.
  *
- *  `before` and `after` are the two sides exactly as they came from the agent.
+ *  `before` and `after` are the two sides exactly as they came from the code-agent.
  *  Which is which matters: staging means "make the index look like the
  *  worktree", so `before` is the index side and `after` the worktree side, and
  *  the same patch reversed is what unstages it.

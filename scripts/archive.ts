@@ -1,7 +1,7 @@
 /** Minimal tar.gz and zip writers.
  *
  *  Both formats are a few hundred bytes of header around the payload, and
- *  writing them here keeps the agent build stage free of `tar`, `zip` and any
+ *  writing them here keeps the code-agent build stage free of `tar`, `zip` and any
  *  npm dependency — it needs nothing but Bun and a network route to Bun's CDN.
  *
  *  Why two formats at all: a binary downloaded straight from a browser arrives
