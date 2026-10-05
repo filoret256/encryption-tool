@@ -17,7 +17,7 @@
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash, createPrivateKey, sign } from "node:crypto";
 import { join, resolve } from "node:path";
-import { TARGETS, archiveName, byId, type CodeAgentTarget } from "../src/code-agent/targets.ts";
+import { TARGETS, archiveName, byId, exeName, manifestName, type AgentName, type CodeAgentTarget } from "../src/code-agent/targets.ts";
 import { VERSION } from "../src/version.ts";
 import { pack } from "./archive.ts";
 import { findGo, GO_MISSING } from "./go-toolchain.ts";
@@ -31,10 +31,12 @@ interface Args {
   /** Private key (PEM, Ed25519) to sign SHA256SUMS with. */
   signKey: string | undefined;
   runtime: Runtime;
+  /** Which agent to build: the code-agent (code-agent-go/) or the kafka-agent (kafka-agent-go/). */
+  agent: AgentName;
 }
 
 function parse(argv: string[]): Args {
-  const a: Args = { targets: TARGETS, out: "dist/code-agents", keep: false, signKey: process.env.CODE_AGENT_SIGN_KEY || undefined, runtime: "go" };
+  const a: Args = { targets: TARGETS, out: "", agent: "code-agent", keep: false, signKey: process.env.CODE_AGENT_SIGN_KEY || undefined, runtime: "go" };
   for (let i = 0; i < argv.length; i++) {
     const [flag, inline] = argv[i].split(/=(.*)/s);
     const value = (): string => inline ?? argv[++i] ?? "";
@@ -51,6 +53,12 @@ function parse(argv: string[]): Args {
         break;
       }
       case "--out": a.out = value(); break;
+      case "--agent": {
+        const n = value();
+        if (n !== "code" && n !== "kafka") throw new Error(`--agent must be code or kafka, got "${n}"`);
+        a.agent = `${n}-agent`;
+        break;
+      }
       case "--keep-binaries": a.keep = true; break;
       case "--sign-key": a.signKey = value(); break;
       case "--runtime": {
@@ -64,7 +72,9 @@ function parse(argv: string[]): Args {
 
   --targets <ids>    comma-separated, or empty to build none
                      (${TARGETS.map((t) => t.id).join(", ")})
-  --out <dir>        output directory (default: dist/code-agents)
+  --agent <name>     code (default) or kafka — which agent to build. The kafka-agent is
+                     Go only, and is packed as kafka-agent-<version>-<platform>.
+  --out <dir>        output directory (default: dist/code-agents, or dist/kafka-agents)
   --runtime <name>   go (default) or bun — which implementation to ship.
                      The Go build is ~7 MB per platform against Bun's ~60-100,
                      because a Bun binary embeds the whole runtime.
@@ -76,6 +86,8 @@ function parse(argv: string[]): Args {
         process.exit(0);
     }
   }
+  if (a.agent === "kafka-agent" && a.runtime !== "go") throw new Error("the kafka-agent has no Bun implementation; use --runtime go");
+  a.out ||= `dist/${a.agent}s`;
   return a;
 }
 
@@ -125,7 +137,7 @@ async function goBuild(go: string, t: CodeAgentTarget, outfile: string): Promise
   const proc = Bun.spawn(
     [go, "build", "-trimpath", "-ldflags", `-s -w -X main.version=${VERSION}`, "-o", resolve(outfile), "."],
     {
-      cwd: "code-agent-go",
+      cwd: `${args.agent}-go`,
       env: { ...process.env, GOOS: t.goos, GOARCH: t.goarch, CGO_ENABLED: "0" },
       stdout: "inherit",
       stderr: "inherit",
@@ -152,15 +164,16 @@ if (args.runtime === "go" && args.targets.length && !go) throw new Error(GO_MISS
 for (const t of args.targets) {
   const started = Date.now();
   // Bun appends .exe for Windows targets, so ask for the final name directly.
-  const outfile = join(work, t.exe);
+  const exe = exeName(t, args.agent);
+  const outfile = join(work, exe);
   if (go) await goBuild(go, t, outfile);
   else await bunBuild(t, outfile);
 
   const binary = await readFile(outfile);
-  const archive = pack(t.kind, [{ name: t.exe, data: binary, mode: 0o755 }]);
-  const file = archiveName(t, VERSION);
+  const archive = pack(t.kind, [{ name: exe, data: binary, mode: 0o755 }]);
+  const file = archiveName(t, VERSION, args.agent);
   await writeFile(join(args.out, file), archive);
-  if (args.keep) await writeFile(join(args.out, `${t.id}-${t.exe}`), binary);
+  if (args.keep) await writeFile(join(args.out, `${t.id}-${exe}`), binary);
   await rm(outfile, { force: true });
 
   manifest.builds.push({
@@ -168,7 +181,7 @@ for (const t of args.targets) {
     os: t.os,
     arch: t.arch,
     label: t.label,
-    exe: t.exe,
+    exe,
     kind: t.kind,
     file,
     size: archive.length,
@@ -180,7 +193,7 @@ for (const t of args.targets) {
 }
 
 await rm(work, { recursive: true, force: true });
-await writeFile(join(args.out, "code-agents.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+await writeFile(join(args.out, manifestName(args.agent)), `${JSON.stringify(manifest, null, 2)}\n`);
 // A plain SHA256SUMS as well, so `sha256sum -c` works for anyone who mirrors
 // the archives outside this app.
 await writeFile(

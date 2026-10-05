@@ -18,10 +18,12 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { iter } from "../src/code-agent/proc.ts";
+import { OutputTooLarge, TimedOut, gitSubcommand, iter, procDeadlines, runLimited, runLines } from "../src/code-agent/proc.ts";
+import { search } from "../src/code-agent/search.ts";
+import { Jail } from "../src/code-agent/jail.ts";
 import { findGo } from "./go-toolchain.ts";
 import { VERSION } from "../src/version.ts";
-import type { CodeAgentInfo, Branch, Commit, CommitDetail, DirEntry, DiffPair, FileRead, GitStatus, SearchHit } from "../src/code-agent/protocol.ts";
+import type { CodeAgentInfo, BlamePage, BranchList, Commit, CommitDetail, DirEntry, DiffPair, FileRead, GitStatus, SearchHit, SearchSummary } from "../src/code-agent/protocol.ts";
 
 interface Result {
   name: string;
@@ -54,7 +56,7 @@ const argvFor = (impl: Impl, root: string, port: number, extra: string[] = []): 
 // ── building the Go code-agent ─────────────────────────────────────────────────
 
 async function buildGoCodeAgent(go: string): Promise<string> {
-  const out = join("dist", "code-agent-go", process.platform === "win32" ? "enc-tool-code-agent.exe" : "enc-tool-code-agent");
+  const out = join("dist", "code-agent-go", process.platform === "win32" ? "code-agent.exe" : "code-agent");
   await mkdir(join("dist", "code-agent-go"), { recursive: true });
   // The version is stamped in even here: code-agent.info is compared field by field
   // between the two code-agents, and "dev" against "4.0.0" would be a false alarm.
@@ -107,7 +109,34 @@ function canonical(value: unknown): unknown {
 
 const stable = (v: unknown): string => JSON.stringify(canonical(v));
 
+/** The hits a scan streamed, whichever shape the code-agent sent them in: one
+ *  per frame, which is what it used to do, or in batches, which is what it does
+ *  now (P9). Both are read here so a check about *what was found* does not
+ *  depend on how it was carried. */
+function streamedHits(chunks: unknown[]): SearchHit[] {
+  const out: SearchHit[] = [];
+  for (const c of chunks) {
+    const f = c as { hit?: SearchHit; hits?: SearchHit[] };
+    if (Array.isArray(f.hits)) out.push(...f.hits);
+    else if (f.hit) out.push(f.hit);
+  }
+  return out;
+}
+
+/** How many frames carried hits, which is the number batching is about. */
+const hitFrames = (chunks: unknown[]): number => {
+  let n = 0;
+  for (const c of chunks) {
+    const f = c as { hit?: SearchHit; hits?: SearchHit[] };
+    if (f.hit || (Array.isArray(f.hits) && f.hits.length)) n++;
+  }
+  return n;
+};
+
 // ── the wire client ───────────────────────────────────────────────────────
+
+/** How long one request may go unanswered before it counts as a failure. */
+const REPLY_TIMEOUT_MS = 120_000;
 
 type Call = <T>(op: string, params?: Record<string, unknown>, track?: boolean) => Promise<T> & { chunks: unknown[] };
 
@@ -181,7 +210,10 @@ async function connect(
     if ("chunk" in frame) return void entry.chunks.push(frame.chunk);
     pending.delete(frame.id as number);
     if (frame.ok) entry.resolve(frame.data);
-    else entry.reject(new Error(String(frame.error)));
+    // The code is carried as well as the sentence: EBUSY and EGIT are different
+    // answers, and a check that had to match prose to tell them apart would
+    // break the first time the sentence was reworded.
+    else entry.reject(Object.assign(new Error(String(frame.error)), { code: frame.code }));
   });
 
   /** `track: false` keeps a reply out of the cross-code-agent comparison. Needed
@@ -192,7 +224,25 @@ async function connect(
     const chunks: unknown[] = [];
     const key = `${tag}${op} ${JSON.stringify(params)}`;
     const p = new Promise<T>((resolve, reject) => {
-      pending.set(id, { resolve: resolve as (v: unknown) => void, reject, chunks });
+      // The whole suite hangs on one unanswered request otherwise — and it
+      // hangs silently, because a promise that never settles prints nothing.
+      // Twelve checks in, that cost half an hour twice. Every op this suite
+      // issues answers in well under a second when the code-agent is well.
+      const timer = setTimeout(() => {
+        if (!pending.delete(id)) return;
+        reject(new Error(`${op} did not answer in ${Math.round(REPLY_TIMEOUT_MS / 1000)} s`));
+      }, REPLY_TIMEOUT_MS);
+      pending.set(id, {
+        resolve: (v) => {
+          clearTimeout(timer);
+          (resolve as (v: unknown) => void)(v);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        },
+        chunks,
+      });
       ws.send(JSON.stringify({ id, op, ...params }));
     });
     // Errors are recorded too: the two code-agents must fail alike, not merely
@@ -350,12 +400,40 @@ async function suite(impl: Impl, sandbox: Sandbox): Promise<{ results: Result[];
 
     const status = await call<GitStatus>("git.status");
     check("git.status", status.branch !== null, `branch=${status.branch} entries=${status.entries.length}`);
+    check(
+      "git.status says how many changes there are, and whether it stopped",
+      status.entryCount === status.entries.length && status.truncated === false,
+      `${status.entries.length} entries, entryCount ${status.entryCount}, truncated ${status.truncated}`,
+    );
 
     const commits = await call<Commit[]>("git.log", { limit: 5 });
     check("git.log", commits.length > 0 && /^[0-9a-f]{40}$/.test(commits[0]?.oid ?? ""), `${commits.length} commits, head="${commits[0]?.subject}"`);
 
-    const branches = await call<Branch[]>("git.branches");
-    check("git.branches", branches.some((b) => b.head), branches.map((b) => b.name).join(", "));
+    const refs = await call<BranchList>("git.branches");
+    check("git.branches", refs.refs.some((b) => b.head), refs.refs.map((b) => b.name).join(", "));
+    check("git.branches says whether it stopped", refs.truncated === false, `${refs.refs.length} refs, truncated ${refs.truncated}`);
+
+    // ── blame is a page, not a file (P16) ──
+    //
+    // Blame is one row per line and the rows are wide: a million-line file is
+    // 250 MB of JSON in one frame. The range is asked of git, so the agent never
+    // reads the rest, and the page says whether the file goes on.
+    const paged = await call<BlamePage>("git.blame", { path: "src/code-agent/protocol.ts", limit: 5 });
+    check(
+      "git.blame returns the page it was asked for",
+      paged.rows.length === 5 && paged.offset === 0 && paged.more === true && paged.rows[0]!.line === 1,
+      `${paged.rows.length} rows from line ${paged.rows[0]?.line}, more=${paged.more}`,
+    );
+    const second = await call<BlamePage>("git.blame", { path: "src/code-agent/protocol.ts", offset: 2, limit: 3 });
+    check(
+      "git.blame pages by line",
+      second.rows.length === 3 && second.offset === 2 && second.rows[0]!.line === 3,
+      `offset ${second.offset}, first row line ${second.rows[0]?.line}`,
+    );
+    const past = await call<BlamePage>("git.blame", { path: "src/code-agent/protocol.ts", offset: 100000 });
+    check("git.blame past the last line is an empty page, not an error", past.rows.length === 0 && past.more === false, `offset ${past.offset}, ${past.rows.length} rows`);
+    const whole = await call<BlamePage>("git.blame", { path: "src/version.ts" });
+    check("git.blame of a short file is one page that ends", whole.rows.length > 0 && whole.more === false, `${whole.rows.length} rows, more=${whole.more}`);
 
     // The second commit is the first one with a parent, so its diff is non-empty.
     const withParent = commits.find((c) => c.parents.length > 0);
@@ -370,15 +448,47 @@ async function suite(impl: Impl, sandbox: Sandbox): Promise<{ results: Result[];
     const pair = await call<DiffPair>("git.diff", { path: target.path, kind: withParent!.oid });
     check("git.diff", pair.before !== null || pair.after !== null, `${target.path}: ${pair.beforeLabel} -> ${pair.afterLabel}`);
 
-    const hits = call<{ files: number; matches: number; engine: string }>("search", {
+    const hits = call<SearchSummary>("search", {
       query: "TabEditor",
       matchCase: true,
       wholeWord: true,
       regex: false,
     });
     const summary = await hits;
-    const streamed = hits.chunks.filter((c) => (c as { hit?: SearchHit }).hit).length;
-    check("search", summary.matches > 0 && streamed === summary.matches, `${summary.matches} matches in ${summary.files} files via ${summary.engine}, ${streamed} streamed`);
+    const streamed = streamedHits(hits.chunks);
+    check("search", summary.matches > 0 && streamed.length === summary.matches, `${summary.matches} matches in ${summary.files} files via ${summary.engine}, ${streamed.length} streamed`);
+    // The scan's own account of itself, compared between the two code-agents:
+    // why it stopped, and how far it got. `scanned` and `candidates` are null
+    // with ripgrep and numbers with the fallback, and the two must agree on
+    // which — a scan that invented a figure would be a page reporting a
+    // progress that never happened.
+    check(
+      "search says where it got to, and why it stopped",
+      summary.reason === null &&
+        !summary.truncated &&
+        (summary.engine === "ripgrep" ? summary.scanned === null && summary.candidates === null : summary.scanned !== null),
+      `reason ${String(summary.reason)}, scanned ${String(summary.scanned)} of ${String(summary.candidates)} via ${summary.engine}`,
+    );
+    const capped = await call<SearchSummary>("search", { query: "TabEditor", maxMatches: 2 });
+    check(
+      "a scan stopped at the cap names the cap",
+      capped.reason === "matches" && capped.truncated,
+      `reason ${String(capped.reason)}, truncated ${capped.truncated}`,
+    );
+
+    // A scan sends its hits in batches: one frame each was up to 5,000 frames,
+    // 5,000 JSON parses and 5,000 calls into the page's main thread for a list
+    // that repaints on a timer anyway. The frame count can never be compared
+    // between the two code-agents — the batch boundary depends on a timer — so
+    // this is a check rather than a parity probe.
+    const wide = call<{ matches: number }>("search", { query: "const", maxMatches: 300 }, false);
+    const wideSummary = await wide;
+    const wideHits = streamedHits(wide.chunks);
+    check(
+      "a broad scan carries its hits in batches",
+      wideSummary.matches > 64 && wideHits.length > 64 && hitFrames(wide.chunks) < wideHits.length / 8,
+      `${wideHits.length} hits in ${hitFrames(wide.chunks)} frame(s), ${wideSummary.matches} matched`,
+    );
 
     const watching = await call<{ watching: boolean }>("watch.start");
     check("watch.start", typeof watching.watching === "boolean", `watching=${watching.watching}`);
@@ -386,6 +496,43 @@ async function suite(impl: Impl, sandbox: Sandbox): Promise<{ results: Result[];
     await call("git.nope").then(
       () => check("unknown op rejected", false, "no error"),
       (e: Error) => check("unknown op rejected", /Unknown op/.test(e.message), e.message),
+    );
+
+    // ── a connection may only have so much work in hand (P7) ──
+    //
+    // Every request runs on a promise of its own so a slow one never holds up
+    // the rest, and nothing bounded how many there could be: a loop issuing
+    // fs.read queued a 4 MB buffer per request with no ceiling but memory. A
+    // search is used here rather than a read because a read can finish between
+    // two frames of the flood, and what is being checked is the queue, not the
+    // speed of the disk. `cancel` is exempt: it is how a client gets out.
+    const flood = 140;
+    const inFlight: Promise<unknown>[] = [];
+    let cancelWhileFull: Promise<unknown> | null = null;
+    for (let i = 0; i < flood; i++) {
+      inFlight.push(call("search", { query: "code-agent", maxMatches: 1 }, false).catch((e: Error) => e));
+      // Sent once the connection is over the cap: whatever else it refuses,
+      // this is how a client gets out of a full house.
+      if (i === flood - 4) cancelWhileFull = call("cancel", { target: 999_999 }, false).catch((e: Error) => e);
+    }
+    const refused = (await Promise.all(inFlight)).filter(
+      (r): r is Error & { code?: string } => r instanceof Error && (r as { code?: string }).code === "EBUSY",
+    );
+    check(
+      "a connection that floods the agent is refused, not queued",
+      refused.length > 0 && refused.length <= flood,
+      `${refused.length} of ${flood} refused with EBUSY`,
+    );
+    check(
+      "every refusal says the same thing",
+      refused.every((e) => e.message === "Too many requests in flight"),
+      refused[0]?.message ?? "nothing was refused",
+    );
+    const cancelled = await cancelWhileFull;
+    check(
+      "cancel is never refused, even with the connection full",
+      cancelled !== null && !(cancelled instanceof Error),
+      cancelled instanceof Error ? cancelled.message : stable(cancelled),
     );
 
     // ── parity probes ──
@@ -539,7 +686,7 @@ async function mutations(
     // refuses to delete the branch the worktree is on, which is why each of
     // these steps checks out main again before the next.
     await call("git.branchCreate", { name: "topic", from: "HEAD" });
-    const withTopic = await call<Branch[]>("git.branches");
+    const withTopic = (await call<BranchList>("git.branches")).refs;
     check(
       "git.branchCreate",
       withTopic.some((b) => b.name === "topic" && b.head),
@@ -548,7 +695,7 @@ async function mutations(
 
     await call("git.checkout", { ref: "main" });
     await call("git.branchRename", { from: "topic", to: "topic-2" });
-    const renamed = await call<Branch[]>("git.branches");
+    const renamed = (await call<BranchList>("git.branches")).refs;
     check(
       "git.branchRename",
       renamed.some((b) => b.name === "topic-2") && !renamed.some((b) => b.name === "topic"),
@@ -556,7 +703,7 @@ async function mutations(
     );
 
     await call("git.branchDelete", { name: "topic-2" });
-    const deleted = await call<Branch[]>("git.branches");
+    const deleted = (await call<BranchList>("git.branches")).refs;
     check("git.branchDelete", !deleted.some((b) => b.name.startsWith("topic")), deleted.map((b) => b.name).join(", "));
 
     // Merge of a branch that points at the same commit: a fast-forward that
@@ -772,11 +919,11 @@ async function newOps(
     // ── UXB-79: tags ──
     await call("git.tagCreate", { name: "v1.0.0", ref: "HEAD" });
     await call("git.tagCreate", { name: "v1.1.0", ref: "HEAD", message: "first annotated" });
-    const tagged = await call<Branch[]>("git.branches");
+    const tagged = (await call<BranchList>("git.branches")).refs;
     const tags = tagged.filter((b) => b.tag).map((b) => b.name).sort();
     check("git.tagCreate, lightweight and annotated", tags.join(",") === "v1.0.0,v1.1.0", tags.join(", "));
     await call("git.tagDelete", { name: "v1.0.0" });
-    const afterDelete = await call<Branch[]>("git.branches");
+    const afterDelete = (await call<BranchList>("git.branches")).refs;
     check(
       "git.tagDelete",
       !afterDelete.some((b) => b.tag && b.name === "v1.0.0"),
@@ -1497,7 +1644,7 @@ async function hardening(
       const search = async (c: Client, params: Record<string, unknown>): Promise<{ summary: Found; hits: SearchHit[] }> => {
         const p = c.call<Found>("search", { matchCase: false, wholeWord: false, regex: false, ...params }, false);
         const summary = await p;
-        return { summary, hits: p.chunks.map((x) => (x as { hit: SearchHit }).hit).filter(Boolean) };
+        return { summary, hits: streamedHits(p.chunks) };
       };
       const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -1727,6 +1874,191 @@ if (!sandbox.fileLinks || !sandbox.dirLinks) {
   console.log(`\nnote: this platform would not create ${missing} symlinks — those checks report as skipped\n`);
 }
 
+// ── the output buffer, once, without either agent (P8) ────────────────────
+//
+// `runLimited` used to keep a command's output in a list of chunks and then
+// copy them into a second buffer of the whole size — two copies of the same
+// bytes at once, and one of these per running git. This is the TypeScript
+// code-agent's own process helper, so it is checked once rather than against
+// each implementation; what is checked is the boundary the rewrite could have
+// moved, and that an output crossing several doublings comes back whole.
+const standalone: Result[] = [];
+const checkOnce = (name: string, ok: boolean, note = ""): void => {
+  standalone.push({ name, ok, note });
+  console.log(`  ${ok ? "ok  " : "FAIL"}  ${name}${note ? `  — ${note}` : ""}`);
+};
+{
+  // The command is this same interpreter, so the check needs no shell and no
+  // platform-specific tool: `-e` writes exactly the bytes asked for.
+  const emit = (n: number, tail = ""): string[] => [process.execPath, "-e", `process.stdout.write("x".repeat(${n})${tail})`];
+  const cwd = process.cwd();
+
+  const exact = await runLimited(emit(4096), cwd, undefined, 4096);
+  checkOnce("an output exactly at the limit comes back whole", exact.bytes.length === 4096, `${exact.bytes.length} bytes`);
+
+  const over = await runLimited(emit(4097), cwd, undefined, 4096).then(
+    () => "returned",
+    (e: Error) => (e instanceof OutputTooLarge ? "refused" : `wrong error: ${e.message}`),
+  );
+  checkOnce("one byte over the limit is refused, as a class of its own", over === "refused", over);
+
+  // 3 MiB spans six doublings from the 64 KiB the buffer starts at, and the
+  // result must be the bytes that were written, in order, and not a chunk of a
+  // buffer that grew past them.
+  const grown = await runLimited(emit(3 << 20, `+"END"`), cwd, undefined, 8 << 20);
+  const text = new TextDecoder().decode(grown.bytes);
+  checkOnce(
+    "an output past several doublings comes back whole and in order",
+    text.length === (3 << 20) + 3 && text.startsWith("xxx") && text.endsWith("END"),
+    `${grown.bytes.length} bytes, ends in ${JSON.stringify(text.slice(-3))}`,
+  );
+
+  // Nothing is kept beyond the limit, and the process is stopped rather than
+  // read to its end and refused.
+  const short = await runLimited(emit(100_000), cwd, undefined, 1 << 20);
+  checkOnce("an output under the limit is not padded to it", short.bytes.length === 100_000, `${short.bytes.length} bytes`);
+
+  // ── a child with no deadline of its own (P10) ──
+  //
+  // `Bun.spawn` has no deadline, and GIT_TERMINAL_PROMPT=0 only stops git from
+  // asking for a password: a fetch against a connection that never opens stayed
+  // alive and held one of the four process slots, and four of those stop every
+  // search and every git operation.
+  const never = "setTimeout(() => {}, 60000)";
+  const stopped = await runLimited([process.execPath, "-e", never], cwd, undefined, 1 << 20, { deadlineMs: 400 }).then(
+    () => "returned",
+    (e: Error) => (e instanceof TimedOut ? "stopped" : `wrong error: ${e.message}`),
+  );
+  checkOnce("a command that never ends is stopped at its deadline", stopped === "stopped", stopped);
+
+  const streamed = await (async () => {
+    try {
+      for await (const line of runLines([process.execPath, "-e", never], cwd, { limits: { deadlineMs: 400 } })) void line;
+      return "returned";
+    } catch (e) {
+      return e instanceof TimedOut ? "stopped" : `wrong error: ${(e as Error).message}`;
+    }
+  })();
+  checkOnce("the same holds for a command read line by line", streamed === "stopped", streamed);
+
+  // The two clocks are not the same clock: a read is bounded by its own work, a
+  // command that talks to a remote by somebody else's network — and only the
+  // second is bounded by silence, because only there is silence evidence of
+  // anything. The classification is not argv[1]: a read runs as
+  // `git --no-optional-locks log …`.
+  const read = procDeadlines(["git", "--no-optional-locks", "log", "-n", "10"]);
+  const remote = procDeadlines(["git", "fetch", "--prune", "--progress"]);
+  checkOnce(
+    "a remote command gets more time and a window for silence",
+    remote.deadlineMs > read.deadlineMs && read.idleMs === 0 && remote.idleMs > 0,
+    `read ${read.deadlineMs / 60_000} min, no window; remote ${remote.deadlineMs / 60_000} min, ${remote.idleMs / 60_000} min of silence`,
+  );
+  const subcommands: [string[], string][] = [
+    [["git", "--no-optional-locks", "status"], "status"],
+    [["git", "-c", "a=b", "push", "origin"], "push"],
+    [["rg", "--json", "-e", "pattern"], ""],
+    [["git"], ""],
+  ];
+  const wrong = subcommands.filter(([argv, want]) => gitSubcommand(argv) !== want);
+  checkOnce(
+    "the subcommand is read through the options in front of it",
+    wrong.length === 0,
+    wrong.map(([argv, want]) => `${argv.join(" ")} → ${gitSubcommand(argv)}, want ${want}`).join("; ") || "all four read correctly",
+  );
+  const fixed = procDeadlines(["git", "fetch"], { deadlineMs: 400 });
+  checkOnce("a deadline given to a call replaces both defaults", fixed.deadlineMs === 400 && fixed.idleMs === 0, `${fixed.deadlineMs} ms, ${fixed.idleMs} ms`);
+}
+
+// ── the fallback scan's own bounds, once (P18) ────────────────────────────
+//
+// The fallback matches in a worker, on a deadline per request — and nothing
+// bounded the sum of those requests. A repository of 40,000 files where each
+// takes a few milliseconds is minutes of scanning, with no number in it and no
+// way for the page to say how far it had got. This is the TypeScript
+// code-agent's own scan, so it is checked once rather than against each
+// implementation; what the two must agree on — reason, scanned, candidates —
+// is compared over the wire in the suite below.
+{
+  const root = await mkdtemp(join(tmpdir(), "enc-search-scan-"));
+  const body = "a line with a needle in it\n".repeat(20);
+  for (let i = 0; i < 40; i++) {
+    const dir = join(root, `d${i % 4}`);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, `f${i}.txt`), body);
+  }
+  await Bun.spawn(["git", "-C", root, "init", "-q"], { stdout: "ignore", stderr: "ignore" }).exited;
+  const jail = await Jail.open(root);
+  const drain = async (
+    opts: { query: string; regex?: boolean },
+    limits: { scanMs?: number; requestMs?: number; progressEvery?: number },
+  ): Promise<{ summary: SearchSummary; hits: number; progress: number[] }> => {
+    const progress: number[] = [];
+    const it = search(
+      jail,
+      { query: opts.query, matchCase: false, wholeWord: false, regex: opts.regex ?? false },
+      false,
+      { cancelled: false },
+      (p) => progress.push(p.scanned),
+      limits,
+    );
+    let hits = 0;
+    for (;;) {
+      const next = await it.next();
+      if (next.done) return { summary: next.value, hits, progress };
+      hits++;
+    }
+  };
+
+  const whole = await drain({ query: "needle" }, { progressEvery: 8 });
+  checkOnce(
+    "a scan that reaches the end says how far it got and why it did not stop",
+    whole.summary.reason === null && !whole.summary.truncated && whole.summary.scanned === 40 && whole.summary.candidates === 40,
+    `${whole.summary.scanned} of ${whole.summary.candidates} files, ${whole.hits} hits, reason ${String(whole.summary.reason)}`,
+  );
+  checkOnce(
+    "and reports its progress while it runs",
+    whole.progress.length === 5 && whole.progress[4] === 40,
+    `every 8 files: ${whole.progress.join(", ") || "(nothing)"}`,
+  );
+
+  const again = await drain({ query: "needle" }, { progressEvery: 8 });
+  checkOnce(
+    "a second scan through the same worker still works",
+    again.hits === whole.hits && again.summary.reason === null,
+    `${again.hits} hits, reason ${String(again.summary.reason)}`,
+  );
+
+  const timed = await drain({ query: "needle" }, { scanMs: 1, progressEvery: 8 });
+  checkOnce(
+    "a scan that runs out of its own deadline says so, and how far it got",
+    timed.summary.reason === "time" && timed.summary.truncated && (timed.summary.scanned ?? 0) < 40,
+    `reason ${String(timed.summary.reason)}, ${timed.summary.scanned} of ${timed.summary.candidates} files after 1 ms`,
+  );
+
+  // A pattern that cannot finish in time: `(a+)+$` against a line of a's is
+  // exponential, and one file of them is enough to miss the request deadline.
+  // This is the "worker that does not answer": what matters is that the search
+  // ends with an error inside the deadline, and that the stuck worker is not
+  // handed to the next search.
+  await writeFile(join(root, "slow.txt"), `${"a".repeat(60)}!\n`.repeat(400));
+  const stuck = await drain({ query: "(a+)+$", regex: true }, { requestMs: 300, scanMs: 60_000 }).then(
+    () => "returned",
+    (e: Error) => e.message,
+  );
+  checkOnce(
+    "a worker stuck inside a pattern ends the search, with the pattern named",
+    typeof stuck === "string" && /took more than 0\.3 s on one file/.test(stuck),
+    typeof stuck === "string" ? stuck.slice(0, 60) : stuck,
+  );
+  const after = await drain({ query: "needle" }, { progressEvery: 8 });
+  checkOnce(
+    "and the next search is answered by a new worker",
+    after.hits > 0 && after.summary.candidates === 41,
+    `${after.hits} hits over ${after.summary.candidates} files`,
+  );
+  await rm(root, { recursive: true, force: true }).catch(() => undefined);
+}
+
 const runs: { impl: Impl; results: Result[]; answers: Map<string, string> }[] = [];
 for (const impl of impls) {
   console.log(`\n── ${impl.label} ${"─".repeat(Math.max(0, 50 - impl.label.length))}`);
@@ -1782,6 +2114,11 @@ for (const { impl, results } of runs) {
   const bad = results.filter((r) => !r.ok).length;
   failed += bad;
   console.log(`${impl.id.padEnd(3)} ${results.length - bad}/${results.length} passed`);
+}
+if (standalone.length) {
+  const bad = standalone.filter((r) => !r.ok).length;
+  failed += bad;
+  console.log(`proc ${standalone.length - bad}/${standalone.length} passed (the process helper, once)`);
 }
 if (runs.length === 2) {
   console.log(mismatched ? `\n${mismatched} check(s) differ between implementations` : `\nboth implementations agree on all checks`);

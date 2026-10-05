@@ -21,6 +21,7 @@ import { iter } from "../src/code-agent/proc.ts";
 import { pack } from "./archive.ts";
 import { VERSION } from "../src/version.ts";
 import { isCodeAgentUrl } from "../src/web/code/code-agent.ts";
+import { isKafkaAgentUrl } from "../src/web/kafka/kafka-agent.ts";
 
 const results: { name: string; ok: boolean; note: string }[] = [];
 function check(name: string, ok: boolean, note = ""): void {
@@ -43,7 +44,7 @@ const text = new TextEncoder().encode("#!/bin/sh\nexec code-agent\n");
 
 {
   const gz = pack("tar.gz", [
-    { name: "enc-tool-code-agent", data: payload, mode: 0o755 },
+    { name: "code-agent", data: payload, mode: 0o755 },
     { name: "README", data: text, mode: 0o644 },
   ]);
   const raw = new Uint8Array(gunzipSync(gz));
@@ -66,7 +67,7 @@ const text = new TextEncoder().encode("#!/bin/sh\nexec code-agent\n");
 
   check(
     "tar.gz: header, size, mode and checksum are well formed",
-    name === "enc-tool-code-agent" && mode === "0000755" && size === payload.length && magic === "ustar" && sum === stated,
+    name === "code-agent" && mode === "0000755" && size === payload.length && magic === "ustar" && sum === stated,
     `name=${name} mode=${mode} size=${size} magic=${magic} cksum ${sum === stated ? "matches" : `${sum} != ${stated}`}`,
   );
   check("tar.gz: the payload round-trips byte for byte", sha256(body) === sha256(payload), `${size} bytes`);
@@ -81,7 +82,7 @@ const text = new TextEncoder().encode("#!/bin/sh\nexec code-agent\n");
 }
 
 {
-  const z = pack("zip", [{ name: "enc-tool-code-agent.exe", data: payload }]);
+  const z = pack("zip", [{ name: "code-agent.exe", data: payload }]);
   const view = new DataView(z.buffer, z.byteOffset, z.byteLength);
   const sig = view.getUint32(0, true);
   const method = view.getUint16(8, true);
@@ -131,8 +132,8 @@ const BARE_MANIFEST_PORT = 5390;
 const dir = await mkdtemp(join(tmpdir(), "enc-code-agents-"));
 const empty = await mkdtemp(join(tmpdir(), "enc-code-agents-empty-"));
 
-const archive = pack("tar.gz", [{ name: "enc-tool-code-agent", data: payload, mode: 0o755 }]);
-const file = `enc-tool-code-agent-${VERSION}-linux-x64.tar.gz`;
+const archive = pack("tar.gz", [{ name: "code-agent", data: payload, mode: 0o755 }]);
+const file = `code-agent-${VERSION}-linux-x64.tar.gz`;
 await writeFile(join(dir, file), archive);
 await writeFile(join(dir, "secret.txt"), "not for download\n");
 await writeFile(
@@ -142,13 +143,13 @@ await writeFile(
     builds: [
       {
         id: "linux-x64", os: "linux", arch: "x64", label: "Linux (x64)",
-        exe: "enc-tool-code-agent", kind: "tar.gz", file,
+        exe: "code-agent", kind: "tar.gz", file,
         size: archive.length, sha256: sha256(archive),
       },
       // Listed but absent: a partial mirror must not produce a broken link.
       {
         id: "windows-x64", os: "windows", arch: "x64", label: "Windows (x64)",
-        exe: "enc-tool-code-agent.exe", kind: "zip", file: `enc-tool-code-agent-${VERSION}-windows-x64.zip`,
+        exe: "code-agent.exe", kind: "zip", file: `code-agent-${VERSION}-windows-x64.zip`,
         size: 1, sha256: "00",
       },
     ],
@@ -209,6 +210,48 @@ try {
     `${res.headers.get("content-type")}, immutable per version`,
   );
 
+  // The kafka-agent is handed out the same way, from its own folder and manifest,
+  // and neither agent's route will serve the other's files.
+  const kafkaDir = await mkdtemp(join(tmpdir(), "enc-kafka-agents-"));
+  const kafkaArchive = pack("tar.gz", [{ name: "kafka-agent", data: payload, mode: 0o755 }]);
+  const kafkaFile = `kafka-agent-${VERSION}-linux-x64.tar.gz`;
+  await writeFile(join(kafkaDir, kafkaFile), kafkaArchive);
+  await writeFile(
+    join(kafkaDir, "kafka-agents.json"),
+    JSON.stringify({
+      version: VERSION,
+      builds: [
+        {
+          id: "linux-x64", os: "linux", arch: "x64", label: "Linux (x64)",
+          exe: "kafka-agent", kind: "tar.gz", file: kafkaFile,
+          size: kafkaArchive.length, sha256: sha256(kafkaArchive),
+        },
+      ],
+    }),
+  );
+  servers.push(await serve(PORT + 100, { CODE_AGENT_DIR: dir, KAFKA_AGENT_DIR: kafkaDir }));
+  const kbase = `http://127.0.0.1:${PORT + 100}`;
+  const kafkaListing = (await fetch(`${kbase}/kafka-agent/downloads`).then((r) => r.json())) as { builds: Build[] };
+  const kafkaRes = await fetch(kbase + (kafkaListing.builds[0]?.url ?? "/none"));
+  const kafkaGot = new Uint8Array(await kafkaRes.arrayBuffer());
+  check(
+    "the kafka-agent is listed and downloads intact from its own route",
+    kafkaListing.builds.length === 1 &&
+      kafkaListing.builds[0].url === `/kafka-agent/download/${kafkaFile}` &&
+      kafkaRes.ok && sha256(kafkaGot) === kafkaListing.builds[0].sha256 &&
+      (kafkaRes.headers.get("content-disposition") ?? "").includes(kafkaFile),
+    `${kafkaGot.length} bytes, sha256 matches the manifest`,
+  );
+  const cross = [
+    await fetch(`${kbase}/code-agent/download/${kafkaFile}`),
+    await fetch(`${kbase}/kafka-agent/download/${file}`),
+  ];
+  check(
+    "each agent's route serves only its own archives",
+    cross.every((r) => r.status === 404),
+    `the other agent's file: ${cross.map((r) => r.status).join(", ")}`,
+  );
+
   // The route joins a request string to a path only through the manifest
   // allowlist. Percent-encoded separators are used because fetch normalises a
   // literal "../" out of the URL before it is ever sent.
@@ -219,7 +262,7 @@ try {
     "%2Fetc%2Fpasswd",
     "code-agents.json",
     "secret.txt",
-    `enc-tool-code-agent-${VERSION}-windows-x64.zip`,
+    `code-agent-${VERSION}-windows-x64.zip`,
   ];
   const leaked: string[] = [];
   for (const name of escapes) {
@@ -241,7 +284,7 @@ try {
   check(
     "a mirror is advertised for every known platform",
     mirrored.builds.length === 5 &&
-      mirrored.builds.every((b) => b.url.startsWith("https://cdn.example.com/code-agents/enc-tool-code-agent-")) &&
+      mirrored.builds.every((b) => b.url.startsWith("https://cdn.example.com/code-agents/code-agent-")) &&
       mirrored.builds.every((b) => b.sha256 === undefined),
     `${mirrored.builds.length} builds, trailing slash trimmed, no checksums claimed for files we have not seen`,
   );
@@ -463,7 +506,7 @@ try {
     );
     // ── 4. the folder argument the panel now hands out ──
     //
-    // The instructions say `./enc-tool-code-agent <folder>`, so one binary can serve
+    // The instructions say `./code-agent <folder>`, so one binary can serve
     // every repository. That path has to work, and getting it wrong must not
     // quietly fall back to exposing the current directory instead.
     const stopPositional = await startCodeAgent(5098, [dir, "--allow-origin", ALLOWED]);
@@ -552,6 +595,8 @@ try {
       "ws://127.0.0.1:5001/other?token=abc", // not the code-agent's path
       "http://127.0.0.1:5001/ws?token=abc", // not a socket
       "ws://127.0.0.1.evil.example/ws?token=a", // loopback as a prefix only
+      "ws://127.0.0.1:5011/ws?token=abc123", // the kafka-agent's port: another program
+      "ws://127.0.0.1:5090/ws?token=abc123", // a port no agent binds by default
       "not a url at all",
       "",
     ];
@@ -559,6 +604,18 @@ try {
       "the auto-connect matcher accepts the code-agent's URL and nothing else",
       good.every((u) => isCodeAgentUrl(u)) && bad.every((u) => !isCodeAgentUrl(u)),
       `${good.length} accepted, ${bad.length} rejected`,
+    );
+    // The same boundary from the other side: each agent's URL belongs to its own tab,
+    // so pasting one where the other is expected connects nothing.
+    check(
+      "the kafka tab's matcher takes the kafka-agent's URL, and the code-agent's is not one",
+      isKafkaAgentUrl("ws://127.0.0.1:5011/ws?token=abc123") &&
+        isKafkaAgentUrl("ws://localhost:5020/ws?token=abc123") &&
+        !isKafkaAgentUrl("ws://127.0.0.1:5001/ws?token=abc123") &&
+        !isKafkaAgentUrl("ws://127.0.0.1:5011/ws") &&
+        !isKafkaAgentUrl("ws://evil.example:5011/ws?token=abc123") &&
+        !isCodeAgentUrl("ws://127.0.0.1:5011/ws?token=abc123"),
+      "5011-5020 for the kafka-agent, 5001-5010 for the code-agent",
     );
   } finally {
     stopFlag();

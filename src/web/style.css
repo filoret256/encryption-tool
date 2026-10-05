@@ -31,6 +31,10 @@
   --fs-badge: 10px; /* counters and pills only */
 
   --mono: 'Cascadia Code', 'Consolas', 'Menlo', 'Monaco', monospace;
+  /* Tells the browser which of its own colours to use: scrollbars, form controls, the
+     autofill tint. Without it the scrollbars are the light ones whatever the theme, and a
+     dark page has bright bars down every list. It follows the same switch as the tokens. */
+  color-scheme: light;
   --bg: #f7f8fa; --panel: #fff; --border: #e2e5ea; --text: #1f2430;
   /* #8a93a3 measured about 2.9:1 against this background — under the 4.5:1 an
      11px label needs, which is why "EXPLORER", "BRANCH" and the toolbar labels
@@ -49,6 +53,7 @@
   --ok: #15803d; --bad: #b91c1c;
 }
 :root[data-theme="dark"] {
+  color-scheme: dark;
   --bg: #0d1117; --panel: #161b22; --border: #2d333b; --text: #e6edf3;
   --text-muted: #768390; --accent: #2f81f7; --accent-fg: #fff;
   --btn: #21262d; --btn-hover: #2d333b; --active: #1f3a5f;
@@ -74,6 +79,7 @@
  *  supports. Every dark block below carries the same pair. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme]) {
+    color-scheme: dark;
     --bg: #0d1117; --panel: #161b22; --border: #2d333b; --text: #e6edf3;
     --text-muted: #768390; --accent: #2f81f7; --accent-fg: #fff;
     --btn: #21262d; --btn-hover: #2d333b; --active: #1f3a5f;
@@ -97,7 +103,7 @@ body {
   display: flex; align-items: center; justify-content: space-between;
   padding: 6px 12px; background: var(--panel); border-bottom: 1px solid var(--border);
 }
-.tabs { display: flex; gap: 4px; }
+.tabs { display: flex; align-items: center; gap: 4px; }
 .tab {
   font-family: var(--mono); font-size: var(--fs-md); cursor: pointer;
   padding: 6px 14px; border: 1px solid transparent; border-radius: 6px;
@@ -293,6 +299,10 @@ body {
 .tree-row {
   display: flex; align-items: center; gap: 4px; height: var(--row);
   font-size: var(--fs-sm); white-space: nowrap; cursor: pointer; user-select: none;
+  /* The indent rides a custom property, set where the row is built rather than
+     written into every row on every paint — and it cannot be a style=""
+     attribute in the markup, which style-src no longer admits. */
+  padding-left: calc(4px + var(--depth, 0) * 12px);
 }
 .tree-row:hover { background: var(--btn); }
 .tree-row.sel { background: var(--active); }
@@ -301,6 +311,8 @@ body {
    dimming here — that would mute exactly the signal they exist to give. */
 .tree-icon { flex: 0 0 auto; display: flex; align-items: center; }
 .tree-icon .fic { display: block; width: 16px; height: 16px; }
+/* The file-icon sprite holds symbols and draws nothing itself. */
+.fic-sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
 /* Folders take the row's own colour instead of a fixed grey, so they follow the
    theme and the git decoration on the row. */
 .tree-icon .fic-dir { fill: currentColor; opacity: .65; }
@@ -426,7 +438,8 @@ body {
 .welcome-note { margin: 20px 0 0; font-size: var(--fs-xs); }
 .code-editor-host.is-empty { background: color-mix(in srgb, var(--text) 5%, var(--bg)); }
 .code-editor-host.is-empty .cm-editor { background: transparent; }
-.code-editor-host.is-empty .cm-gutters { background: transparent; opacity: .5; }
+/* No gutter: a column with a lone "1" in it reads as a document that has one empty line (I-05). */
+.code-editor-host.is-empty .cm-gutters { display: none; }
 .code-editor-host.is-empty .cm-cursor { display: none; }
 /* Only the highlight goes: the active line is the element that carries the
    placeholder, so hiding it hides the hint as well. */
@@ -476,6 +489,10 @@ body {
 .gp-commit textarea { min-height: calc(var(--row) * 2); overflow-y: auto; }
 .gp-commit-row { display: flex; align-items: center; gap: 6px; }
 .gp-commit-row .js-commit { flex: 0 1 auto; }
+.gp-amend { display: inline-flex; align-items: center; gap: 4px; font-size: var(--fs-sm); color: var(--text-muted); cursor: pointer; user-select: none; }
+.gp-amend:has(input:checked) { color: var(--text); }
+.gp-amend input { margin: 0; cursor: pointer; }
+.gp-amend input:disabled { cursor: default; }
 /* Unpushed work, in the commit block. Accent-coloured but not a primary button:
    it has to be noticed next to "commit" without competing with it, because the
    press that belongs there is still the commit. */
@@ -526,6 +543,13 @@ body {
 .gp-stash-files .gp-row { padding-left: 26px; }
 .gp-stash-files .gp-mark { font-family: var(--mono); font-size: var(--fs-badge); color: var(--text-muted); }
 .gp-empty { padding: 12px 10px; margin: 0; font-size: var(--fs-sm); color: var(--text-muted); }
+/* What the list is not showing. The code-agent stops at five thousand changes,
+   and a panel that showed five thousand of five hundred thousand without saying
+   so would be describing a working tree that does not exist. */
+.gp-truncated {
+  margin: 0; padding: 6px 10px; font-size: var(--fs-xs); color: var(--dec-modified);
+  border-top: 1px solid var(--border);
+}
 /* A sticky divider inside the list, holding "stage all" and "discard all". It
    sits between a header and a row in the hierarchy, and takes the button height
    so its own buttons have somewhere to sit without growing it. */
@@ -612,6 +636,12 @@ body {
    per-row style="" attribute it replaces is no longer allowed by style-src. */
 .vlist-row { display: flex; align-items: stretch; height: var(--vlist-row-h); }
 .vlist-row > * { flex: 1; min-width: 0; }
+/* Rows of their own height — the commit history, where an open commit is taller
+   than the row it opened from. There is no single height to put on the layer,
+   so each row is positioned and sized by itself, and the transform above is
+   cleared by the script that lays them out. `height: auto` on purpose: the row
+   reports its own height, which is what the offsets are measured from. */
+.vlist-var .vlist-row { position: absolute; left: 0; right: 0; display: block; height: auto; }
 
 /* ── Search panel ─────────────────────────────────────────────────────── */
 .sp { display: flex; flex-direction: column; min-height: 0; }
@@ -699,6 +729,14 @@ body {
 .hist-filter input:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
 .hist-filter-count { flex: 0 0 auto; color: var(--text-muted); font-size: var(--fs-badge); white-space: nowrap; }
 .hist-list { flex: 1; min-height: 0; overflow: auto; }
+/* The note shown instead of the list when there is nothing to list: "No
+   commits.", a failure with its retry, or the panel's own limit. It lives
+   outside the virtual list, which owns everything inside .hist-list. */
+.hist-note { flex: 1; min-height: 0; overflow: auto; }
+/* Named `hist-view`, not `hist-body`: `.hist-body` is already the commit
+   message below, and it is `white-space: pre-wrap` — which, inherited by the
+   list, turned every row's markup indentation into visible lines. */
+.hist-view { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .hist-item { border-bottom: 1px solid var(--border); }
 /* Fixed height: the lane SVG is drawn per row and must match it exactly, or
    the vertical lines break between rows. */
@@ -733,12 +771,15 @@ body {
    with no ellipsis and no way to tell it had been cut. Each pill now truncates
    on its own, and the group takes less of the row so the commit subject beside
    it keeps something to say. */
-.hist-refs { display: inline-flex; flex: 0 1 auto; min-width: 0; max-width: 45%; gap: 4px; }
+.hist-refs { display: inline-flex; flex: 0 1 auto; min-width: 0; max-width: 60%; gap: 4px; }
 .hist-ref {
   /* The cap grows with the panel. A fixed 24ch cut `origin/feature/vat-rework`
      in a panel wide enough to show it twice over — and in gitflow the part that
      identifies a ref is exactly the part past the twenty-fourth character. The
      flex shrink below still yields to the subject line when space runs out. */
+  /* A pill keeps the name of a branch up to 12 characters (the .ref-wN rules below), so a
+     crowded row cuts the long ones and not `main` down to a dot; the whole name is in the
+     tooltip (I-07). */
   flex: 0 1 auto; min-width: 3ch; max-width: clamp(14ch, 45%, 60ch);
   overflow: hidden; white-space: nowrap;
   font-size: var(--fs-badge); padding: 1px 5px; border-radius: 999px;
@@ -748,6 +789,22 @@ body {
    told apart from its neighbours by its end, and the 18ch cap used to keep the
    half that every ref on the commit shares — "origin/rele…" three times over.
    Same trick the diff column headers use. */
+/* One rule per length, because an inline style would be refused by the page's policy. */
+.hist-ref.ref-w1 { min-width: calc(1ch + 12px); }
+.hist-ref.ref-w2 { min-width: calc(2ch + 12px); }
+.hist-ref.ref-w3 { min-width: calc(3ch + 12px); }
+.hist-ref.ref-w4 { min-width: calc(4ch + 12px); }
+.hist-ref.ref-w5 { min-width: calc(5ch + 12px); }
+.hist-ref.ref-w6 { min-width: calc(6ch + 12px); }
+.hist-ref.ref-w7 { min-width: calc(7ch + 12px); }
+.hist-ref.ref-w8 { min-width: calc(8ch + 12px); }
+.hist-ref.ref-w9 { min-width: calc(9ch + 12px); }
+.hist-ref.ref-w10 { min-width: calc(10ch + 12px); }
+.hist-ref.ref-w11 { min-width: calc(11ch + 12px); }
+.hist-ref.ref-w12 { min-width: calc(12ch + 12px); }
+.hist-ref.ref-w13 { min-width: calc(13ch + 12px); }
+.hist-ref.ref-w14 { min-width: calc(14ch + 12px); }
+.hist-ref.ref-w15 { min-width: calc(15ch + 12px); }
 .hist-ref-name { display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left; }
 .hist-ref.ref-head { border-color: var(--accent); color: var(--accent); }
 .hist-ref.ref-remote { color: var(--dec-modified); border-color: var(--dec-modified); }
@@ -763,7 +820,10 @@ body {
 .hist-files { display: flex; gap: 6px; padding: 2px 8px 8px; background: var(--bg); }
 /* Width comes from the lane count, set inline; the SVG is taken out of flow so
    its intrinsic height cannot inflate the block. */
-.hist-gutter { flex: 0 0 auto; position: relative; }
+/* The negative margins undo .hist-files' padding and the item's 1px rule: the lanes of the row
+   above end at its edge and those of the row below start at its own, and without them a
+   gap of a few pixels cut every lane at both ends of an open commit. */
+.hist-gutter { flex: 0 0 auto; position: relative; margin: -2px 0 -9px; }
 .hist-gutter .g-cont { position: absolute; inset: 0; }
 .hist-files-body { flex: 1; min-width: 0; }
 .hist-body { margin: 0 0 6px; font-size: var(--fs-xs); color: var(--text-muted); white-space: pre-wrap; }
@@ -835,8 +895,8 @@ body {
 .diff-body .cm-merge-a, .diff-body .cm-merge-b { height: 100%; min-height: 0; }
 .diff-body .cm-mergeViewEditor { height: 100%; min-height: 0; }
 .diff-body .cm-editor { height: 100%; }
-/* The mode button while the window, not the reader, is choosing inline. */
-.diff-head .js-mode.is-forced { border-style: dashed; color: var(--text-muted); }
+/* The split button while the window, not the reader, is choosing inline. */
+.diff-head .js-mode-split.is-forced { border-style: dashed; color: var(--text-muted); }
 .diff-note { padding: 16px; color: var(--text-muted); font-size: var(--fs-sm); }
 /* One-sided diffs: a banner over the file's own content, tinted by direction. */
 .diff-note-added, .diff-note-removed {
@@ -917,11 +977,22 @@ body {
 }
 .cap-chip:hover { background: var(--btn-hover); }
 .cap-dot { line-height: 1; }
-.cap-badge[data-status="online"] .cap-dot { color: var(--ok); }
-.cap-badge[data-status="connecting"] .cap-dot { color: var(--dec-modified); }
-.cap-badge[data-status="error"] .cap-dot,
-.cap-badge[data-status="blocked"] .cap-dot { color: var(--bad); }
-.cap-badge[data-status="online"] .cap-text { color: var(--text); }
+/* The whole chip carries the state — fill, edge and text — because a coloured
+   dot alone is a few pixels and easy to miss. Offline keeps the plain chip. */
+.cap-badge[data-status="online"] .cap-chip,
+.cap-badge[data-status="connecting"] .cap-chip,
+.cap-badge[data-status="error"] .cap-chip,
+.cap-badge[data-status="blocked"] .cap-chip {
+  color: var(--cap-c); border-color: var(--cap-c);
+  background: color-mix(in srgb, var(--cap-c) 16%, var(--panel));
+}
+.cap-badge[data-status="online"] .cap-chip:hover,
+.cap-badge[data-status="connecting"] .cap-chip:hover,
+.cap-badge[data-status="error"] .cap-chip:hover,
+.cap-badge[data-status="blocked"] .cap-chip:hover { background: color-mix(in srgb, var(--cap-c) 26%, var(--panel)); }
+.cap-badge[data-status="online"] { --cap-c: var(--ok); }
+.cap-badge[data-status="connecting"] { --cap-c: var(--dec-modified); }
+.cap-badge[data-status="error"], .cap-badge[data-status="blocked"] { --cap-c: var(--bad); }
 
 /* Anchored on the left now that the badge sits beside the tabs rather than at
    the right edge of the header. */
@@ -955,12 +1026,17 @@ body {
 .needs-cap { opacity: .55; border-style: dashed; border-width: 1px; border-color: var(--text-muted); }
 .cap-install { width: 100%; margin-top: 6px; }
 
-/* ── Code-tab tools: code-agent download + capability badge ────────────────────
-   Sit between the tabs and the header's right-hand group. `margin-right:auto`
-   claims the free space of the header's space-between, which keeps them next
-   to the tabs instead of centred between the two groups. */
-.code-tools { display: flex; align-items: center; gap: 8px; margin: 0 auto 0 10px; }
+/* ── Agent tools: the capability badge, and each agent's download ──────────────
+   The badge sits between the tabs and the header's right-hand group.
+   `margin-right:auto` claims the free space of the header's space-between, which
+   keeps it next to the tabs instead of centred between the two groups. */
+.code-tools, .kafka-tools { display: flex; align-items: center; gap: 8px; margin: 0 auto 0 10px; }
+/* Tabs | download | status: the download hides itself when nothing is published, and
+   then the rule after it goes too, so two rules never stand side by side. */
 .code-agent-dl { position: relative; }
+.code-agent-dl[hidden] { display: none; }
+.code-tools > [hidden] + .toolbar-sep,
+.kafka-tools > [hidden] + .toolbar-sep { display: none; }
 .code-agent-dl-chip {
   display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
   padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px;
@@ -1057,7 +1133,8 @@ body {
 }
 .output-head .t-btn { height: var(--ctl-xs); font-size: var(--fs-xs); text-transform: none; }
 .output-count { text-transform: none; }
-.output-body { flex: 1; min-height: 0; overflow: auto; padding: 6px 0; }
+/* The list inside scrolls; this is only its box. */
+.output-body { flex: 1; min-height: 0; display: flex; overflow: hidden; }
 .output-empty { margin: 0; padding: 12px; color: var(--text-muted); font-size: var(--fs-sm); }
 .output-entry { padding: 3px 10px; border-left: 2px solid transparent; }
 .output-entry.error { border-left-color: var(--bad); background: color-mix(in srgb, var(--bad) 7%, transparent); }
@@ -1142,7 +1219,7 @@ body {
   .header { flex-wrap: wrap; gap: 6px; }
   /* The auto margin pins the tools beside the tabs in a space-between row.
      Once that row wraps it would instead push them onto a line of their own. */
-  .code-tools { margin: 0; }
+  .code-tools, .kafka-tools { margin: 0; }
 }
 
 @media (max-width: 700px) {
@@ -1461,10 +1538,16 @@ body {
 .dircmp-note { margin: 0; padding: 12px; color: var(--text-muted); font-size: var(--fs-sm); }
 .dircmp-note.is-error { color: var(--bad); }
 .dircmp-note.is-warn { color: var(--dec-modified); }
-.dircmp-list { display: flex; flex-direction: column; }
+/* The list is a virtual list, so it needs a height to be a window onto: the
+   comparison fills the host, and the rows scroll inside it rather than the host
+   growing to every row there is. */
+.code-folder-host:has(> .dircmp) { overflow: hidden; }
+.dircmp { height: 100%; min-height: 0; }
+/* The rows are a virtual list's rows: the list owns the element and its height,
+   and the code puts `dircmp-row` and the state back on it after every paint. */
 .dircmp-row {
   display: flex; align-items: center; gap: 8px;
-  padding: 0 12px; height: var(--row); font-size: var(--fs-sm);
+  padding: 0 12px; font-size: var(--fs-sm);
   border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
 }
 .dircmp-row.openable { cursor: pointer; }
@@ -1479,3 +1562,293 @@ body {
 .dircmp-row.right .dircmp-badge { color: var(--dec-added); }
 .dircmp-row.left .dircmp-badge { color: var(--dec-deleted); }
 .dircmp-row.same { color: var(--text-muted); }
+
+/* ── Kafka tab ─────────────────────────────────────────────────────────── */
+/* Built from the code tab's own parts — the rail, the side panel, the toolbar,
+   the status bar, the virtual list — so the two tabs look like one program. What
+   is added is only what a Kafka browser needs that an editor does not. */
+#kafka-tab { position: relative; }
+.kf-body { position: relative; }
+.kf-main { overflow: hidden; }
+.kf-mainview { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; overflow: auto; }
+.kf-mainview[data-kind] { overflow: auto; }
+.kf-cur { display: inline-flex; align-items: center; gap: 6px; color: var(--text); }
+/* The agent in the toolbar is drawn as the code tab's folder: muted, the button beside it is
+   what to press. */
+.kf-agent { color: var(--text-muted); white-space: nowrap; }
+
+/* The connect screen covers the panes and nothing else: the toolbar and the
+   status bar stay where they are, as the code tab's welcome does. */
+/* The card is in the main area, in the flow, where the code tab's card is: the rail and the side
+   panel stay. It used to cover the whole body, and what it covered was still there to be read. */
+.kf-connect { flex: 1; min-height: 0; overflow: auto; }
+
+/* Rows: one line each, the name gives way before anything else does. */
+.kf-row {
+  display: flex; align-items: center; gap: 6px; height: var(--row); padding: 0 8px;
+  font-size: var(--fs-sm); white-space: nowrap; cursor: pointer; user-select: none;
+}
+.kf-row:hover { background: var(--btn); }
+.kf-row.sel { background: var(--active); }
+/* The two versions of the diff on screen: the open one is .sel, the other one this. */
+.kf-row.pair { background: var(--active); }
+.kf-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.kf-internal { color: var(--text-muted); font-style: italic; }
+.kf-meta { flex: 0 0 auto; color: var(--text-muted); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.kf-lag { color: var(--dec-modified); }
+.kf-muted { color: var(--text-muted); }
+.kf-mono { font-family: var(--mono); font-size: var(--fs-xs); }
+.kf-wrap { overflow-wrap: anywhere; }
+.kf-grow { flex: 1; min-width: 0; }
+.kf-narrow { width: 96px; }
+/* The filter takes what the selects leave, but never so little it cannot be typed in. */
+.kf-msgbar .kf-grow { min-width: 140px; }
+.kf-scroll { flex: 1; min-height: 0; overflow: auto; }
+/* The virtual list scrolls itself; its host only has to give it a height. */
+.kf-list { flex: 1; min-height: 0; display: flex; }
+.kf-count { padding: 2px 8px; color: var(--text-muted); font-size: var(--fs-xs); }
+.kf-filter { display: flex; gap: 4px; padding: 6px 8px; flex: 0 0 auto; border-bottom: 1px solid var(--border); }
+.kf-filter .t-input, .kf-bar .t-input { padding: 0 8px; height: var(--ctl-sm); }
+.kf-filter .t-input { flex: 1; min-width: 0; }
+.kf-filter .t-btn, .kf-bar .t-btn { height: var(--ctl-sm); }
+/* A toggle or an action that is a picture: it keeps its own width, and the input takes the rest. */
+.kf-filter .kf-iconbtn { flex: 0 0 auto; width: var(--ctl-sm); padding: 0; display: inline-flex; align-items: center; justify-content: center; }
+.kf-filter .kf-iconbtn svg { width: 14px; height: 14px; }
+/* read | live: two buttons that read as one control, the chosen one filled. */
+.kf-seg { display: inline-flex; flex: 0 0 auto; }
+.kf-seg .t-btn { border-radius: 0; }
+.kf-seg .t-btn:first-child { border-radius: 4px 0 0 4px; }
+.kf-seg .t-btn:last-child { border-radius: 0 4px 4px 0; margin-left: -1px; }
+
+.kf-note { padding: 10px 12px; color: var(--text-muted); font-size: var(--fs-sm); line-height: 1.5; }
+.kf-note-bad { color: var(--bad); }
+.kf-note-warn { color: var(--dec-modified); }
+.kf-note .t-btn { margin-left: 6px; }
+
+/* A word in a pill: state, read-only, controller. */
+.kf-tag {
+  flex: 0 0 auto; padding: 0 6px; line-height: 16px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--text-muted); font-size: var(--fs-badge);
+  text-transform: none; white-space: nowrap;
+}
+.kf-tag-ok { color: var(--ok); border-color: currentColor; }
+.kf-tag-warn { color: var(--dec-modified); border-color: currentColor; }
+.kf-tag-bad { color: var(--bad); border-color: currentColor; }
+.kf-dot { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.kf-dot-ok { background: var(--ok); }
+.kf-dot-bad { background: var(--bad); }
+.kf-dot-idle { background: var(--text-muted); opacity: .5; }
+
+/* The main area's views. */
+.kf-view { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; padding: 14px 18px; gap: 10px; overflow: auto; }
+.kf-view.kf-topic { padding: 0; gap: 0; overflow: hidden; }
+/* As tall as a button, with or without one: a read-only cluster has no "delete topic", and the
+   tabs under the heading moved by the difference (I-04). */
+.kf-title { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; min-height: var(--ctl-h); box-sizing: content-box; }
+.kf-topic > .kf-title { padding: 12px 18px 8px; }
+.kf-title h2 { margin: 0; font-size: var(--fs-lg, 16px); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kf-facts-inline { color: var(--text-muted); font-size: var(--fs-xs); }
+.kf-h3 { margin: 8px 0 0; font-size: var(--fs-xs); text-transform: uppercase; color: var(--text-muted); font-weight: 600; letter-spacing: .04em; }
+.kf-facts { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px 18px; }
+.kf-fact { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.kf-fact-l { color: var(--text-muted); font-size: var(--fs-xs); text-transform: uppercase; }
+.kf-fact-v { font-size: var(--fs-sm); overflow-wrap: anywhere; }
+.kf-status { border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px; max-width: 46rem; }
+.kf-status-bad { border-color: var(--bad); }
+.kf-status b { color: var(--bad); }
+.kf-status p { margin: 6px 0 10px; line-height: 1.5; }
+.kf-fill { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+
+.kf-table { border-collapse: collapse; width: 100%; font-size: var(--fs-sm); }
+.kf-table th {
+  position: sticky; top: 0; background: var(--panel); text-align: left; font-weight: 500;
+  font-size: var(--fs-xs); text-transform: uppercase; color: var(--text-muted);
+  padding: 4px 10px; border-bottom: 1px solid var(--border);
+}
+.kf-table td { padding: 3px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
+.kf-table tbody tr:hover { background: var(--btn); }
+.kf-table a { color: var(--accent); text-decoration: none; }
+.kf-table a:hover { text-decoration: underline; }
+.kf-headers td { padding: 1px 10px; border-bottom: 0; }
+
+.kf-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; padding: 6px 12px; flex: 0 0 auto; }
+.kf-fill > .kf-bar { padding-left: 0; padding-right: 0; }
+
+/* Tabs across the top of a topic: the code tab's own tab look. */
+.kf-tabs { display: flex; flex: 0 0 auto; background: var(--bg); border-bottom: 1px solid var(--border); padding: 0 12px; }
+.kf-tab {
+  height: var(--head-h); padding: 0 14px; border: 0; background: transparent; cursor: pointer;
+  color: var(--text-muted); font-family: var(--mono); font-size: var(--fs-sm);
+}
+.kf-tab:hover { background: var(--btn); }
+.kf-tab.active { color: var(--text); box-shadow: inset 0 -2px 0 var(--accent); }
+.kf-tabbody { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.kf-pane { flex: 1; min-height: 0; min-width: 0; display: flex; flex-direction: column; }
+.kf-pane[hidden] { display: none; }
+.kf-pane[data-pane="config"], .kf-pane[data-pane="partitions"] { padding: 0 12px 8px; }
+
+/* Messages: a table above, one message below. */
+.kf-msgstatus { padding: 0 12px 6px; color: var(--text-muted); font-size: var(--fs-xs); flex: 0 0 auto; min-height: 16px; }
+.kf-msgstatus.kf-note-bad { color: var(--bad); }
+/* The reading controls wrap among themselves, so `send…` never lands alone on a
+   row of its own: it keeps the end of the row the controls end on, and the bar
+   grows a line instead. */
+/* The reading controls and the two write buttons are one row of items that wraps together:
+   the groups are only there for the markup, so they take no box of their own. Before this the
+   write group was a second flex item that dropped to a line of its own as soon as the reading
+   group wrapped, and 1000-1100 px is exactly where it wraps. */
+.kf-msgread { display: contents; }
+/* What is done with the messages — saving, sending — keeps the end of the row it lands on. */
+.kf-msgwrite { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; margin-left: auto; }
+/* The same inset as the title above, so the row ends where "delete topic" ends. */
+.kf-msgbar { padding-left: 18px; padding-right: 18px; }
+/* One width whatever the partition is called, so the controls after it do not move. */
+.kf-messages .js-part { width: 10rem; flex: 0 0 auto; }
+.kf-split { flex: 1; min-height: 0; display: flex; flex-direction: column; border-top: 1px solid var(--border); }
+.kf-msgtable { flex: 0 0 46%; min-height: 90px; max-height: calc(100% - 140px); display: flex; flex-direction: column; }
+/* Nothing chosen: the list has the whole height, and there is no panel to divide it from. */
+.kf-split:not(.has-detail) .kf-msgtable { flex: 1 1 auto; max-height: none; }
+.kf-split:not(.has-detail) .kf-hsplit, .kf-split:not(.has-detail) .kf-msgdetail { display: none; }
+/* The divider, as the side panel's but lying down: a hairline to look at, a wider reach. */
+.kf-hsplit {
+  flex: 0 0 auto; height: 7px; cursor: row-resize; position: relative;
+  background: var(--panel); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+}
+.kf-hsplit::before { content: ""; position: absolute; left: 0; right: 0; top: -4px; bottom: -4px; z-index: 2; }
+.kf-hsplit:hover, .kf-hsplit.dragging, .kf-hsplit:focus-visible { background: var(--accent); border-color: var(--accent); outline: none; }
+.kf-mhead, .kf-mrow {
+  display: grid; grid-template-columns: 44px 86px 168px minmax(60px, 170px) minmax(0, 1fr); gap: 0 10px;
+  padding: 0 12px; align-items: center;
+}
+.kf-mhead { height: var(--row); flex: 0 0 auto; background: var(--panel); border-bottom: 1px solid var(--border); font-size: var(--fs-xs); text-transform: uppercase; color: var(--text-muted); }
+.kf-mrow { font-size: var(--fs-xs); font-family: var(--mono); cursor: pointer; white-space: nowrap; }
+.kf-mrow > span { overflow: hidden; text-overflow: ellipsis; }
+.kf-mrow:hover { background: var(--btn); }
+.kf-mrow.sel { background: var(--active); }
+.kf-mlist { flex: 1; min-height: 0; display: flex; }
+/* The facts and the warnings are shown whole: they used to scroll inside a box of their own, so
+   a warning could sit below the fold of a box that was itself on screen. The column scrolls
+   instead, and the editor keeps a height to read in. */
+.kf-msgdetail { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: auto; }
+.kf-meta-block { flex: 0 0 auto; border-bottom: 1px solid var(--border); }
+.kf-kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; padding: 4px 12px; font-size: var(--fs-xs); }
+.kf-editor { flex: 1; min-height: 120px; }
+.kf-editor .cm-editor { height: 100%; }
+
+/* ── Kafka tab: keyboard and narrow windows ────────────────────────────────
+   The lists take focus themselves and keep a cursor (side.ts), so the ring
+   belongs on the row the cursor is on, as it does on the code tab's tree — a
+   rectangle around a whole panel reads as an error, not as a position. */
+.kf-listbox:focus-visible { outline: none; }
+.kf-listbox:focus-visible .kf-row.cur,
+.kf-listbox:focus-visible .kf-mrow.sel {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.kf-tab:focus-visible,
+.kf-table a:focus-visible,
+.sb-button:focus-visible,
+.output-body .vlist-viewport:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+@media (max-width: 700px) {
+  /* The status bar says the same, and the toolbar is short of room. */
+  .kf-view { padding: 10px 12px; }
+  .kf-topic > .kf-title { padding: 10px 12px 6px; }
+  .kf-tabs { padding: 0; }
+  .kf-tab { padding: 0 10px; }
+  .kf-pane[data-pane="config"], .kf-pane[data-pane="partitions"] { padding: 0 8px 8px; }
+  /* Five columns need about 480px. Without the time, the rest fit a phone. */
+  .kf-mhead, .kf-mrow { grid-template-columns: 38px 64px minmax(50px, 110px) minmax(0, 1fr); padding: 0 8px; }
+  .kf-mhead > :nth-child(3), .kf-mrow > :nth-child(3) { display: none; }
+  .kf-msgtable { flex-basis: 40%; }
+  /* Stacked, the tab is a column under the panel: the log may not take all of it. */
+  .kf-main .output-log { height: 30vh; }
+  .kf-main { min-height: 60vh; }
+}
+
+/* ── Kafka tab: the dialogs that change a cluster ──────────────────────────
+   Send a message, delete a topic. The delete button on a topic is quiet until it
+   is hovered: it is one click from a dialog, and the dialog is what asks. */
+.t-btn-quiet-danger { color: var(--bad); }
+.t-btn-quiet-danger:hover { background: var(--bad); border-color: var(--bad); color: #fff; }
+/* The title and the foot stay; the form between them scrolls. A window shorter than the form
+   used to scroll the whole dialog, and the send button went with the part that was off screen. */
+.kf-send { width: min(680px, 94vw); max-height: 92vh; overflow: hidden; }
+.kf-send-form, .kf-send-done { flex: 1 1 auto; min-height: 0; overflow: auto; }
+.kf-send-form { display: flex; flex-direction: column; gap: 8px; }
+.kf-send-foot { flex: 0 0 auto; display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px solid var(--border); }
+/* One layout for every field: the label on the left, its control on the right. */
+.kf-send-grid { display: grid; grid-template-columns: 9rem minmax(0, 1fr); gap: 8px 10px; align-items: start; }
+.kf-send-grid > label { line-height: var(--ctl-h); }
+.kf-send-grid > .kf-send-editor { grid-column: 1 / -1; }
+.kf-send-col { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.kf-send-col > .t-btn { align-self: flex-start; }
+.kf-send-row { display: flex; gap: 6px; align-items: center; min-width: 0; }
+.kf-send-row .t-input { min-width: 0; }
+.kf-send-row > .t-input:not(select) { flex: 1 1 auto; }
+.kf-send-row select.t-input { flex: 0 0 auto; width: auto; }
+.kf-send-editor { height: 200px; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+.kf-send-editor .cm-editor { height: 100%; }
+.kf-send-headers { display: flex; flex-direction: column; gap: 6px; }
+.kf-send-headers:empty { display: none; }
+.kf-send-header .js-hk { flex: 0 0 30%; }
+.kf-check { display: inline-flex; gap: 6px; align-items: center; text-transform: none; font-size: var(--fs-sm); color: var(--text); }
+.kf-send-done { padding: 6px 0; }
+@media (max-width: 700px) {
+  .kf-send-grid { grid-template-columns: minmax(0, 1fr); }
+  .kf-send-row { flex-wrap: wrap; }
+}
+
+/* Create a topic, reset offsets. */
+.kf-textarea { height: auto; padding: 6px 8px; font-family: var(--mono); font-size: var(--fs-xs); resize: vertical; }
+.kf-reset-preview { max-height: 34vh; overflow: auto; border: 1px solid var(--border); border-radius: 4px; }
+.kf-reset-preview .kf-table th { position: static; }
+.kf-reset-preview .modal-hint { padding: 6px 10px; }
+.kf-send-row .js-time, .kf-send-row .js-num { flex: 1 1 auto; }
+
+/* Registering a schema (K-47): a taller editor than a message's value — a schema is a
+   page of text — and the compatibility level as a control in the subject's own header. */
+.kf-schema-edit { height: 260px; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+.kf-schema-edit .cm-editor { height: 100%; }
+.kf-compat, .kf-compat-host { display: inline-flex; align-items: center; gap: 6px; }
+.kf-compat .t-input { width: auto; flex: none; }
+
+/* A topic's settings, in the dialog that changes them. The list of what somebody
+   set can be long, so it scrolls on its own. */
+.modal-hint.is-warn { color: var(--dec-modified); }
+.kf-settings { display: flex; flex-direction: column; gap: 6px; max-height: 32vh; overflow: auto; }
+.kf-settings:empty { display: none; }
+.kf-set-name { flex: 0 0 34%; font-size: var(--fs-xs); overflow-wrap: anywhere; }
+
+/* ACLs: a table per principal, with a filter above it (K-44). */
+.kf-acl-table { flex: 1; min-height: 0; overflow: auto; padding: 0 0 12px; }
+/* The heading, the note, the filter and the table start at one left line: the filter and the
+   table used to be inset by their own paddings, so each began a few pixels from the last. */
+.kf-view > .kf-filter { padding-left: 0; padding-right: 0; border-bottom: 0; }
+.kf-view > .kf-note { padding-left: 0; padding-right: 0; }
+table.kf-acls { margin-left: -8px; width: calc(100% + 8px); }
+.kf-clickrow { cursor: pointer; }
+.kf-clickrow:hover, .kf-clickrow:focus-visible { background: var(--btn); outline: none; }
+.kf-clusters-table { width: 100%; margin-left: -10px; width: calc(100% + 10px); }
+.kf-acl-group { margin-top: 10px; }
+/* A principal is a name as written — "User:alice" — not a label to be set in capitals. */
+.kf-acl-group .kf-h3 { margin: 0 0 4px; text-transform: none; letter-spacing: 0; font-size: var(--fs-sm); color: var(--text); }
+.kf-ops { display: flex; flex-wrap: wrap; gap: 4px; }
+.kf-acls { width: 100%; }
+.kf-acls td, .kf-acls th { padding: 3px 8px; }
+.kf-acl-deny td { background: color-mix(in srgb, var(--bad) 8%, transparent); }
+
+/* A schema subject: its versions on the left, the text or the diff of two of them on the
+   right. Laid out like a topic's panes, so the editor and the diff fill the height. */
+.kf-subject { padding: 0; gap: 0; overflow: hidden; }
+.kf-subject > .kf-title { padding: 12px 18px 8px; }
+.kf-schema { flex: 1; min-height: 0; display: flex; }
+.kf-schema-list { flex: 0 0 240px; min-height: 0; overflow: auto; border-right: 1px solid var(--border); padding-bottom: 8px; }
+.kf-schema-body { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.kf-schema-body .modal-hint { padding: 6px 12px; }
+.kf-schema-text { flex: 1; min-height: 0; }
+.kf-schema-diff { flex: 1; min-height: 0; }
+

@@ -12,7 +12,7 @@ import { Text } from "@codemirror/state";
 import { git, startCodeAgent, type Harness } from "./harness.ts";
 import { findConflicts } from "../src/web/code/conflicts.ts";
 import { hunkPatches } from "../src/web/code/hunkpatch.ts";
-import type { Branch, Commit, CommitDetail, DiffPair, FileRead, GitStatus } from "../src/code-agent/protocol.ts";
+import type { BlamePage, Branch, BranchList, Commit, CommitDetail, DiffPair, FileRead, GitStatus } from "../src/code-agent/protocol.ts";
 
 const PORT = 5097;
 const results: { name: string; ok: boolean; note: string }[] = [];
@@ -112,7 +112,7 @@ try {
   await git(root, "checkout", "--", "app.ts");
 
   // ── branches ──
-  const branches = await call<Branch[]>("git.branches");
+  const branches = (await call<BranchList>("git.branches")).refs;
   check(
     "branches",
     branches.length === 2 && branches.find((b) => b.name === "main")?.head === true,
@@ -201,7 +201,7 @@ try {
   );
 
   // ── blame ──
-  const blame = await call<{ oid: string; author: string; line: number }[]>("git.blame", { path: "README.md" });
+  const blame = (await call<BlamePage>("git.blame", { path: "README.md" })).rows;
   check("blame", blame.length > 0 && /^[0-9a-f]{40}$/.test(blame[0]?.oid ?? ""), `${blame.length} line(s), author=${blame[0]?.author}`);
 
   // ── staging one hunk at a time ──

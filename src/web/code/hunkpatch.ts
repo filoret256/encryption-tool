@@ -86,6 +86,17 @@ function ranges(before: string, after: string, lenA: number, lenB: number): Rang
  *  the same patch reversed is what unstages it.
  */
 export function hunkPatches(path: string, before: string, after: string): string[] {
+  // The same pair is asked about on every click of "stage this change", and each answer is a diff of
+  // both whole texts. The last one is kept.
+  if (last && last.path === path && last.before === before && last.after === after) return last.result;
+  const result = buildPatches(path, before, after);
+  last = { path, before, after, result };
+  return result;
+}
+
+let last: { path: string; before: string; after: string; result: string[] } | null = null;
+
+function buildPatches(path: string, before: string, after: string): string[] {
   const a = gitLines(before);
   const b = gitLines(after);
   const header = [`diff --git a/${path} b/${path}`, `--- a/${path}`, `+++ b/${path}`];

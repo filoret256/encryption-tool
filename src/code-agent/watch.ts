@@ -54,6 +54,24 @@ const HEAVY_DIRS = new Set(["node_modules", ".venv", "__pycache__", ".tox", ".my
 /** Does a path lie inside a heavy directory? Its own last segment does not count:
  *  that event is the folder itself. */
 const insideHeavyDir = (rel: string): boolean => rel.split("/").slice(0, -1).some((seg) => HEAVY_DIRS.has(seg));
+
+/** The same question asked of the name exactly as `fs.watch` hands it over, with no parsing:
+ *  an install makes 200 000 of these in a burst, and each used to be normalised, split and
+ *  joined on the one thread that also answers every request, only to be thrown away. A name
+ *  matches when a heavy directory's name stands as a whole segment — after the start or a
+ *  separator — with a separator after it, so that something is inside. */
+function insideHeavyRaw(name: string): boolean {
+  for (const dir of HEAVY_DIRS) {
+    let at = name.indexOf(dir);
+    while (at !== -1) {
+      const before = at === 0 || name[at - 1] === "/" || name[at - 1] === "\\";
+      const after = name[at + dir.length];
+      if (before && (after === "/" || after === "\\")) return true;
+      at = name.indexOf(dir, at + 1);
+    }
+  }
+  return false;
+}
 /** Beyond this, send a single "everything" signal — the UI reloads wholesale. */
 const MAX_PATHS = 400;
 
@@ -73,7 +91,11 @@ export class Watcher {
     const w = new Watcher(root, onChange);
     try {
       w.watcher = watch(root, { recursive: true, persistent: false }, (_event, filename) => {
-        if (filename) w.push(String(filename));
+        if (!filename) return;
+        const name = String(filename);
+        // Before anything else is done with it: the cheap way to drop the bulk of a burst.
+        if (insideHeavyRaw(name)) return;
+        w.push(name);
       });
       // A watcher that dies later must not take the code-agent down with it.
       w.watcher.on("error", () => w.close());

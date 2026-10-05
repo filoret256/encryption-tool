@@ -24,3 +24,21 @@ export const CODE_AGENT_PORT_RANGE = `${CODE_AGENT_PORT_MIN}-${CODE_AGENT_PORT_M
 /** Every port in the range, in the order the code-agent tries to bind them. */
 export const codeAgentPortRange = (): number[] =>
   Array.from({ length: CODE_AGENT_PORT_MAX - CODE_AGENT_PORT_MIN + 1 }, (_, i) => CODE_AGENT_PORT_MIN + i);
+
+/** The loopback ports the kafka-agent may bind — a range of its own, next to
+ *  the code-agent's rather than shared with it.
+ *
+ *  Sharing would make the two agents race for the same ports, and a URL pasted
+ *  into the wrong tab would reach the wrong agent. Kept apart, the port alone
+ *  says which agent a URL belongs to (src/web/code/code-agent.ts,
+ *  src/web/kafka/kafka-agent.ts), and the same argument about naming every port
+ *  in connect-src applies to this range exactly as to the one above. */
+export const KAFKA_AGENT_PORT_MIN = 5011;
+export const KAFKA_AGENT_PORT_MAX = 5020;
+
+/** "5011-5020" — help text, the shell's meta tag, KAFKA_AGENT_PORTS. */
+export const KAFKA_AGENT_PORT_RANGE = `${KAFKA_AGENT_PORT_MIN}-${KAFKA_AGENT_PORT_MAX}`;
+
+/** Every port in the range, in the order the kafka-agent tries to bind them. */
+export const kafkaAgentPortRange = (): number[] =>
+  Array.from({ length: KAFKA_AGENT_PORT_MAX - KAFKA_AGENT_PORT_MIN + 1 }, (_, i) => KAFKA_AGENT_PORT_MIN + i);

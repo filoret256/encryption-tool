@@ -146,6 +146,13 @@ export interface GitStatus {
   behind: number;
   oid: string | null;
   entries: StatusEntry[];
+  /** How many entries the working tree really has. Larger than `entries.length`
+   *  when the code-agent stopped collecting at its limit — a repository with
+   *  half a million untracked files is a status nobody can read, and shipping
+   *  all of it is a frame nobody can parse. */
+  entryCount: number;
+  /** True when `entries` is only the beginning of the list. */
+  truncated: boolean;
   /** Set while a merge/rebase/cherry-pick/revert is half-finished. */
   operation?: GitOperation | null;
   /** The commit message git has already written for the next commit, with its
@@ -193,6 +200,16 @@ export interface Branch {
   time: number;
 }
 
+/** The refs of a repository, and whether they are all of them.
+ *
+ *  A bare array could not say that: a mirror with fifty thousand refs would
+ *  either cost a frame nothing can parse or silently lose the tail, and a
+ *  picker that quietly shows half the branches is worse than one that says so. */
+export interface BranchList {
+  refs: Branch[];
+  truncated: boolean;
+}
+
 /** A pair of texts for @codemirror/merge. `before`/`after` are null when the
  *  file does not exist on that side (added / deleted). */
 export interface DiffPair {
@@ -222,8 +239,17 @@ export interface CommitDetail {
   parent?: number;
 }
 
-/** One line of `git blame`. The browser mirror of this is `BlameLine` in
+/** One page of `git blame`. The browser mirror of `BlameRow` is `BlameLine` in
  *  code/blame.ts, which is where the gutter renders it. */
+export interface BlamePage {
+  rows: BlameRow[];
+  /** 0-based line the page starts at. */
+  offset: number;
+  /** True when the file goes on past this page. */
+  more: boolean;
+}
+
+/** One line of `git blame`. */
 export interface BlameRow {
   oid: string;
   author: string;
@@ -246,12 +272,25 @@ export interface SearchHit {
   ranges: [number, number][];
 }
 
+/** Why a scan stopped before it had been through every file. Null when it finished. */
+export type SearchStop = "cancelled" | "matches" | "time";
+
 export interface SearchSummary {
   files: number;
   matches: number;
-  /** True when the scan stopped at the result cap. */
+  /** True when the scan was stopped: by the result cap, by the deadline, or because a
+   *  newer search superseded this one. */
   truncated: boolean;
   engine: "ripgrep" | "fallback";
+  /** Which of those it was, or null when the scan reached the end. */
+  reason: SearchStop | null;
+  /** How many files the scan opened. Null with ripgrep, which walks the tree itself
+   *  and reports no such number — the page says nothing rather than a figure it
+   *  made up. */
+  scanned: number | null;
+  /** How many files there were to look at, before the include and exclude patterns.
+   *  Null with ripgrep, for the same reason. */
+  candidates: number | null;
 }
 
 export interface FsChange {

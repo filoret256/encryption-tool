@@ -12,7 +12,7 @@
  * On WebCrypto so the module also runs in the browser; the format is byte-for-
  * byte what the previous node:crypto version produced.
  */
-import { fromHex, fromUtf8, randomBytes, timingSafeEqual, toHex, utf8, type Bytes } from "./bytes.ts";
+import { concat, fromHex, fromUtf8, hexAscii, hexLines, randomBytes, timingSafeEqual, utf8, type Bytes } from "./bytes.ts";
 import { pkcs7Pad, pkcs7Unpad } from "./pkcs7.ts";
 
 const SALT_SIZE = 32;
@@ -47,12 +47,12 @@ const ctrParams = (iv: Bytes): AesCtrParams => ({ name: "AES-CTR", counter: iv, 
 
 /** salt/mac/ciphertext -> Ansible Vault envelope (double hex, 80-col wrap). */
 function format(salt: Bytes, mac: Bytes, ciphertext: Bytes): string {
-  const inner = `${toHex(salt)}\n${toHex(mac)}\n${toHex(ciphertext)}`;
-  const hexTwice = toHex(utf8(inner));
-  const lines: string[] = [];
-  for (let i = 0; i < hexTwice.length; i += LINE_WIDTH) lines.push(hexTwice.slice(i, i + LINE_WIDTH));
-  return `${HEADER}\n${lines.join("\n")}`;
+  // The UTF-8 bytes of "saltHex\nmacHex\nctHex" — all ASCII, so they are the hex themselves.
+  const inner = concat(hexAscii(salt), NEWLINE, hexAscii(mac), NEWLINE, hexAscii(ciphertext));
+  return hexLines(HEADER, inner, LINE_WIDTH);
 }
+
+const NEWLINE: Bytes = new Uint8Array([10]);
 
 /** Parse envelope -> [salt, mac, ciphertext]. Line-wrap width is ignored. */
 function parse(text: string): [Bytes, Bytes, Bytes] {

@@ -9,7 +9,7 @@
  *  platform ships, so the rail changed shape between Windows, macOS and Linux
  *  and never matched the surrounding line weight.
  */
-const svg = (body: string): string =>
+export const svg = (body: string): string =>
   `<svg class="ic" viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${body}</svg>`;
 
 /** A page with a folded corner — the explorer. */

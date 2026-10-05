@@ -25,6 +25,10 @@ export interface Notice {
   isError?: boolean;
   /** Opens the output log at the entry this notice came from. */
   onDetails?: () => void;
+  /** A question the notice asks: one button per answer. The notice goes when one is pressed. */
+  actions?: { label: string; run: () => void }[];
+  /** Stays until dismissed even when it is not an error: a question waits for its answer. */
+  sticky?: boolean;
   /** What state this notice is about, when it is about one.
    *
    *  An error may not expire on a timer — but it may stop being true. "merge
@@ -66,6 +70,14 @@ export function mountNotifier(host: HTMLElement): Notifier {
   host.setAttribute("role", "status");
   host.setAttribute("aria-live", "polite");
 
+  // A success's fade-out timer, by notice: a notice taken down early takes its timer with it.
+  const timers = new Map<HTMLElement, ReturnType<typeof setTimeout>>();
+  const drop = (el: HTMLElement): void => {
+    clearTimeout(timers.get(el));
+    timers.delete(el);
+    el.remove();
+  };
+
   const trim = (): void => {
     const all = [...host.children] as HTMLElement[];
     const errors = all.filter((el) => el.classList.contains("error"));
@@ -73,20 +85,21 @@ export function mountNotifier(host: HTMLElement): Notifier {
     // cannot answer — used to stack without limit, because errors were exempt
     // from eviction entirely. They still outrank successes; they just have a
     // ceiling now.
-    if (errors.length > MAX_ERRORS) errors[0].remove();
+    if (errors.length > MAX_ERRORS) drop(errors[0]);
     const left = [...host.children] as HTMLElement[];
     if (left.length <= MAX_VISIBLE) return;
     const evictable = left.filter((el) => !el.classList.contains("error"));
-    (evictable[0] ?? left[0]).remove();
+    drop(evictable[0] ?? left[0]);
   };
 
   return {
-    show({ message, isError = false, onDetails, scope }: Notice): void {
+    show({ message, isError = false, onDetails, actions, sticky = false, scope }: Notice): void {
       // The same failure usually arrives several times at once: the status,
       // the log and the file list all ask git independently, and one broken
       // ref answers all three. Four identical stacked errors say nothing the
       // first one did not — so a repeat counts up on the notice already there.
-      const key = `${isError ? "e" : "i"}:${message}`;
+      // A question is never folded into the one before it: each has its own answer to give.
+      const key = `${isError ? "e" : "i"}:${message}${actions ? Math.random() : ""}`;
       const last = host.lastElementChild as HTMLElement | null;
       if (last && last.dataset.key === key) {
         const seen = Number(last.dataset.count ?? "1") + 1;
@@ -121,10 +134,22 @@ export function mountNotifier(host: HTMLElement): Notifier {
         more.className = "toast-action";
         more.textContent = "details";
         more.addEventListener("click", () => {
-          el.remove();
+          drop(el);
           onDetails();
         });
         el.appendChild(more);
+      }
+
+      for (const action of actions ?? []) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "toast-action";
+        button.textContent = action.label;
+        button.addEventListener("click", () => {
+          drop(el);
+          action.run();
+        });
+        el.appendChild(button);
       }
 
       // Errors get a real close button; successes get one too, for anyone who
@@ -134,22 +159,22 @@ export function mountNotifier(host: HTMLElement): Notifier {
       close.className = "toast-close";
       close.setAttribute("aria-label", "Dismiss");
       close.textContent = "✕";
-      close.addEventListener("click", () => el.remove());
+      close.addEventListener("click", () => drop(el));
       el.appendChild(close);
 
       host.appendChild(el);
       trim();
 
-      if (!isError) setTimeout(() => el.remove(), LINGER_MS);
+      if (!isError && !sticky) timers.set(el, setTimeout(() => drop(el), LINGER_MS));
     },
 
     dismissAll(): void {
-      host.replaceChildren();
+      for (const el of [...host.children] as HTMLElement[]) drop(el);
     },
 
     dismissScope(scope: string): void {
       for (const el of [...host.children] as HTMLElement[]) {
-        if (el.dataset.scope === scope) el.remove();
+        if (el.dataset.scope === scope) drop(el);
       }
     },
   };

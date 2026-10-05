@@ -10,6 +10,7 @@
  *  one place a caller supplies markup. It must be escaped by the caller; the
  *  label and detail are inserted as text and cannot be.
  */
+import { debounce } from "./debounce.ts";
 import { esc, startTrimmed } from "./ui.ts";
 
 export interface PickItem {
@@ -74,6 +75,7 @@ export function quickPick(opts: QuickPickOptions): Promise<string | null> {
     let active = 0;
 
     const done = (value: string | null): void => {
+      if (compute) (refilter as ReturnType<typeof debounce>).cancel();
       back.remove();
       document.removeEventListener("keydown", onKey, true);
       resolve(value);
@@ -115,12 +117,22 @@ export function quickPick(opts: QuickPickOptions): Promise<string | null> {
       list.querySelector(".pick-row.active")?.scrollIntoView({ block: "nearest" });
     };
 
+    // A list that is computed — quick open, over every file of the project — waits for a pause in
+    // the typing; a fixed one is short enough to follow every letter.
+    const refilter = compute ? debounce(render, 120) : render;
+    /** What is on screen is what is typed, before anything acts on it. */
+    const settle = (): void => {
+      if (compute) (refilter as ReturnType<typeof debounce>).flush();
+    };
+
     const choose = (): void => {
+      settle();
       const picked = shown[active]?.value ?? (opts.freeText ? filter.value.trim() : "");
       if (picked) done(picked);
     };
 
     const move = (delta: number): void => {
+      settle();
       if (!shown.length) return;
       active = Math.min(shown.length - 1, Math.max(0, active + delta));
       render();
@@ -134,8 +146,8 @@ export function quickPick(opts: QuickPickOptions): Promise<string | null> {
         case "ArrowUp": e.preventDefault(); return move(-1);
         case "PageDown": e.preventDefault(); return move(8);
         case "PageUp": e.preventDefault(); return move(-8);
-        case "Home": if (!filter.value) { e.preventDefault(); active = 0; render(); } return;
-        case "End": if (!filter.value) { e.preventDefault(); active = shown.length - 1; render(); } return;
+        case "Home": if (!filter.value) { e.preventDefault(); settle(); active = 0; render(); } return;
+        case "End": if (!filter.value) { e.preventDefault(); settle(); active = shown.length - 1; render(); } return;
         case "Enter":
           // The list is not a form control, so Enter has to be claimed here for
           // the keyboard path to work when the buttons are absent.
@@ -154,7 +166,7 @@ export function quickPick(opts: QuickPickOptions): Promise<string | null> {
 
     filter.addEventListener("input", () => {
       active = 0;
-      render();
+      refilter();
     });
     // A click selects; it does not act.
     //

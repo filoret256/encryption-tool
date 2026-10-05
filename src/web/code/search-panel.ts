@@ -24,7 +24,7 @@ export interface SearchCallbacks {
 
 type Row =
   | { kind: "file"; path: string; count: number }
-  | { kind: "hit"; path: string; hit: SearchHit; key: string };
+  | { kind: "hit"; path: string; hit: SearchHit };
 
 export interface Options {
   matchCase: boolean;
@@ -97,11 +97,23 @@ export class SearchPanel {
    *  matches are dismissed — it used to keep claiming the original number
    *  after half the hits had been waved away. */
   private summary: SearchSummary | null = null;
+  /** How far the running scan has got, from the code-agent's progress frames.
+   *  Only the fallback engine sends them: ripgrep walks the tree itself and does
+   *  not say, so the line simply has no numbers while it runs. */
+  private progress: { scanned: number; candidates: number } | null = null;
   /** Set by the stop button while a replace is running. */
   private cancelReplace = false;
   private list: VirtualList<Row>;
 
   private opts: Options;
+  /** What the rows preview a replacement with, worked out once per change of the replacement,
+   *  the query or an option; `undefined` is a settled answer (nothing to preview), `stale` is
+   *  none yet. Every visible row asks for it on every paint, and each ask read three fields from
+   *  the page and, for a regular expression, compiled it again. */
+  private preview: ReturnType<SearchPanel["computePreview"]> | typeof STALE = STALE;
+  /** The regular expression the preview uses, kept while the query and the options stay as
+   *  they were: typing a replacement changes the preview but not the pattern. */
+  private previewRegex: { key: string; regex: RegExp } | null = null;
   private debounce: ReturnType<typeof setTimeout> | null = null;
   private paintTimer: ReturnType<typeof setTimeout> | null = null;
   /** Request id of the scan whose hits we still accept. */
@@ -131,6 +143,7 @@ export class SearchPanel {
     ] as [string, keyof Options][]) {
       this.$(sel).addEventListener("click", () => {
         this.opts[key] = !this.opts[key];
+        this.preview = STALE;
         saveOptions(this.opts);
         this.paintToggles();
         if (key !== "preserveCase") this.schedule();
@@ -138,14 +151,20 @@ export class SearchPanel {
     }
 
     for (const sel of [".js-query", ".js-include", ".js-exclude"]) {
-      this.$(sel).addEventListener("input", () => this.schedule());
+      this.$(sel).addEventListener("input", () => {
+        this.preview = STALE;
+        this.schedule();
+      });
     }
     this.$(".js-query").addEventListener("keydown", (e) => {
       if ((e as KeyboardEvent).key === "Enter") void this.run();
     });
     // Typing a replacement changes what the rows say, not what was found: the
     // list is repainted, the scan is not repeated.
-    this.$(".js-replace").addEventListener("input", () => this.list.refresh());
+    this.$(".js-replace").addEventListener("input", () => {
+      this.preview = STALE;
+      this.list.refresh();
+    });
     this.$(".js-replace-all").addEventListener("click", () => void this.replace([...this.results.keys()]));
     this.$(".js-recent").addEventListener("click", (e) => this.recentMenu(e as MouseEvent));
 
@@ -161,6 +180,7 @@ export class SearchPanel {
    *  this folder" from the explorer. */
   searchFor(query: string, include?: string): void {
     this.$<HTMLInputElement>(".js-query").value = query;
+    this.preview = STALE;
     if (include !== undefined) {
       this.$<HTMLInputElement>(".js-include").value = include;
       // The include field lives in a collapsed <details>; setting it silently
@@ -174,14 +194,23 @@ export class SearchPanel {
   /** The replacement settings, or undefined while the replace box is empty —
    *  in which case the rows are just results and nothing is previewed. */
   private previewOpts(): { replacement: string; regex: RegExp | null; preserveCase: boolean } | undefined {
+    if (this.preview === STALE) this.preview = this.computePreview();
+    return this.preview;
+  }
+
+  private computePreview(): { replacement: string; regex: RegExp | null; preserveCase: boolean } | undefined {
     const replacement = this.$<HTMLInputElement>(".js-replace").value;
     if (!replacement) return undefined;
     const query = this.$<HTMLInputElement>(".js-query").value;
     if (!query) return undefined;
     let regex: RegExp | null = null;
     if (this.opts.regex) {
-      if (!isValidRegex(query, this.opts)) return undefined;
-      regex = new RegExp(patternSource(query, this.opts), this.opts.matchCase ? "" : "i");
+      const key = `${this.opts.matchCase}${this.opts.wholeWord}|${query}`;
+      if (this.previewRegex?.key !== key) {
+        if (!isValidRegex(query, this.opts)) return undefined;
+        this.previewRegex = { key, regex: new RegExp(patternSource(query, this.opts), this.opts.matchCase ? "" : "i") };
+      }
+      regex = this.previewRegex.regex;
     }
     return { replacement, regex, preserveCase: this.opts.preserveCase };
   }
@@ -240,6 +269,7 @@ export class SearchPanel {
     this.results.clear();
     this.dismissed.clear();
     this.matches = 0;
+    this.progress = null;
     this.rebuild();
 
     if (!query || this.codeAgent.state !== "online") {
@@ -256,6 +286,7 @@ export class SearchPanel {
     // regular expression does not end up in the list.
     rememberQuery(query);
 
+    this.preview = STALE; // the query may have been set without an input event
     const { id, promise } = this.codeAgent.callTracked<SearchSummary>(
       "search",
       {
@@ -268,12 +299,26 @@ export class SearchPanel {
       },
       (chunk) => {
         if (id !== this.activeId) return; // a later scan already took over
-        const hit = (chunk as { hit?: SearchHit }).hit;
-        if (!hit) return;
-        const list = this.results.get(hit.path);
-        if (list) list.push(hit);
-        else this.results.set(hit.path, [hit]);
-        this.matches += Math.max(1, hit.ranges.length);
+        const c = chunk as { hit?: SearchHit; hits?: SearchHit[]; progress?: { scanned: number; candidates: number } };
+        // A progress frame carries no hits: the scan is saying how far through
+        // the file list it is, which on a large repository is the only thing
+        // that changes for minutes at a time.
+        if (c.progress) {
+          this.progress = c.progress;
+          this.schedulePaint();
+          return;
+        }
+        // Hits arrive in batches — one frame per hit was 5,000 frames and 5,000
+        // JSON parses for one scan. A single hit is still accepted: it is what
+        // an older code-agent sends, and what a batch of one would be anyway.
+        const hits = c.hits ?? (c.hit ? [c.hit] : []);
+        if (!hits.length) return;
+        for (const hit of hits) {
+          const list = this.results.get(hit.path);
+          if (list) list.push(hit);
+          else this.results.set(hit.path, [hit]);
+          this.matches += Math.max(1, hit.ranges.length);
+        }
         this.schedulePaint();
       },
     );
@@ -302,13 +347,36 @@ export class SearchPanel {
       this.paintTimer = null;
       if (!this.activeId) return;
       this.rebuild();
-      this.setSummary(`searching… ${this.matches} in ${this.results.size} files`);
+      const howFar = this.progress ? ` · ${this.progress.scanned} of ${this.progress.candidates} files scanned` : "";
+      this.setSummary(`searching… ${this.matches} in ${this.results.size} files${howFar}`);
     }, PAINT_MS);
   }
 
   private setSummary(text: string): void {
     this.summary = null;
     this.$(".js-summary").textContent = text;
+  }
+
+  /** Why the scan stopped, in the words of the person waiting for it.
+   *
+   *  "(truncated)" on its own was the whole story before this: the result cap,
+   *  the scan's own deadline and a newer search superseding this one all read
+   *  the same, and none of them said how far the scan had got. */
+  private static stopped(s: SearchSummary): string {
+    const reached =
+      s.scanned !== null && s.candidates !== null ? ` after ${s.scanned} of ${s.candidates} files` : "";
+    switch (s.reason) {
+      case "matches":
+        return ` (truncated at the result limit${reached})`;
+      case "time":
+        return ` (truncated — the scan ran out of its 30 s${reached})`;
+      case "cancelled":
+        return ` (truncated — a newer search took over${reached})`;
+      default:
+        // An older code-agent sends no reason at all, and then the old word is
+        // the only thing that can honestly be said.
+        return s.truncated ? " (truncated)" : "";
+    }
   }
 
   /** The count as it stands now.
@@ -336,7 +404,7 @@ export class SearchPanel {
     el.textContent =
       `${matches}${matches < s.matches ? ` of ${s.matches}` : ""} result${matches === 1 ? "" : "s"}` +
       ` in ${files} file${files === 1 ? "" : "s"}` +
-      (s.truncated ? " (truncated)" : "") +
+      SearchPanel.stopped(s) +
       ` · ${s.engine}`;
   }
 
@@ -345,11 +413,13 @@ export class SearchPanel {
   private rebuild(): void {
     this.rows = [];
     for (const [path, hits] of this.results) {
-      const live = hits.filter((h) => !this.dismissed.has(hitKey(path, h)));
+      // A key is a string made per hit; with nothing dismissed — nearly always — none is needed,
+      // and this runs every 100 ms over every hit found so far.
+      const live = this.dismissed.size ? hits.filter((h) => !this.dismissed.has(hitKey(path, h))) : hits;
       if (!live.length) continue;
       this.rows.push({ kind: "file", path, count: live.length });
       if (this.collapsed.has(path)) continue;
-      for (const hit of live) this.rows.push({ kind: "hit", path, hit, key: hitKey(path, hit) });
+      for (const hit of live) this.rows.push({ kind: "hit", path, hit });
     }
     this.list.setItems(this.rows);
     this.renderSummary();
@@ -374,7 +444,7 @@ export class SearchPanel {
     // taken around the first match, a hard cap at 200 characters — so on a long
     // line what is on screen can be a fragment with the context cut off both
     // ends. The title carries the line as it actually is.
-    return `<div class="sp-hit" data-path="${esc(row.path)}" data-key="${esc(row.key)}" title="${esc(hitTitle(row.path, row.hit))}">
+    return `<div class="sp-hit" data-path="${esc(row.path)}" data-key="${esc(hitKey(row.path, row.hit))}" title="${esc(hitTitle(row.path, row.hit))}">
       <span class="sp-lineno">${row.hit.line}</span>
       <span class="sp-text">${hitHtml(row.hit, this.previewOpts())}</span>
       <span class="sp-acts"><button class="t-icon" data-act="dismiss-hit" title="Dismiss match">${iconClose}</button></span>
@@ -390,7 +460,7 @@ export class SearchPanel {
     }
     if (act === "replace-file") return this.replace([row.path]);
     if (act === "dismiss-hit" && row.kind === "hit") {
-      this.dismissed.add(row.key);
+      this.dismissed.add(hitKey(row.path, row.hit));
       return this.rebuild();
     }
 
@@ -498,6 +568,9 @@ export class SearchPanel {
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────
+
+/** `preview` before it has been worked out. */
+const STALE = Symbol("stale");
 
 const hitKey = (path: string, hit: SearchHit): string => `${path}:${hit.line}:${hit.col}`;
 

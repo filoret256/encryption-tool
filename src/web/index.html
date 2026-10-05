@@ -17,6 +17,8 @@
        refused code-agent connection, which the browser otherwise reports as an
        ordinary failure to connect. -->
   <meta name="code-agent-ports" content="__CODE_AGENT_PORTS__" />
+  <!-- The same, for the kafka tab and the kafka-agent's own range. -->
+  <meta name="kafka-agent-ports" content="__KAFKA_AGENT_PORTS__" />
   <link rel="stylesheet" href="/public/main.css" />
 
   <!-- PWA. Two theme-colour tags so the browser chrome follows the user's
@@ -24,6 +26,8 @@
   <link rel="manifest" href="/manifest.webmanifest" />
   <meta name="theme-color" content="#f7f8fa" media="(prefers-color-scheme: light)" />
   <meta name="theme-color" content="#0d1117" media="(prefers-color-scheme: dark)" />
+  <!-- Both names: Chrome and Edge read the standard one, iOS only its own. -->
+  <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-title" content="enc-tool" />
   <link rel="apple-touch-icon" href="/public/apple-touch-icon.png" />
@@ -35,17 +39,27 @@
       <button class="tab tab-ansible active" data-action="switch" data-tab="ansible">ansible-vault</button>
       <button class="tab tab-helm" data-action="switch" data-tab="helm">helm-encrypt</button>
       <button class="tab tab-code" data-action="switch" data-tab="code">code</button>
+      <button class="tab tab-kafka" data-action="switch" data-tab="kafka">kafka</button>
     </div>
-    <!-- Everything here concerns the local code-agent — where to get one, and what it
-         can currently do — so it belongs beside the tab that uses it. main.ts
-         reveals the group with the code tab and hides it again otherwise. -->
+    <!-- The tabs, then a rule, then where to get the open tab's agent, then a rule,
+         then what state it is in: "ansible-vault helm-encrypt code kafka | ⤓ code-agent
+         | ● code-agent". One group per agent, revealed by main.ts with its own tab and
+         hidden on every other, so the crypto tabs show none of it. The download hides
+         itself as well when the deployment publishes no builds. -->
     <div id="code-tools" class="code-tools" hidden>
-      <!-- Download point for the prebuilt local code-agent. Hides itself as well when
-           the deployment publishes none. -->
+      <span class="toolbar-sep"></span>
       <div id="code-agent-dl" hidden></div>
+      <span class="toolbar-sep"></span>
       <!-- Capability badge: reports whether the local code-agent, git and ripgrep are
            reachable, and what is unavailable without them. Mounted by main.ts. -->
       <div id="cap-badge"></div>
+    </div>
+    <!-- The kafka tab's counterpart. -->
+    <div id="kafka-tools" class="kafka-tools" hidden>
+      <span class="toolbar-sep"></span>
+      <div id="kafka-agent-dl" hidden></div>
+      <span class="toolbar-sep"></span>
+      <div id="kafka-badge"></div>
     </div>
     <div class="header-right">
       <button class="theme-toggle" data-action="theme" aria-label="Toggle dark / light theme" title="Toggle theme">
@@ -61,6 +75,8 @@
   <div id="helm-tab" class="tab-content" data-tabid="helm"></div>
   <!-- No data-tabid: the code tab has its own layout, not the shared crypto
        toolbar template, and is populated by the lazily-loaded code chunk. -->
+  <!-- No data-tabid either: populated by the lazily-loaded kafka chunk. -->
+  <div id="kafka-tab" class="tab-content"></div>
   <div id="code-tab" class="tab-content"></div>
 
   <!-- No accept filter: the files people bring here are secrets and vars, and
@@ -82,10 +98,12 @@
   <template id="tab-template">
     <div class="toolbar">
       <span class="t-label">password</span>
-      <div class="pw-wrap">
+      <!-- A form, so the browser sees a password field it can fill and Enter in it
+           encrypts (main.ts). It never submits: the CSP has form-action 'none'. -->
+      <form class="pw-wrap js-pw-form">
         <input type="password" class="t-input js-password" placeholder="password" autocomplete="off" />
         <button type="button" class="t-eye" data-action="togglePw">👁</button>
-      </div>
+      </form>
       <div class="toolbar-sep"></div>
       <button class="t-btn t-btn-primary" data-action="encrypt" title="Encrypt the selection, or the whole buffer (Ctrl+E)">↑ encrypt</button>
       <button class="t-btn t-btn-primary" data-action="decrypt" title="Decrypt the selection, or the whole buffer (Ctrl+D)">↓ decrypt</button>

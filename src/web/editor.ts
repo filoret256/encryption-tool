@@ -139,8 +139,28 @@ const foldView = [codeFolding(), foldGutter(), keymap.of(foldKeymap)];
 
 const yamlLinter = linter((view) => yamlDiagnostics(view.state.doc.toString()));
 
+/** Below this, the YAML parser costs nothing worth measuring and is always on. */
+const YAML_ALWAYS_BELOW = 256 * 1024;
+/** What the sample reads of a large text, and what in it says "this is YAML". */
+const YAML_SAMPLE = 64 * 1024;
+const LOOKS_LIKE_YAML = /^\s*(?:#|-\s)|[\w"'.-]:(?:\s|$)/m;
+
+/** Whether a text is worth handing to the YAML parser.
+ *
+ *  An Ansible Vault envelope is a header and then lines of hex: to the YAML grammar one plain
+ *  scalar that runs to the end of the document. Reading it as such costs about 0.5 s for the
+ *  38 MB envelope of a 9 MB buffer — against 0.05 s for the same bytes as key/value lines —
+ *  and the result is a document with nothing to highlight. So a large text with no line that
+ *  looks like YAML (a comment, a list item, `key:`) is shown as plain text. */
+function wantsYaml(text: string): boolean {
+  if (text.length < YAML_ALWAYS_BELOW) return true;
+  return LOOKS_LIKE_YAML.test(text.length > YAML_SAMPLE ? text.slice(0, YAML_SAMPLE) : text);
+}
+
 export class TabEditor {
   readonly view: EditorView;
+  private yamlOn = true;
+  private cLang = new Compartment();
   private cLine = new Compartment();
   private cWrap = new Compartment();
   private cWs = new Compartment();
@@ -148,7 +168,7 @@ export class TabEditor {
   private cLint = new Compartment();
   private cHighlight = new Compartment();
   private cDark = new Compartment();
-  private changeCb: (() => void) | null = null;
+  private changeCb: ((docChanged: boolean) => void) | null = null;
 
   /** `readOnly` is for the result pane in two-pane mode: it holds output, and
    *  typing into it would produce something neither side accounts for. */
@@ -171,7 +191,7 @@ export class TabEditor {
           indentOnInput(),
           bracketMatching(),
           closeBrackets(),
-          yamlLang(),
+          this.cLang.of(yamlLang()),
           this.cHighlight.of(syntaxHighlighting(dark ? oneDarkHighlightStyle : defaultHighlightStyle)),
           this.cDark.of(cmDark(dark)),
           // Shared chrome first, this editor's own after it: where both name
@@ -189,7 +209,7 @@ export class TabEditor {
           // which the default keymap would otherwise take.
           keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
           EditorView.updateListener.of((u) => {
-            if (u.docChanged || u.selectionSet) this.changeCb?.();
+            if (u.docChanged || u.selectionSet) this.changeCb?.(u.docChanged);
           }),
         ],
       }),
@@ -200,7 +220,12 @@ export class TabEditor {
     return this.view.state.doc.toString();
   }
   set value(v: string) {
-    this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: v } });
+    // The language changes in the same transaction as the text, so the parser never starts on
+    // the new document with the old grammar.
+    const yaml = wantsYaml(v);
+    const effects = yaml === this.yamlOn ? [] : [this.cLang.reconfigure(yaml ? yamlLang() : [])];
+    this.yamlOn = yaml;
+    this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: v }, effects });
   }
 
   get lineCount(): number {
@@ -224,6 +249,35 @@ export class TabEditor {
     this.view.dispatch({ changes: { from: r.from, to: r.to, insert: text } });
   }
 
+  /** The main selection, as offsets: what a job that was handed the selection writes back to. */
+  get selectionRange(): { from: number; to: number } {
+    const r = this.view.state.selection.main;
+    return { from: r.from, to: r.to };
+  }
+
+  get length(): number {
+    return this.view.state.doc.length;
+  }
+
+  /** What is at these offsets now, clamped to the document. */
+  sliceText(from: number, to: number): string {
+    const n = this.view.state.doc.length;
+    return this.view.state.sliceDoc(Math.min(from, n), Math.min(to, n));
+  }
+
+  /** Put text at these offsets. The whole document goes through the `value` setter, which
+   *  also decides whether the text is YAML. */
+  replaceRange(from: number, to: number, text: string): void {
+    const n = this.view.state.doc.length;
+    from = Math.min(from, n);
+    to = Math.min(to, n);
+    if (from === 0 && to === n) {
+      this.value = text;
+      return;
+    }
+    this.view.dispatch({ changes: { from, to, insert: text } });
+  }
+
   focus(): void {
     this.view.focus();
   }
@@ -231,7 +285,9 @@ export class TabEditor {
   refresh(): void {
     this.view.requestMeasure();
   }
-  onChange(cb: () => void): void {
+  /** Told on every change of the text or of the selection; `docChanged` says which. A caret that
+   *  only moved changes nothing a count of the text could show. */
+  onChange(cb: (docChanged: boolean) => void): void {
     this.changeCb = cb;
   }
 

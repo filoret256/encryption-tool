@@ -1,17 +1,17 @@
 // Putting the connection URL on the system clipboard at startup.
 //
 // The URL carries a token that is new on every run, so without this the first
-// thing anyone does after starting the code-agent is select a line of terminal
+// thing anyone does after starting an agent is select a line of terminal
 // output with the mouse. There is no way for a process to offer a "copy"
 // button in a terminal — catching a keypress would mean holding the terminal in
 // raw mode, which breaks Ctrl+C, pipes, and running without a TTY at all — so
-// the code-agent simply does the copying itself.
+// the agent simply does the copying itself.
 //
 // Shelling out to the platform's clipboard tool rather than taking a
 // dependency: each is one process spawn, they are the tools the user's desktop
 // already ships, and a Go clipboard library would pull in cgo and X11 headers
 // for something this small.
-package main
+package agentkit
 
 import (
 	"os"
@@ -42,10 +42,10 @@ func clipboardTools() [][]string {
 	}
 }
 
-// copyToClipboard reports whether the text reached the clipboard. A failure is
+// CopyToClipboard reports whether the text reached the clipboard. A failure is
 // not an error worth stopping for: the URL is printed either way, and the whole
 // feature is a convenience.
-func copyToClipboard(text string) bool {
+func CopyToClipboard(text string) bool {
 	for _, argv := range clipboardTools() {
 		path, err := exec.LookPath(argv[0])
 		if err != nil {
@@ -60,12 +60,12 @@ func copyToClipboard(text string) bool {
 	return false
 }
 
-// interactive reports whether stdout is a terminal a person is watching.
+// Interactive reports whether stdout is a terminal a person is watching.
 //
-// This gates the copy, and gating it matters: the smoke suite starts code-agents in
+// This gates the copy, and gating it matters: the smoke suite starts agents in
 // a loop with their output piped, and every one of them would otherwise
 // overwrite whatever the developer had on their clipboard.
-func interactive() bool {
+func Interactive() bool {
 	info, err := os.Stdout.Stat()
 	if err != nil {
 		return false

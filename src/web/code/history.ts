@@ -4,9 +4,11 @@
  *  is fast, but shipping 50k commits through the socket and into the DOM is not.
  */
 import type { CodeAgentClient } from "./code-agent.ts";
-import type { Branch, Commit, CommitDetail, GitStatus } from "../../code-agent/protocol.ts";
-import { copyToClipboard, esc, modalConfirm, modalPrompt, setHtmlKeepingScroll, showMenu, startTrimmed, type MenuItem } from "./ui.ts";
+import type { BranchList, Commit, CommitDetail, GitStatus } from "../../code-agent/protocol.ts";
+import { copyToClipboard, esc, modalConfirm, modalPrompt, ROW_H, showMenu, startTrimmed, type MenuItem } from "./ui.ts";
 import { computeGraph, continuationSvg, laneSvg, LANE_W, type GraphRow } from "./graph.ts";
+import { debounce } from "./debounce.ts";
+import { VirtualList } from "./vlist.ts";
 import { iconRefresh } from "./icons.ts";
 import { OP_SCOPE } from "./git-panel.ts";
 import { pickRef } from "./refpicker.ts";
@@ -17,6 +19,25 @@ const PAGE = 100;
  *  is past anything a blame line realistically points at and short of walking a
  *  large repository end to end for a commit that is on another branch. */
 const REVEAL_PAGES = 10;
+
+/** The most commits the panel holds.
+ *
+ *  It is a window, not the history: `git log` on a large repository has twenty
+ *  thousand commits in it, and holding them all costs the reader nothing but
+ *  memory — the graph is a pass over every loaded commit, and a refresh re-reads
+ *  the whole window because a rebase can rewrite any of it. Twenty pages is far
+ *  past what anyone scrolls through looking for something; scoping the log to a
+ *  path is how you go deeper, and the panel says so when the limit is reached. */
+const MAX_LOADED = 2000;
+
+/** How many commits of a fresh first page must match the top of what is loaded before the
+ *  rest of the loaded list is trusted to be what it was. */
+const MIN_OVERLAP = 10;
+
+/** What the offsets assume an open commit's block is worth before it has been
+ *  rendered once. Every open commit was clicked while it was on screen, so it is
+ *  measured immediately; this is only what the very first paint of one uses. */
+const DETAIL_GUESS = 200;
 
 /** Who and what a commit diff belongs to, so its two sides can be labelled with
  *  something a reader recognises instead of two near-identical hashes. */
@@ -81,8 +102,16 @@ function parseFilter(raw: string): Filter | null {
   return f;
 }
 
+/** A commit's searchable text, lower-cased once: every keystroke asks about every loaded commit,
+ *  and building and lower-casing four fields for each of them each time was most of the cost. */
+const hayCache = new WeakMap<Commit, string>();
+
 function matches(c: Commit, f: Filter): boolean {
-  const hay = `${c.subject} ${c.author} ${c.email} ${c.refs}`.toLowerCase();
+  let hay = hayCache.get(c);
+  if (hay === undefined) {
+    hay = `${c.subject} ${c.author} ${c.email} ${c.refs}`.toLowerCase();
+    hayCache.set(c, hay);
+  }
   if (!f.text.every((t) => hay.includes(t))) return false;
   if (!f.author.every((a) => `${c.author} ${c.email}`.toLowerCase().includes(a))) return false;
   if (f.since !== undefined && c.time < f.since) return false;
@@ -131,16 +160,44 @@ const SHELL = `
     <span class="hist-filter-count js-count"></span>
   </div>
   <div class="hist-compare js-compare" hidden></div>
-  <div class="hist-list js-list"></div>
+  <div class="hist-view">
+    <div class="hist-list js-list"></div>
+    <div class="hist-note js-note" hidden></div>
+  </div>
   <button class="t-btn hist-more js-more" type="button" hidden>load more</button>`;
 
 export class HistoryPanel {
   private commits: Commit[] = [];
-  private graph: GraphRow[] = [];
+  /** Bumped whenever `commits` is replaced. What the lane map and the layout
+   *  cache are keyed on, instead of a JSON fingerprint of every commit: the old
+   *  key was rebuilt on every render, and a render happens on every watcher
+   *  event. */
+  private listVersion = 0;
+  /** The rows on screen after the filter, which is what the list holds and what
+   *  an anchor index is counted in. */
+  private shown: Commit[] = [];
+  /** How tall an open commit's block turned out to be, per commit. Measured from
+   *  the rendered rows, because what an open commit holds — a wrapped message, a
+   *  list of changed files — is what decides its height. */
+  private readonly detailHeights = new Map<string, number>();
+  /** The lane of each commit for the current log and graph toggle. */
+  private lanesFor: { version: number; graph: boolean; byOid: Map<string, GraphRow | undefined> } | null = null;
+  private readonly list: VirtualList<Commit>;
+  /** The graph toggle, kept: `lanes()` is asked for a lane per row rendered, and
+   *  a querySelector per row per paint is not worth the saved field. */
+  private readonly graphToggle: HTMLInputElement;
   /** How many commits are loaded. Not a request size any more: "load more" asks
    *  for one page past this, and only a refresh re-reads the window. */
   private limit = PAGE;
   private loadingMore = false;
+  /** Which question `commits` answers: the path and `--all`. A refresh may join a fresh first page
+   *  to the loaded list only when the question is the same; another question has another list. */
+  private loadedKey = "";
+  /** The next refresh reads the whole window. Set by the reload button, whose job is to say that
+   *  nothing already shown is to be believed. */
+  private fullNext = false;
+  /** Which `reveal` is current. A newer one, a new scope, a full reload: the older one stops paging. */
+  private revealSeq = 0;
   /** Which commits are open.
    *
    *  A set, not one oid: comparing what two commits touched is the ordinary
@@ -163,10 +220,6 @@ export class HistoryPanel {
   /** Which parent a merge commit is being read against, per commit — so a
    *  refresh of the log does not silently put the list back to parent 1. */
   private parentChoice = new Map<string, number>();
-  /** Fingerprint of what is currently on screen; an unchanged log is not
-   *  redrawn, so a click is never dropped because the row it landed on was
-   *  replaced underneath it. */
-  private renderedKey = "";
   /** Why the log is not on screen, when the answer is not simply "there is
    *  none". Kept apart from `commits` because the two used to be conflated:
    *  any failure emptied the list, and an empty list says "No commits." */
@@ -182,10 +235,34 @@ export class HistoryPanel {
     host.classList.add("hist");
     host.innerHTML = SHELL;
     this.$ = <T extends HTMLElement>(sel: string): T => host.querySelector<T>(sel)!;
+    this.graphToggle = this.$<HTMLInputElement>(".js-graph");
+
+    // The list is virtual: only the rows on screen exist, which is what makes a
+    // window of two thousand commits cost the same as a window of fifty. Rows
+    // are not all the same height here — an open commit is taller than the row
+    // it opened from — so the list measures them as it renders them, and the
+    // panel remembers what each open block turned out to be.
+    this.list = new VirtualList<Commit>(this.$(".js-list"), ROW_H, (c) => this.commitHtml(c), {
+      variable: {
+        heightOf: (c) => ROW_H + (this.expanded.has(c.oid) ? (this.detailHeights.get(c.oid) ?? DETAIL_GUESS) : 0),
+        measured: (c, _i, height) => {
+          if (!this.expanded.has(c.oid)) return;
+          const block = Math.max(0, height - ROW_H);
+          if (this.detailHeights.get(c.oid) !== block) this.detailHeights.set(c.oid, block);
+        },
+      },
+      // The gutter width cannot be a style="" attribute (style-src has no
+      // 'unsafe-inline'), so it rides in data-lanes and is applied to the rows
+      // once they exist — which, for a virtual list, is after every paint.
+      afterRender: () => this.applyLaneWidths(),
+    });
 
     this.$(".js-all").addEventListener("change", () => void this.refresh());
     this.$(".js-graph").addEventListener("change", () => this.render());
-    this.$(".js-reload").addEventListener("click", () => void this.refresh());
+    this.$(".js-reload").addEventListener("click", () => {
+      this.fullNext = true;
+      void this.refresh();
+    });
     this.$(".js-more").addEventListener("click", () => void this.loadMore());
     // Acting on the press. This list rebuilds itself whenever a commit's files
     // arrive and on every watcher event, and a rebuild between mousedown and
@@ -194,16 +271,18 @@ export class HistoryPanel {
     this.$(".js-list").addEventListener("pointerdown", (e) => void this.onPress(e as PointerEvent));
     this.$(".js-list").addEventListener("contextmenu", (e) => this.onContextMenu(e as MouseEvent));
 
-    // The filter runs over what is already loaded, so it costs nothing per
-    // keystroke and needs no debounce — which is the point of doing it here
-    // rather than sending every keystroke to `git log --grep`.
-    this.$(".js-filter").addEventListener("input", (e) => {
-      this.filter = parseFilter((e.target as HTMLInputElement).value);
+    // The filter runs over what is already loaded, which is the point of doing it here rather
+    // than sending every keystroke to `git log --grep`. It still walks every loaded commit and
+    // draws the list, so it waits for a pause in the typing.
+    const applyFilter = debounce(() => {
+      this.filter = parseFilter(this.$<HTMLInputElement>(".js-filter").value);
       this.render();
-    });
+    }, 120);
+    this.$(".js-filter").addEventListener("input", () => applyFilter());
     this.$(".js-filter").addEventListener("keydown", (e) => {
       const ev = e as KeyboardEvent;
       if (ev.key !== "Escape") return;
+      applyFilter.cancel();
       ev.stopPropagation();
       this.$<HTMLInputElement>(".js-filter").value = "";
       this.filter = null;
@@ -223,14 +302,13 @@ export class HistoryPanel {
   setOptions(o: { all?: boolean; graph?: boolean }): void {
     if (o.all !== undefined) this.$<HTMLInputElement>(".js-all").checked = o.all;
     if (o.graph !== undefined) this.$<HTMLInputElement>(".js-graph").checked = o.graph;
-    // The fingerprint below suppresses identical redraws, and a toggle changes
-    // nothing about the commits themselves.
-    this.renderedKey = "";
+    this.render();
   }
 
   /** Show the history of one path only. */
   scopeTo(path: string | null): void {
     if (this.path === path) return;
+    this.revealSeq++;
     this.path = path;
     this.limit = PAGE;
     this.expanded.clear();
@@ -239,6 +317,10 @@ export class HistoryPanel {
 
   /** Open the panel on one commit: expand it and put it on screen. */
   async reveal(oid: string): Promise<void> {
+    // Paging for a commit is work for the row that asked. Another click on a blame line, or a
+    // change of what the panel shows, makes this one's answer worth nothing — it stops after the
+    // page in flight rather than walking nine more.
+    const seq = ++this.revealSeq;
     // A blame line can name a commit older than the loaded window, and landing
     // on "nothing here" would read as the click having failed. Paging forward
     // is what reaches it; before `skip` existed this raised a limit it then
@@ -246,11 +328,12 @@ export class HistoryPanel {
     //
     // Bounded, because the commit may simply not be on this branch — walking a
     // hundred thousand commits to discover that helps nobody.
-    for (let pages = 0; pages < REVEAL_PAGES && !this.commits.some((c) => c.oid === oid); pages++) {
+    for (let pages = 0; pages < REVEAL_PAGES && seq === this.revealSeq && !this.commits.some((c) => c.oid === oid); pages++) {
       const before = this.commits.length;
       await this.loadMore();
       if (this.commits.length === before) break; // the log ended
     }
+    if (seq !== this.revealSeq) return;
     if (!this.commits.some((c) => c.oid === oid)) {
       this.cb.toast(`${oid.slice(0, 7)} is not in the history being shown.`, true);
       return;
@@ -262,9 +345,12 @@ export class HistoryPanel {
       this.filter = null;
     }
     this.expanded.add(oid);
-    this.render();
+    this.render(oid);
     await this.loadDetail(oid);
-    this.$(".js-list").querySelector(`.hist-item[data-oid="${oid}"]`)?.scrollIntoView({ block: "center" });
+    // The row may not be in the DOM yet — the list holds only what is on screen
+    // — so it is the index, not a selector, that brings it into view.
+    const at = this.shown.findIndex((c) => c.oid === oid);
+    if (at >= 0) this.list.scrollToIndex(at);
   }
 
   /** One page of the log.
@@ -293,30 +379,33 @@ export class HistoryPanel {
    *  whole because at that point it has to. */
   private async loadMore(): Promise<void> {
     if (this.loadingMore) return;
+    // The window has to end somewhere: see MAX_LOADED. The button says so, so
+    // this is only the guard behind it.
+    if (this.commits.length >= MAX_LOADED) return this.showMore();
     this.loadingMore = true;
     const button = this.$<HTMLButtonElement>(".js-more");
     button.disabled = true;
     button.textContent = "loading…";
     try {
-      const next = withoutStash(await this.page(PAGE, this.commits.length));
+      const next = withoutStash(await this.page(Math.min(PAGE, MAX_LOADED - this.commits.length), this.commits.length));
       // Appending is only safe while the oids are still distinct; a concurrent
       // rewrite could hand back one already shown, and a duplicated row is a
       // worse answer than a missing one.
       const seen = new Set(this.commits.map((c) => c.oid));
       this.commits = [...this.commits, ...next.filter((c) => !seen.has(c.oid))];
+      this.listVersion++;
       // `limit` is "how many were asked for", which is what render() compares
       // the list against to decide whether the button has anywhere left to go:
       // a short page means the log ended, so leave it one above what arrived.
       // A full page means there may be more, so leave the two equal.
       this.limit = this.commits.length + (next.length === PAGE ? 0 : 1);
-      this.renderedKey = "";
       this.render();
     } catch (e) {
       this.cb.toast(e instanceof Error ? e.message : String(e), true);
     } finally {
       this.loadingMore = false;
       button.disabled = false;
-      button.textContent = "load more";
+      this.showMore();
     }
   }
 
@@ -329,19 +418,32 @@ export class HistoryPanel {
   private async load(): Promise<void> {
     if (this.codeAgent.state !== "online" || !this.codeAgent.info?.gitVersion) {
       this.commits = [];
+      this.listVersion++;
       return this.render();
     }
     try {
-      // The whole loaded window, because a refresh means the refs moved and the
-      // pages already shown may not say what they said before.
-      this.commits = withoutStash(await this.page(Math.max(this.limit, PAGE), 0));
+      const key = JSON.stringify([this.path, this.path ? false : this.$<HTMLInputElement>(".js-all").checked]);
+      const full = this.fullNext || key !== this.loadedKey || this.commits.length <= PAGE;
+      this.fullNext = false;
+      const joined = full ? null : await this.refreshHead();
+      if (joined) {
+        this.commits = joined;
+      } else {
+        // The whole loaded window: a rewritten history (a rebase, a reset) can change any of it, and
+        // so can another question than the one that was loaded — and never more than the panel holds.
+        this.commits = withoutStash(await this.page(Math.min(Math.max(this.limit, PAGE), MAX_LOADED), 0));
+      }
+      this.loadedKey = key;
+      this.listVersion++;
       this.failure = null;
       // A commit's diff is immutable, but a rebase rewrites oids, so a stale
       // entry can only ever be unreachable — drop what is no longer listed.
       const live = new Set(this.commits.map((c) => c.oid));
       for (const oid of [...this.details.keys()]) if (!live.has(oid)) this.details.delete(oid);
+      for (const oid of [...this.detailHeights.keys()]) if (!live.has(oid)) this.detailHeights.delete(oid);
     } catch (e) {
       this.commits = [];
+      this.listVersion++;
       const message = e instanceof Error ? e.message : String(e);
       // A repository with no commits yet is not a failure. Anything else is —
       // and reporting it as "No commits." is how one broken entry under
@@ -353,66 +455,128 @@ export class HistoryPanel {
     this.render();
   }
 
+  /** Read only the first page and join it to what is already loaded.
+   *
+   *  A refresh happens on every change under `.git`, and in the usual one — a commit, a pull, a
+   *  checkout — what is new is at the top and the rest is what it was. Asking for the whole loaded
+   *  window again (up to two thousand commits, over the socket, through git and the parser) to
+   *  learn that was most of what a refresh cost once the reader had paged a few times.
+   *
+   *  The first page is fetched and looked for in the loaded list. If its older part is the top of
+   *  that list, commit for commit, the new commits are put in front of the rest. If it is not — a
+   *  rebase, a reset, a different branch — null is returned and the caller reads the window whole.
+   *  What this does not refresh is a label on a commit further down (a tag or branch that moved
+   *  there): the reload button reads the window whole for that. */
+  private async refreshHead(): Promise<Commit[] | null> {
+    const head = withoutStash(await this.page(PAGE, 0));
+    const old = this.commits;
+    if (!head.length) return null;
+    const at = new Map(old.map((c, i) => [c.oid, i] as const));
+    let joinAtHead = -1;
+    let joinAtOld = -1;
+    for (let j = 0; j < head.length; j++) {
+      const i = at.get(head[j].oid);
+      if (i !== undefined) {
+        joinAtHead = j;
+        joinAtOld = i;
+        break;
+      }
+    }
+    if (joinAtHead < 0) return null;
+    const overlap = head.length - joinAtHead;
+    for (let k = 0; k < overlap; k++) if (old[joinAtOld + k]?.oid !== head[joinAtHead + k].oid) return null;
+    if (overlap < Math.min(MIN_OVERLAP, head.length)) return null;
+    const merged = [...head.slice(0, joinAtHead), ...old.slice(joinAtOld)].slice(0, MAX_LOADED);
+    // Keep `limit` meaning what it meant: a log that had ended still has one more than what is held.
+    const ended = this.limit > old.length;
+    this.limit = merged.length + (ended ? 1 : 0);
+    return merged;
+  }
+
   /** `anchorOid` is the commit the user just clicked. Expanding it, or
    *  collapsing whatever was open above it, changes the heights around it — so
-   *  that row is pinned in place instead of the scroll offset. */
+   *  that row is pinned in place instead of the scroll offset.
+   *
+   *  What this no longer does is build the whole list: the rows are virtual, and
+   *  this only tells the list what to show. The fingerprint that used to guard
+   *  against redrawing an unchanged log was a JSON string over every loaded
+   *  commit, rebuilt on every render — a render happens on every watcher event —
+   *  so what remains of it is a cheap comparison of the panel's own state. */
   private render(anchorOid?: string): void {
     const list = this.$(".js-list");
+    const note = this.$(".js-note");
     this.renderScope();
     this.renderCompareBar();
     if (!this.commits.length) {
-      list.innerHTML = this.failure
+      // The note lives outside the list: the list is a virtual one, and it owns
+      // everything inside itself.
+      list.hidden = true;
+      note.hidden = false;
+      note.innerHTML = this.failure
         ? `<div class="panel-error">
              <p class="panel-error-title">The history could not be loaded.</p>
              <pre>${esc(this.failure)}</pre>
              <button class="t-btn js-retry" type="button">try again</button>
            </div>`
         : `<p class="gp-empty">No commits.</p>`;
-      list.querySelector(".js-retry")?.addEventListener("click", () => void this.refresh());
+      note.querySelector(".js-retry")?.addEventListener("click", () => void this.refresh());
       this.$(".js-more").hidden = true;
-      // The fingerprint below suppresses an identical redraw; an error state
-      // has to be able to redraw itself once the cause is gone.
-      this.renderedKey = "";
       return;
     }
-    // The layout depends only on the commit list, so it is recomputed here
-    // rather than in refresh() — the graph toggle re-renders without refetching.
-    const withGraph = this.$<HTMLInputElement>(".js-graph").checked;
+    if (!note.hidden) {
+      note.hidden = true;
+      note.replaceChildren();
+      list.hidden = false;
+    }
+
     // The filter hides rows; it must not renumber the graph, so the lanes are
     // computed over the whole log and the shown rows keep their own lane.
     const shown = this.filter ? this.commits.filter((c) => matches(c, this.filter!)) : this.commits;
+    this.shown = shown;
     this.reportCount(shown.length);
-    const key = JSON.stringify([
-      this.commits.map((c) => [c.oid, c.refs, c.subject]),
-      // The parent a merge is read against is part of what is on screen: two
-      // renders of the same commit show different file lists.
-      [...this.expanded].map((oid) => [oid, Boolean(this.details.get(oid)), this.details.get(oid)?.parent ?? 0]),
-      shown.length === this.commits.length ? null : shown.map((c) => c.oid),
-      this.compareBase,
-      withGraph,
-    ]);
-    if (key === this.renderedKey) return;
-    this.renderedKey = key;
+    const anchor = anchorOid ? shown.findIndex((c) => c.oid === anchorOid) : -1;
+    this.list.setItems(shown, anchor);
+    this.showMore();
+  }
 
-    // A filtered log is a list of separate commits, not a connected history:
-    // drawing lanes between rows with others hidden between them would join
-    // commits that are not parent and child. So the graph goes while filtering.
-    this.graph = withGraph && !this.filter ? computeGraph(this.commits) : [];
-    const laneOf = new Map(this.commits.map((c, i) => [c.oid, this.graph[i]]));
-    setHtmlKeepingScroll(
-      list,
-      shown.length
-        ? shown.map((c) => this.commitHtml(c, laneOf.get(c.oid))).join("")
-        : `<p class="gp-empty">Nothing in the loaded history matches. “load more” widens what is searched.</p>`,
-      anchorOid ? `.hist-item[data-oid="${anchorOid}"] .hist-row` : undefined,
-    );
-    // The gutter width cannot be a style="" attribute any more (style-src has
-    // no 'unsafe-inline'), so it rides in data-lanes and is applied here, once
-    // the rows are in the DOM.
-    for (const gutter of list.querySelectorAll<HTMLElement>(".hist-gutter")) {
+  /** The lane of each commit, for the current log and graph toggle.
+   *
+   *  A filtered log is a list of separate commits, not a connected history:
+   *  drawing lanes between rows with others hidden between them would join
+   *  commits that are not parent and child. So the graph goes while filtering.
+   *
+   *  Cached, because it is one entry per loaded commit and a render happens on
+   *  every watcher event. */
+  private lanes(): Map<string, GraphRow | undefined> {
+    const on = this.graphToggle.checked && !this.filter;
+    if (this.lanesFor && this.lanesFor.version === this.listVersion && this.lanesFor.graph === on) return this.lanesFor.byOid;
+    const graph = on ? computeGraph(this.commits) : [];
+    const byOid = new Map<string, GraphRow | undefined>(this.commits.map((c, i) => [c.oid, graph[i]]));
+    this.lanesFor = { version: this.listVersion, graph: on, byOid };
+    return byOid;
+  }
+
+  /** The rows are in the DOM now, so the width the graph needs can be applied.
+   *  A style="" attribute would have said it in the markup; style-src no longer
+   *  admits one. */
+  private applyLaneWidths(): void {
+    for (const gutter of this.$(".js-list").querySelectorAll<HTMLElement>(".hist-gutter")) {
       gutter.style.width = `${Number(gutter.dataset.lanes) * LANE_W}px`;
     }
-    this.$(".js-more").hidden = this.commits.length < this.limit;
+  }
+
+  /** Whether there is anywhere left to go, and what to say when there is not. */
+  private showMore(): void {
+    const button = this.$<HTMLButtonElement>(".js-more");
+    if (this.commits.length >= MAX_LOADED) {
+      button.hidden = false;
+      button.disabled = true;
+      button.textContent = `${MAX_LOADED.toLocaleString("en-US")} commits loaded — the panel stops here. Scope the history to a path to go deeper.`;
+      return;
+    }
+    button.disabled = false;
+    button.textContent = "load more";
+    button.hidden = this.commits.length < this.limit;
   }
 
   /** How much of the log the filter is actually looking at.
@@ -468,9 +632,10 @@ export class HistoryPanel {
     if (this.expanded.has(oid)) this.render(oid);
   }
 
-  private commitHtml(c: Commit, row: GraphRow | undefined): string {
+  private commitHtml(c: Commit): string {
     const open = this.expanded.has(c.oid);
     const detail = this.details.get(c.oid);
+    const row = this.lanes().get(c.oid);
     // Everything the row has no width for. The row shows a first name and "2h";
     // who that is and when that was were not recoverable from anywhere in the
     // panel, not even on hover.
@@ -792,11 +957,11 @@ export class HistoryPanel {
    *  trade. */
   private async compareRefWith(left: string): Promise<void> {
     try {
-      const refs = await this.codeAgent.call<Branch[]>("git.branches");
+      const list = await this.codeAgent.call<BranchList>("git.branches");
       const right = await pickRef({
         title: `Compare ${left} with which ref?`,
         hint: "Lists what is on each side that is not on the other.",
-        refs,
+        refs: list.refs,
         current: left,
         excludeCurrent: true,
         okLabel: "compare",
@@ -850,7 +1015,7 @@ function refsHtml(refs: string): string {
       const mark = kind === "tag" ? `<span class="hist-ref-mark" aria-hidden="true">⌗</span>` : "";
       // The bare name — no "tag: ", no "HEAD -> " — is what git takes as a ref,
       // and what the context menu compares against.
-      return `<span class="hist-ref ref-${kind}" data-ref="${esc(label)}" title="${esc(r)}">${mark}<span class="hist-ref-name">${esc(startTrimmed(label))}</span></span>`;
+      return `<span class="hist-ref ref-${kind} ref-w${Math.min(label.length, 12) + (kind === "tag" ? 3 : 0)}" data-ref="${esc(label)}" title="${esc(r)}">${mark}<span class="hist-ref-name">${esc(startTrimmed(label))}</span></span>`;
     });
   return `<span class="hist-refs">${chips.join("")}</span>`;
 }

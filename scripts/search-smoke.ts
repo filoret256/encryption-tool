@@ -44,6 +44,19 @@ await git(root, "commit", "-qm", "fixtures");
 
 type Search = { hits: SearchHit[]; summary: SearchSummary };
 
+/** The hits a scan streamed, whichever shape it sent them in: one frame per hit,
+ *  which is what it used to do, or in batches, which is what it does now (P9).
+ *  A check about *what was found* must not depend on how it was carried. */
+const streamedHits = (chunks: unknown[]): SearchHit[] => {
+  const out: SearchHit[] = [];
+  for (const c of chunks) {
+    const f = c as { hit?: SearchHit; hits?: SearchHit[] };
+    if (Array.isArray(f.hits)) out.push(...f.hits);
+    else if (f.hit) out.push(f.hit);
+  }
+  return out;
+};
+
 let h: Harness | null = null;
 try {
   h = await startCodeAgent(root, PORT);
@@ -56,8 +69,7 @@ try {
       ...params,
     });
     const summary = await call;
-    const hits = call.chunks.map((c) => (c as { hit: SearchHit }).hit).filter(Boolean);
-    return { hits, summary };
+    return { hits: streamedHits(call.chunks), summary };
   };
 
   // ── streaming and the ignore rules ──
@@ -144,7 +156,7 @@ try {
 
       const b = other.call<SearchSummary>("search", { query: "widget", matchCase: false, wholeWord: false, regex: false });
       const bSummary = await b;
-      const bHits = b.chunks.map((c) => (c as { hit: SearchHit }).hit).filter(Boolean);
+      const bHits = streamedHits(b.chunks);
 
       check("the two engines are actually different", bSummary.engine === "fallback", `${uni.summary.engine} vs ${bSummary.engine}`);
       check(

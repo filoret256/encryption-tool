@@ -13,10 +13,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type searchOpts struct {
@@ -34,6 +36,32 @@ const defaultMaxMatches = 5000
 
 const maxSearchFileBytes = 2 * 1024 * 1024
 
+// How long a whole scan may run, with either engine.
+//
+// Nothing bounded the sum of the per-file work: a repository of 40,000 files
+// where each takes a few milliseconds is minutes of scanning, and
+// search-as-you-type issues one of these per keystroke — so a slow-enough
+// pattern was a promise this agent could not keep, with no number in it and no
+// way to say how far it had got. Thirty seconds is past any scan a person waits
+// for, and the answer says it stopped there. The TypeScript code-agent has the
+// same number (SCAN_LIMIT_MS in src/code-agent/search.ts).
+//
+// A variable rather than a constant because a test cannot wait thirty seconds;
+// same shape as readProcDeadline in proc.go.
+var scanLimit = 30 * time.Second
+
+// How many files between progress frames. A frame every file would be 40,000
+// frames for one scan, which is the thing batching exists to avoid. A variable
+// for the same reason as scanLimit: a test cannot wait for 512 files.
+var progressEvery = 512
+
+// scanProgress is how far a scan has got: how many files there were to look at,
+// and how many it has opened.
+type scanProgress struct {
+	scanned    int
+	candidates int
+}
+
 // runSearch streams hits to emit and returns the summary. Cancellation is the
 // caller's context: search-as-you-type supersedes its own requests constantly,
 // and without this the code-agent would keep a dead scan (and a dead ripgrep)
@@ -42,7 +70,7 @@ const maxSearchFileBytes = 2 * 1024 * 1024
 // It takes the jail rather than a bare folder: the fallback opens every file it
 // lists, and each of those has to be vouched for by the same containment check
 // as any other read — see readSearchable.
-func runSearch(ctx context.Context, j *jail, o searchOpts, ripgrep bool, emit func(searchHit)) searchSummary {
+func runSearch(ctx context.Context, j *jail, o searchOpts, ripgrep bool, emit func(searchHit), progress func(scanProgress)) searchSummary {
 	root := j.root
 	limit := o.maxMatches
 	if limit == 0 {
@@ -55,10 +83,12 @@ func runSearch(ctx context.Context, j *jail, o searchOpts, ripgrep bool, emit fu
 	if o.query == "" {
 		return searchSummary{Engine: engine}
 	}
+	ctx, stop := context.WithTimeout(ctx, scanLimit)
+	defer stop()
 	if ripgrep {
 		return rgSearch(ctx, root, o, limit, emit)
 	}
-	return fallbackSearch(ctx, j, o, limit, emit)
+	return fallbackSearch(ctx, j, o, limit, emit, progress)
 }
 
 // ── ripgrep ───────────────────────────────────────────────────────────────
@@ -160,12 +190,32 @@ func rgSearch(ctx context.Context, root string, o searchOpts, limit int, emit fu
 
 	// A cancelled scan is a partial one; say so rather than reporting a complete
 	// result the caller would take at face value.
+	reason := stopReason(ctx, truncated, matches >= limit)
 	return searchSummary{
 		Files:     len(files),
 		Matches:   matches,
-		Truncated: truncated || ctx.Err() != nil,
+		Truncated: truncated || reason != nil,
 		Engine:    "ripgrep",
+		Reason:    reason,
+		// ripgrep walks the tree itself: it never says how many files there were
+		// or how many it looked at. Null is the honest answer.
+		Scanned:    nil,
+		Candidates: nil,
 	}
+}
+
+// stopReason names why a scan ended before the end of the tree: the result cap,
+// the deadline, or the caller walking away. Nil means it got there.
+func stopReason(ctx context.Context, capped bool, atLimit bool) *string {
+	switch {
+	case capped || atLimit:
+		return strPtr("matches")
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return strPtr("time")
+	case ctx.Err() != nil:
+		return strPtr("cancelled")
+	}
+	return nil
 }
 
 // ── fallback ──────────────────────────────────────────────────────────────
@@ -207,7 +257,7 @@ func readSearchable(j *jail, rel string) ([]byte, bool) {
 	return b, true
 }
 
-func fallbackSearch(ctx context.Context, j *jail, o searchOpts, limit int, emit func(searchHit)) searchSummary {
+func fallbackSearch(ctx context.Context, j *jail, o searchOpts, limit int, emit func(searchHit), progress func(scanProgress)) searchSummary {
 	root := j.root
 	paths := []string{}
 	if r, err := run(ctx, readOnly("ls-files", "-co", "--exclude-standard", "-z"), root); err == nil && r.code == 0 {
@@ -241,10 +291,24 @@ func fallbackSearch(ctx context.Context, j *jail, o searchOpts, limit int, emit 
 
 	files := map[string]bool{}
 	matches := 0
+	scanned := 0
+	candidates := len(paths)
+	// Anything but a scan that reached the end is a partial answer.
+	summary := func(reason *string) searchSummary {
+		return searchSummary{
+			Files:      len(files),
+			Matches:    matches,
+			Truncated:  reason != nil,
+			Engine:     "fallback",
+			Reason:     reason,
+			Scanned:    &scanned,
+			Candidates: &candidates,
+		}
+	}
 
 	for _, rel := range paths {
 		if ctx.Err() != nil {
-			return searchSummary{Files: len(files), Matches: matches, Truncated: true, Engine: "fallback"}
+			return summary(stopReason(ctx, false, false))
 		}
 		if includeRe != nil && !includeRe.MatchString(rel) {
 			continue
@@ -256,6 +320,12 @@ func fallbackSearch(ctx context.Context, j *jail, o searchOpts, limit int, emit 
 		b, ok := readSearchable(j, rel)
 		if !ok {
 			continue
+		}
+		scanned++
+		// Every progressEvery files the caller is told how far this has got. The
+		// scan of a large repository is minutes of silence otherwise.
+		if progress != nil && scanned%progressEvery == 0 {
+			progress(scanProgress{scanned: scanned, candidates: candidates})
 		}
 
 		for i, text := range splitLines(string(b)) {
@@ -271,11 +341,16 @@ func fallbackSearch(ctx context.Context, j *jail, o searchOpts, limit int, emit 
 			matches += len(ranges)
 			emit(searchHit{Path: rel, Line: i + 1, Col: ranges[0][0], Text: text, Ranges: ranges})
 			if matches >= limit {
-				return searchSummary{Files: len(files), Matches: matches, Truncated: true, Engine: "fallback"}
+				return summary(strPtr("matches"))
 			}
 		}
 	}
-	return searchSummary{Files: len(files), Matches: matches, Truncated: false, Engine: "fallback"}
+	// The listing itself can come back empty because the caller gave up: a scan
+	// that looked at nothing has not "reached the end".
+	if ctx.Err() != nil {
+		return summary(stopReason(ctx, false, false))
+	}
+	return summary(nil)
 }
 
 // splitLines splits on \n and drops one trailing \r, matching /\r?\n/.

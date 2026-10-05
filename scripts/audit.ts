@@ -4,10 +4,13 @@
  *  "was it checked" has one answer and does not depend on who remembered:
  *
  *    bun audit          known advisories in the JavaScript dependencies
- *    govulncheck        known vulnerabilities in the Go code-agent that its code reaches
- *    staticcheck        bugs and dead code in the Go code-agent (code-agent-go/staticcheck.conf)
- *    gosec              security-relevant patterns in the Go code-agent
+ *    govulncheck        known vulnerabilities in the Go agents that their code reaches
+ *    staticcheck        bugs and dead code in the Go agents (<module>/staticcheck.conf)
+ *    gosec              security-relevant patterns in the Go agents
  *    go vet             what the compiler's own checker finds
+ *
+ *  The Go steps run once per module in GO_MODULES: every agent, and agent-kit-go,
+ *  the front door they share.
  *    trivy / grype      with --image: the built image, base layers included
  *
  *  A tool that is not installed is reported and skipped — fine on a laptop, where
@@ -39,32 +42,40 @@ interface Step {
 }
 
 const go = (await findGo()) ?? "go";
-const codeAgent = "code-agent-go";
+/** Every Go module in the repository. A module left off this list is one no
+ *  scanner looks at, so a new agent is added here along with its directory. */
+const GO_MODULES = ["agent-kit-go", "code-agent-go", "kafka-agent-go"];
 
-const steps: Step[] = [
-  { name: "bun audit", tool: "bun", argv: ["bun", "audit"], hint: "bundled with Bun" },
-  { name: "go vet", tool: go, argv: [go, "vet", "./..."], cwd: codeAgent, hint: "install Go" },
+const goSteps = (cwd: string): Step[] => [
+  { name: `go vet (${cwd})`, tool: go, argv: [go, "vet", "./..."], cwd, hint: "install Go" },
   {
-    name: "govulncheck",
+    name: `govulncheck (${cwd})`,
     tool: "govulncheck",
     argv: ["govulncheck", "./..."],
-    cwd: codeAgent,
+    cwd,
     hint: "go install golang.org/x/vuln/cmd/govulncheck@v1.8.0",
   },
   {
-    name: "staticcheck",
+    name: `staticcheck (${cwd})`,
     tool: "staticcheck",
     argv: ["staticcheck", "./..."],
-    cwd: codeAgent,
+    cwd,
     hint: "go install honnef.co/go/tools/cmd/staticcheck@v0.8.1",
   },
   {
-    name: "gosec",
+    name: `gosec (${cwd})`,
     tool: "gosec",
     argv: ["gosec", "-quiet", "-severity", "medium", "-confidence", "medium", "-exclude=G301,G302,G306", "./..."],
-    cwd: codeAgent,
+    cwd,
     hint: "go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0",
   },
+];
+
+const steps: Step[] = [
+  { name: "bun audit", tool: "bun", argv: ["bun", "audit"], hint: "bundled with Bun" },
+  // The agents ship as binaries, and their dependencies' licences have to travel with them.
+  { name: "go licenses up to date", tool: "bun", argv: ["bun", "scripts/go-licenses.ts", "--check"], hint: "bundled with Bun" },
+  ...GO_MODULES.flatMap(goSteps),
 ];
 
 if (image) {

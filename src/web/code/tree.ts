@@ -10,8 +10,10 @@
  */
 import type { DirEntry, StatusEntry } from "../../code-agent/protocol.ts";
 import { copyToClipboard, esc, modalPrompt, showMenu, ROW_H, type MenuItem } from "./ui.ts";
+import { debounce, type Debounced } from "./debounce.ts";
 import { fileIcon } from "./file-icons.ts";
 import { singleFlight } from "./singleflight.ts";
+import { RowPool, observeSize } from "./vlist.ts";
 
 const ROW = ROW_H;
 /** Rows rendered above and below the viewport to hide scroll tearing. */
@@ -43,6 +45,17 @@ interface TreeNode {
   expanded: boolean;
   loaded: boolean;
   children: TreeNode[];
+}
+
+/** A node's name in lower case, kept with the name it was made from: a name that changed (a
+ *  rename) is made again, and one that did not is not made on every keystroke of the filter. */
+const lowerNames = new WeakMap<TreeNode, { name: string; lower: string }>();
+function lowerName(n: TreeNode): string {
+  const known = lowerNames.get(n);
+  if (known && known.name === n.name) return known.lower;
+  const lower = n.name.toLowerCase();
+  lowerNames.set(n, { name: n.name, lower });
+  return lower;
 }
 
 export interface TreeOps {
@@ -150,6 +163,10 @@ export class FileTree {
   /** Rows that stand for a run of folders: the last folder's path -> the first
    *  one (what collapsing the row folds away) and the joined label. */
   private chains = new Map<string, { head: TreeNode; label: string }>();
+  /** How far each drawn row is indented, in rows of nesting actually on screen. A node's own
+   *  `depth` counts every folder of a compacted run, so what is under "main/java/com/acme"
+   *  would sit four levels deeper than the row it belongs to. */
+  private rowDepth = new Map<TreeNode, number>();
   /** The last reversible file operation. One deep: this is a safety net for
    *  the drop that landed in the wrong folder, not an edit history. */
   private lastOp: Undoable | null = null;
@@ -170,6 +187,15 @@ export class FileTree {
   private readonly viewport: HTMLElement;
   private readonly spacer: HTMLElement;
   private readonly layer: HTMLElement;
+  /** The row elements, reused between paints: see RowPool. */
+  private readonly pool: RowPool;
+  /** Something the rows show has changed, so every pooled row has to be rebuilt
+   *  on the next paint. A scroll moves the window without changing a row. */
+  private dirty = true;
+  /** The filter's own pause, so that it can be cancelled when the filter is cleared. */
+  private applyFilter!: Debounced;
+  private paintedFirst = -1;
+  private paintedCount = -1;
 
   constructor(
     private readonly host: HTMLElement,
@@ -185,10 +211,12 @@ export class FileTree {
       <div class="tree-viewport"><div class="tree-spacer"></div><div class="tree-layer"></div></div>`;
     this.filterBox = host.querySelector(".tree-filter")!;
     this.filterInput = host.querySelector(".js-tree-filter")!;
-    this.filterInput.addEventListener("input", () => {
+    // A rebuild walks the whole tree, so it waits for a pause in the typing.
+    this.applyFilter = debounce(() => {
       this.filter = this.filterInput.value.trim().toLowerCase();
       this.rebuild();
-    });
+    }, 150);
+    this.filterInput.addEventListener("input", () => this.applyFilter());
     this.filterInput.addEventListener("keydown", (e) => {
       if (e.key === "Escape") this.clearFilter();
       // Down arrow hands the keyboard to the list without losing the filter.
@@ -201,8 +229,11 @@ export class FileTree {
     this.viewport = host.querySelector(".tree-viewport")!;
     this.spacer = host.querySelector(".tree-spacer")!;
     this.layer = host.querySelector(".tree-layer")!;
+    this.pool = new RowPool(this.layer);
 
-    this.viewport.addEventListener("scroll", () => this.paint(), { passive: true });
+    // A wheel, a drag or a held arrow key delivers several scroll events per
+    // frame, and only the last position is worth drawing.
+    this.viewport.addEventListener("scroll", () => this.pool.schedule(() => this.draw()), { passive: true });
     this.viewport.addEventListener("dragstart", (e) => this.onDragStart(e));
     this.viewport.addEventListener("dragover", (e) => this.onDragOver(e));
     this.viewport.addEventListener("dragleave", (e) => this.onDragLeave(e));
@@ -217,7 +248,14 @@ export class FileTree {
     this.viewport.addEventListener("contextmenu", (e) => this.onContextMenu(e));
     this.viewport.tabIndex = 0;
     this.viewport.addEventListener("keydown", (e) => this.onKey(e));
-    new ResizeObserver(() => this.paint()).observe(this.viewport);
+    this.stopObserving = observeSize(this.viewport, () => this.pool.schedule(() => this.draw()));
+  }
+
+  private readonly stopObserving: () => void;
+
+  /** Stop watching the size. The other listeners sit on elements that go with the tree. */
+  dispose(): void {
+    this.stopObserving();
   }
 
   // ── data ────────────────────────────────────────────────────────────────
@@ -240,7 +278,10 @@ export class FileTree {
     this.ignored.clear();
     this.root = { path: "", name: "", dir: true, depth: -1, expanded: true, loaded: false, children: [] };
     this.rows = [];
-    this.layer.innerHTML = "";
+    this.pool.clear();
+    this.dirty = true;
+    this.paintedFirst = -1;
+    this.paintedCount = -1;
     this.spacer.style.height = "0px";
   }
 
@@ -429,18 +470,26 @@ export class FileTree {
   private rebuild(): void {
     this.rows = [];
     const needle = this.filter;
+    // Decided once per node: `keep` asks about a folder's children, and each of them asks about
+    // theirs, so without this every level walked its whole subtree again.
+    const kept = new Map<TreeNode, boolean>();
 
     // With a filter on, a directory earns its place by containing a match —
     // otherwise filtering a tree either hides the matches (their parents are
     // gone) or shows everything (the parents match nothing).
     const keep = (n: TreeNode): boolean => {
       if (!needle) return true;
-      if (n.name.toLowerCase().includes(needle)) return true;
-      return n.dir && n.children.some(keep);
+      let k = kept.get(n);
+      if (k === undefined) {
+        k = lowerName(n).includes(needle) || (n.dir && n.children.some(keep));
+        kept.set(n, k);
+      }
+      return k;
     };
 
     this.chains.clear();
-    const walk = (n: TreeNode): void => {
+    this.rowDepth.clear();
+    const walk = (n: TreeNode, level: number): void => {
       for (const c of n.children) {
         if (!keep(c)) continue;
         // A run of folders that each hold one folder is drawn as one row —
@@ -451,12 +500,13 @@ export class FileTree {
         const last = chain[chain.length - 1];
         if (chain.length > 1) this.chains.set(last.path, { head: c, label: chain.map((x) => x.name).join("/") });
         this.rows.push(last);
+        this.rowDepth.set(last, level);
         // A filter expands what it matches inside: the point is to see the
         // hits, not to be told a folder somewhere below has one.
-        if (last.dir && (last.expanded || (needle && last.loaded))) walk(last);
+        if (last.dir && (last.expanded || (needle && last.loaded))) walk(last, level + 1);
       }
     };
-    walk(this.root);
+    walk(this.root, 0);
     this.spacer.style.height = `${this.rows.length * ROW}px`;
     this.paint();
   }
@@ -486,6 +536,7 @@ export class FileTree {
   }
 
   private clearFilter(): void {
+    this.applyFilter.cancel();
     this.filter = "";
     this.filterInput.value = "";
     this.filterBox.hidden = true;
@@ -542,10 +593,19 @@ export class FileTree {
 
   // ── rendering ───────────────────────────────────────────────────────────
 
+  /** Repaint because something the rows show has changed. */
   private paint(): void {
-    // A repaint replaces every row element. Doing that while the browser is
-    // dragging one of them cancels the drag — and a repaint can be triggered at
-    // any moment by a git status refresh or a watcher event. Defer instead.
+    this.dirty = true;
+    this.pool.cancel();
+    this.draw();
+  }
+
+  /** The window changed underneath the same rows — a scroll, a resize — so the
+   *  rows that are still on screen keep what they show. */
+  private draw(): void {
+    // A repaint replaces the rows the browser is dragging; a repaint can be
+    // triggered at any moment by a git status refresh or a watcher event.
+    // Defer instead — the pool is what the drag is holding on to.
     if (this.dragging) {
       this.paintPending = true;
       return;
@@ -553,18 +613,26 @@ export class FileTree {
     const top = this.viewport.scrollTop;
     const count = Math.ceil(this.viewport.clientHeight / ROW) + OVERSCAN * 2;
     const first = Math.max(0, Math.floor(top / ROW) - OVERSCAN);
-    const slice = this.rows.slice(first, first + count);
+    const to = Math.min(this.rows.length, first + count);
+    const dirty = this.dirty;
+    this.dirty = false;
+    // Nothing moved and nothing changed: a scroll of a few pixels inside one
+    // row costs nothing at all.
+    if (!dirty && first === this.paintedFirst && to - first === this.paintedCount) return;
+    this.paintedFirst = first;
+    this.paintedCount = to - first;
 
     this.layer.style.transform = `translateY(${first * ROW}px)`;
-    this.layer.innerHTML = slice.map((n) => this.rowHtml(n)).join("");
-    // The indent cannot be a style="" attribute any more (style-src has no
-    // 'unsafe-inline'), so it rides in data-depth and is applied here.
-    for (const row of this.layer.querySelectorAll<HTMLElement>(".tree-row")) {
-      row.style.paddingLeft = `${4 + Number(row.dataset.depth) * 12}px`;
-    }
+    this.pool.window(first, to - first, (row, i) => this.fillRow(row, this.rows[i]!), dirty);
   }
 
-  private rowHtml(n: TreeNode): string {
+  /** Put one node into one row element.
+   *
+   *  The row is an element that already exists, so what changes is its content
+   *  and its classes: no row is created, parsed and thrown away as it scrolls
+   *  past.
+   */
+  private fillRow(row: HTMLElement, n: TreeNode): void {
     const st = this.status.get(n.path);
     const mark = n.dir ? (this.dirtyDirs.has(n.path) ? "•" : "") : statusLetter(st);
     const cls = ["tree-row"];
@@ -579,23 +647,31 @@ export class FileTree {
     // shows as untracked is the pair of facts a build folder always has.
     if (this.isIgnored(n.path)) cls.push("dec-ignored");
 
-    // A compacted row sits at the depth of the first folder in its run and
-    // carries the whole run as its name; everything else about it — the path it
-    // acts on, its decorations — belongs to the last folder, which is the one
-    // that actually holds the files.
+    // A compacted row carries the whole run as its name; everything else about it — the path
+    // it acts on, its decorations — belongs to the last folder, which is the one that actually
+    // holds the files. Its indent, and that of what is under it, counts rows on screen.
     const chain = this.chains.get(n.path);
-    const depth = chain ? chain.head.depth : n.depth;
+    const depth = this.rowDepth.get(n) ?? n.depth;
     const label = chain ? chain.label : n.name;
 
-    return `<div class="${cls.join(" ")}" draggable="true" data-path="${esc(n.path)}" data-depth="${depth}"${
-      chain ? ` data-chain-head="${esc(chain.head.path)}" title="${esc(n.path)}"` : ""
-    }>
+    row.className = cls.join(" ");
+    row.draggable = true;
+    row.dataset.path = n.path;
+    row.dataset.depth = String(depth);
+    // The indent cannot be a style="" attribute (style-src has no
+    // 'unsafe-inline'), so it rides a custom property the stylesheet multiplies.
+    // Written when the row is built rather than on every paint, which is what
+    // the row element being reused buys.
+    row.style.setProperty("--depth", String(depth));
+    if (chain) row.dataset.chainHead = chain.head.path;
+    else delete row.dataset.chainHead;
+    row.title = chain ? n.path : "";
+    row.innerHTML = `
       <span class="tree-caret">${n.dir ? (n.expanded ? "▾" : "▸") : ""}</span>
       <span class="tree-icon">${fileIcon(n.name, n.dir)}</span>
       <span class="tree-name">${esc(label)}</span>
       ${n.path === this.compareBase ? `<span class="tree-compare" title="Marked for comparison">⇄</span>` : ""}
-      <span class="tree-mark">${mark}</span>
-    </div>`;
+      <span class="tree-mark">${mark}</span>`;
   }
 
   // ── interaction ─────────────────────────────────────────────────────────

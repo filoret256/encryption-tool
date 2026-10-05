@@ -148,10 +148,45 @@ ${mapEntries}
 const DEFAULT_FILE: [string, string] = [${q(defaults._default.icon)}, ${q(colorOf(defaults._default))}];
 const FOLDER: [string, string] = [${q(defaults._folder.icon)}, ${q(colorOf(defaults._folder))}];
 
+/** The sprite: one hidden <svg> in the document that holds a <symbol> for each glyph that has
+ *  been drawn, so a row carries a \`<use>\` of a few dozen characters and not the glyph itself.
+ *  Rust's is 3,419 characters; forty visible \`.rs\` rows were about 140 KB of markup, parsed again
+ *  on every step of a scroll. A symbol is added the first time its glyph is wanted, so the sprite
+ *  holds what has been seen and not all thirty. */
+let sprite: Element | null = null;
+const placed = new Set<string>();
+
+function place(name: string, g: Glyph): void {
+  if (placed.has(name) || typeof document === "undefined") return;
+  if (!sprite) {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    // A class and not a style attribute: the page's policy does not allow inline styles.
+    svg.setAttribute("class", "fic-sprite");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    document.body.appendChild(svg);
+    sprite = svg;
+  }
+  sprite.insertAdjacentHTML("beforeend", \`<symbol id="fi-\${name}" viewBox="\${g.viewBox}">\${g.body}</symbol>\`);
+  placed.add(name);
+}
+
+/** The markup of an icon by what it is made of: the same few dozen combinations come up for
+ *  every row of every listing. */
+const cache = new Map<string, string>();
+
 const render = ([name, color]: [string, string], extraClass: string): string => {
+  const key = \`\${name}|\${color}|\${extraClass}\`;
+  const known = cache.get(key);
+  if (known !== undefined) return known;
   const g = GLYPHS[name];
   if (!g) return "";
-  return \`<svg class="fic \${extraClass}" viewBox="\${g.viewBox}" width="16" height="16" fill="\${color}" aria-hidden="true" focusable="false">\${g.body}</svg>\`;
+  place(name, g);
+  // The colour is the svg's own fill, which the symbol's paths inherit; a glyph that paints
+  // itself (a gradient, a stylesheet of its own) keeps what it says.
+  const markup = \`<svg class="fic \${extraClass}" width="16" height="16" fill="\${color}" aria-hidden="true" focusable="false"><use href="#fi-\${name}"/></svg>\`;
+  cache.set(key, markup);
+  return markup;
 };
 
 /** Icon markup for a tree entry. Directories get one icon; files are matched on

@@ -28,6 +28,22 @@ declare module "*/public/code.js" {
   const path: string;
   export default path;
 }
+declare module "*/public/kafka.js" {
+  const path: string;
+  export default path;
+}
+declare module "*/public/kafka-diff.js" {
+  const path: string;
+  export default path;
+}
+declare module "*/public/editor-chunk.js" {
+  const path: string;
+  export default path;
+}
+declare module "*/public/crypto-worker.js" {
+  const path: string;
+  export default path;
+}
 declare module "*/public/sw.js" {
   const path: string;
   export default path;

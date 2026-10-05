@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"unicode"
 )
 
@@ -49,6 +51,38 @@ func notRegular(path string) error {
 	return fmt.Errorf("Not a regular file: %s", path)
 }
 
+// fsParallel is how many filesystem calls one request has in flight at once. A listing of ten
+// thousand entries asked ten thousand questions one after another; on Windows or a network drive
+// each is a round trip, and the listing took seconds while holding one of the connection's few
+// process slots. Sixteen at once hides the latency without flooding the disk. The TS code-agent
+// has the same number (FS_PARALLEL in src/code-agent/fs-ops.ts).
+const fsParallel = 16
+
+// forEachLimit calls fn(i) for every i in [0, n), at most fsParallel at a time, and returns when
+// all of them have returned. fn writes its result into a slot of its own, so no lock is needed.
+func forEachLimit(n int, fn func(i int)) {
+	workers := fsParallel
+	if n < workers {
+		workers = n
+	}
+	var wg sync.WaitGroup
+	var next atomic.Int64
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				i := int(next.Add(1)) - 1
+				if i >= n {
+					return
+				}
+				fn(i)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 func readDir(j *jail, path string) ([]dirEntry, error) {
 	abs, err := j.toAbsExisting(path)
 	if err != nil {
@@ -59,13 +93,18 @@ func readDir(j *jail, path string) ([]dirEntry, error) {
 		return nil, nodeFsError(err, "scandir", abs)
 	}
 
-	out := make([]dirEntry, 0, len(ents))
+	// The jail refuses to open anything under the git directory, so listing
+	// it would only offer the explorer a row that errors when clicked.
+	kept := ents[:0:0]
 	for _, d := range ents {
-		// The jail refuses to open anything under the git directory, so listing
-		// it would only offer the explorer a row that errors when clicked.
-		if isGitDirName(d.Name()) {
-			continue
+		if !isGitDirName(d.Name()) {
+			kept = append(kept, d)
 		}
+	}
+
+	out := make([]dirEntry, len(kept))
+	forEachLimit(len(kept), func(i int) {
+		d := kept[i]
 		// ModeIrregular as well as ModeSymlink — see resolveLinks in jail.go: a
 		// Windows junction arrives as the former, and reporting it as an
 		// ordinary directory hid from the explorer the one kind of entry whose
@@ -73,18 +112,22 @@ func readDir(j *jail, path string) ([]dirEntry, error) {
 		link := d.Type()&(fs.ModeSymlink|fs.ModeIrregular) != 0
 		e := dirEntry{Name: d.Name(), Dir: d.IsDir(), Link: link}
 
-		// Stat follows symlinks, so a link to a directory sorts with directories.
-		// A failure here is a broken link or a race with an external delete —
+		// A real directory is already known to be one, and a directory reports no size or
+		// time: there is nothing to ask. What needs the call is a file (its size and time
+		// are the row's) and a link (Stat follows it, so a link to a directory sorts with
+		// directories). A failure is a broken link or a race with an external delete —
 		// list the entry anyway.
-		if st, err := os.Stat(filepath.Join(abs, d.Name())); err == nil {
-			e.Dir = st.IsDir()
-			if !e.Dir {
-				size, mtime := st.Size(), st.ModTime().UnixMilli()
-				e.Size, e.Mtime = &size, &mtime
+		if !e.Dir || link {
+			if st, err := os.Stat(filepath.Join(abs, d.Name())); err == nil {
+				e.Dir = st.IsDir()
+				if !e.Dir {
+					size, mtime := st.Size(), st.ModTime().UnixMilli()
+					e.Size, e.Mtime = &size, &mtime
+				}
 			}
 		}
-		out = append(out, e)
-	}
+		out[i] = e
+	})
 
 	// Directories first, then natural order by name — matches VS Code's explorer.
 	sort.SliceStable(out, func(a, b int) bool {
@@ -286,13 +329,27 @@ func movePath(j *jail, from, to string) error {
 }
 
 func deletePaths(j *jail, paths []string) error {
-	for _, p := range paths {
+	// Every path is checked before anything is removed: a path outside the workspace refuses
+	// the whole request instead of the part of it that came after the deletions.
+	targets := make([]string, len(paths))
+	for i, p := range paths {
 		abs, err := j.toAbsExisting(p)
 		if err != nil {
 			return err
 		}
-		if err := os.RemoveAll(abs); err != nil {
-			return nodeFsError(err, "unlink", abs)
+		targets[i] = abs
+	}
+	errs := make([]error, len(targets))
+	forEachLimit(len(targets), func(i int) {
+		if err := os.RemoveAll(targets[i]); err != nil {
+			errs[i] = nodeFsError(err, "unlink", targets[i])
+		}
+	})
+	// The first failure in the order the paths were given: the same one a sequential run
+	// would have stopped at.
+	for _, err := range errs {
+		if err != nil {
+			return err
 		}
 	}
 	return nil

@@ -1,10 +1,10 @@
-// A minimal RFC 6455 server — enough for this code-agent and deliberately no more.
+// A minimal RFC 6455 server — enough for the local agents and deliberately no more.
 //
 // Reaching for a library would be the reflex, except that everything needed
 // here is one handshake and one frame codec over a loopback socket: no TLS, no
 // permessage-deflate, no client role, no subprotocols. Written out, the whole
 // wire path is auditable in one file and the build pulls nothing for it.
-package main
+package agentkit
 
 import (
 	"bufio"
@@ -22,12 +22,12 @@ import (
 )
 
 const (
-	opContinuation = 0x0
-	opText         = 0x1
-	opBinary       = 0x2
-	opClose        = 0x8
-	opPing         = 0x9
-	opPong         = 0xA
+	OpContinuation = 0x0
+	OpText         = 0x1
+	OpBinary       = 0x2
+	OpClose        = 0x8
+	OpPing         = 0x9
+	OpPong         = 0xA
 )
 
 // RFC 6455 section 1.3. It exists so that a cache or proxy cannot replay a
@@ -35,21 +35,46 @@ const (
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 // Well above the 4 MB file the editor will ever read, well below "a peer can
-// exhaust this process".
+// exhaust this process". It is checked in both directions: on the way in an
+// oversized frame is refused, and on the way out it is not written at all.
 const maxMessageBytes = 32 << 20
+
+// ErrMessageTooLarge is what sending more than maxMessageBytes reports.
+//
+// The receive side always enforced the limit; the send side did not, so an
+// agent that assembled one very large reply — a batch of Kafka values, a git
+// log nobody expected — put it on the wire and left the page to parse it. The
+// limit the socket enforces is the same one, so a caller that hits it has a bug
+// of its own to fix, not a peer to blame.
+var ErrMessageTooLarge = errors.New("message exceeds the size limit")
 
 const writeTimeout = 30 * time.Second
 
-type wsConn struct {
-	conn   net.Conn
-	br     *bufio.Reader
-	wmu    sync.Mutex
+// How a silent peer is told from an idle one. A page that has nothing to ask sends nothing, so
+// silence alone proves nothing: the agent pings, a browser answers with a pong on its own, and
+// the read deadline moves with every frame that arrives. A peer that misses a few pings in a
+// row — the machine slept, the network went, the tab was killed — is gone, and its goroutine
+// and its slot are freed. Variables, so that a test need not wait a minute.
+var (
+	pingEvery = 20 * time.Second
+	readIdle  = 60 * time.Second
+)
+
+type Conn struct {
+	conn net.Conn
+	br   *bufio.Reader
+	wmu  sync.Mutex
+	// readIdle is how long a read may wait for the next frame; zero means for ever, which is
+	// what a connection without a keepalive (an in-memory pipe in a test) wants.
+	readIdle time.Duration
+	// done ends the keepalive loop; nil when there is none.
+	done   chan struct{}
 	closed bool
 }
 
-// wsUpgrade completes the handshake and takes the socket away from net/http.
+// Upgrade completes the handshake and takes the socket away from net/http.
 // The caller owns the connection from here on and must Close it.
-func wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsConn, error) {
+func Upgrade(w http.ResponseWriter, r *http.Request) (*Conn, error) {
 	if r.Method != http.MethodGet {
 		return nil, errors.New("upgrade requires GET")
 	}
@@ -76,7 +101,8 @@ func wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsConn, error) {
 		return nil, err
 	}
 	// net/http may have armed a read deadline for the request; the socket is a
-	// long-lived idle-most-of-the-time channel now, so clear both.
+	// long-lived idle-most-of-the-time channel now, so clear both. The read side gets a
+	// deadline of its own again in readFrame, one that every frame moves.
 	_ = conn.SetDeadline(time.Time{})
 
 	sum := sha1.Sum([]byte(key + wsGUID)) // #nosec G401 -- see the import: the protocol fixes the hash
@@ -92,13 +118,39 @@ func wsUpgrade(w http.ResponseWriter, r *http.Request) (*wsConn, error) {
 	}
 	// brw.Reader may already hold bytes read past the request head, so it has
 	// to be carried over rather than replaced with a fresh reader.
-	return &wsConn{conn: conn, br: brw.Reader}, nil
+	c := &Conn{conn: conn, br: brw.Reader, readIdle: readIdle, done: make(chan struct{})}
+	go c.keepalive(pingEvery)
+	return c, nil
 }
 
-// readMessage returns one complete application message, transparently
+// keepalive pings until the connection closes. A failed ping ends the loop and nothing
+// else: the read deadline is what closes a peer that has stopped answering.
+func (c *Conn) keepalive(every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-t.C:
+			if err := c.write(OpPing, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// armRead moves the read deadline to now + readIdle, when the connection has one.
+func (c *Conn) armRead() {
+	if c.readIdle > 0 {
+		_ = c.conn.SetReadDeadline(time.Now().Add(c.readIdle))
+	}
+}
+
+// ReadMessage returns one complete application message, transparently
 // reassembling fragments and answering pings along the way. A close frame from
 // the peer surfaces as io.EOF.
-func (c *wsConn) readMessage() (byte, []byte, error) {
+func (c *Conn) ReadMessage() (byte, []byte, error) {
 	var (
 		msg     []byte
 		msgOp   byte
@@ -111,27 +163,27 @@ func (c *wsConn) readMessage() (byte, []byte, error) {
 		}
 
 		switch opcode {
-		case opPing:
-			if err := c.write(opPong, payload); err != nil {
+		case OpPing:
+			if err := c.write(OpPong, payload); err != nil {
 				return 0, nil, err
 			}
 			continue
-		case opPong:
+		case OpPong:
 			continue
-		case opClose:
+		case OpClose:
 			// Echo the status code back, as the RFC asks, then report the end of
 			// the stream. Any error here is moot: we are closing regardless.
 			echo := payload
 			if len(echo) > 2 {
 				echo = echo[:2]
 			}
-			_ = c.write(opClose, echo)
-			return opClose, nil, io.EOF
-		case opContinuation:
+			_ = c.write(OpClose, echo)
+			return OpClose, nil, io.EOF
+		case OpContinuation:
 			if !started {
 				return 0, nil, errors.New("continuation frame with nothing to continue")
 			}
-		case opText, opBinary:
+		case OpText, OpBinary:
 			if started {
 				return 0, nil, errors.New("new data frame before the previous one finished")
 			}
@@ -158,7 +210,8 @@ func (c *wsConn) readMessage() (byte, []byte, error) {
 	}
 }
 
-func (c *wsConn) readFrame() (fin bool, opcode byte, payload []byte, err error) {
+func (c *Conn) readFrame() (fin bool, opcode byte, payload []byte, err error) {
+	c.armRead()
 	var h [2]byte
 	if _, err = io.ReadFull(c.br, h[:]); err != nil {
 		return
@@ -204,6 +257,8 @@ func (c *wsConn) readFrame() (fin bool, opcode byte, payload []byte, err error) 
 		return
 	}
 
+	// A large frame has its own allowance: the wait for its first byte is over.
+	c.armRead()
 	var mask [4]byte
 	if _, err = io.ReadFull(c.br, mask[:]); err != nil {
 		return
@@ -218,13 +273,16 @@ func (c *wsConn) readFrame() (fin bool, opcode byte, payload []byte, err error) 
 	return
 }
 
-// sendText writes one unfragmented text message. Safe to call from several
+// SendText writes one unfragmented text message. Safe to call from several
 // goroutines: replies and watcher pushes race by design.
-func (c *wsConn) sendText(payload []byte) error {
-	return c.write(opText, payload)
+func (c *Conn) SendText(payload []byte) error {
+	return c.write(OpText, payload)
 }
 
-func (c *wsConn) write(opcode byte, payload []byte) error {
+func (c *Conn) write(opcode byte, payload []byte) error {
+	if len(payload) > maxMessageBytes {
+		return ErrMessageTooLarge
+	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	if c.closed {
@@ -260,7 +318,7 @@ func (c *wsConn) write(opcode byte, payload []byte) error {
 	return err
 }
 
-func (c *wsConn) close() {
+func (c *Conn) Close() {
 	c.wmu.Lock()
 	already := c.closed
 	c.closed = true
@@ -268,10 +326,13 @@ func (c *wsConn) close() {
 	if already {
 		return
 	}
+	if c.done != nil {
+		close(c.done)
+	}
 	// 1000 = normal closure. Best effort; the peer may already be gone.
 	_ = c.conn.SetWriteDeadline(time.Now().Add(time.Second))
 	var frame [4]byte
-	frame[0] = 0x80 | opClose
+	frame[0] = 0x80 | OpClose
 	frame[1] = 2
 	binary.BigEndian.PutUint16(frame[2:4], 1000)
 	_, _ = c.conn.Write(frame[:])
@@ -288,3 +349,7 @@ func headerHasToken(value, token string) bool {
 	}
 	return false
 }
+
+// NewConn wraps a connection that needs no handshake — an in-memory pipe in a
+// test that drives an agent's dispatch directly.
+func NewConn(c net.Conn) *Conn { return &Conn{conn: c, br: bufio.NewReader(c)} }

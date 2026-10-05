@@ -9,7 +9,7 @@
  *  the whole point of having tabs rather than just re-reading the file.
  */
 import { Compartment, EditorState, type Extension } from "@codemirror/state";
-import { EditorView, drawSelection, highlightActiveLine, keymap, lineNumbers, placeholder } from "@codemirror/view";
+import { EditorView, drawSelection, highlightActiveLine, keymap, lineNumbers, placeholder, type ViewUpdate } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import {
   autocompletion,
@@ -56,8 +56,9 @@ export class CodeEditor {
     parent: HTMLElement,
     private dark: boolean,
     private readonly onSave: () => void,
-    /** Fired on every document change; the tab bar recomputes dirtiness. */
-    private readonly onChange: () => void,
+    /** Fired on every document change, with the update that caused it: the tab bar
+     *  recomputes dirtiness, and an undo is what can make a buffer the file again. */
+    private readonly onChange: (change: ViewUpdate) => void,
     /** A blame line was clicked: the oid of the commit it came from. */
     private readonly onBlamePick: (oid: string) => void = () => {},
     /** The cursor moved, or the document under it changed. */
@@ -120,7 +121,7 @@ export class CodeEditor {
         indentWithTab,
       ]),
       EditorView.updateListener.of((u) => {
-        if (u.docChanged) this.onChange();
+        if (u.docChanged) this.onChange(u);
         // Selection moves without the document changing — that is most of what
         // a cursor position readout reports.
         if (u.docChanged || u.selectionSet) this.onCursor();

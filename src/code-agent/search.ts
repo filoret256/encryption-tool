@@ -16,7 +16,7 @@ import { iter, run } from "./proc.ts";
 import { isBinary } from "./fs-ops.ts";
 import { readOnly } from "./git.ts";
 import type { Jail } from "./jail.ts";
-import type { SearchHit, SearchSummary } from "./protocol.ts";
+import type { SearchHit, SearchStop, SearchSummary } from "./protocol.ts";
 
 export interface SearchOpts {
   query: string;
@@ -36,18 +36,73 @@ export interface Signal {
   cancelled: boolean;
 }
 
+/** How far a scan has got. Sent while it runs, and in the summary at the end.
+ *
+ *  `candidates` is how many files the scan had to choose from and `scanned` how
+ *  many it looked at, so "12,300 of 40,000" is a sentence the page can write.
+ *  ripgrep walks the tree itself and reports neither, so both are null with it. */
+export interface ScanProgress {
+  scanned: number;
+  candidates: number;
+}
+
 const DEFAULT_MAX = 5000;
 const MAX_FILE = 2 * 1024 * 1024;
+
+/** How long a whole scan may run, with either engine.
+ *
+ *  The per-request limit below bounds one file; nothing bounded the sum. A
+ *  repository of 40,000 files where each takes a few milliseconds is minutes of
+ *  scanning, and search-as-you-type issues one of these per keystroke — so a
+ *  slow-enough pattern was a promise the code-agent could not keep, with no
+ *  number in it and no way to say how far it had got. Thirty seconds is past
+ *  any scan a person waits for, and the answer says it stopped there. */
+const SCAN_LIMIT_MS = 30_000;
+
+/** How many files between progress frames. A frame every file would be 40,000
+ *  frames for one scan, which is the thing batching exists to avoid. */
+const PROGRESS_EVERY = 512;
+
+/** The three numbers above, as one thing a caller may tighten.
+ *
+ *  Same shape as the process deadlines in proc.ts: the defaults are what the
+ *  code-agent runs with, and a test that cannot wait thirty seconds passes its
+ *  own — which is the only way to check a bound without reaching it. */
+export interface ScanLimits {
+  scanMs?: number;
+  requestMs?: number;
+  progressEvery?: number;
+}
+
+export function scanLimits(given: ScanLimits = {}): Required<ScanLimits> {
+  return {
+    scanMs: given.scanMs ?? SCAN_LIMIT_MS,
+    requestMs: given.requestMs ?? REQUEST_LIMIT_MS,
+    progressEvery: given.progressEvery ?? PROGRESS_EVERY,
+  };
+}
 
 /** Escape a literal query so it can be handed to a regex engine unchanged. */
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-/** ripgrep reports byte offsets within the line; the browser indexes strings by
- *  UTF-16 code unit. Identical for ASCII, which is the overwhelming majority. */
-function byteToChar(text: string, byteOffset: number): number {
+/** The most highlighted ranges one line carries. A minified bundle is one line with tens of
+ *  thousands of matches, and a result that holds all of them is megabytes for one row nobody
+ *  can read; the count of matches is still the true one. */
+const MAX_RANGES_PER_LINE = 500;
+
+/** A line's submatches as UTF-16 ranges. ripgrep reports byte offsets within the line; the
+ *  browser indexes strings by UTF-16 code unit — identical for ASCII, which is the
+ *  overwhelming majority. The line is encoded once rather than once per
+ *  offset: two offsets a match used to cost two encodings of the whole line — 1.6 MB of
+ *  allocations for a 4 KB line with 200 matches. A line of ASCII, nearly all of them, is not
+ *  encoded at all. */
+function toCharRanges(text: string, submatches: { start: number; end: number }[]): [number, number][] {
+  const shown = submatches.length > MAX_RANGES_PER_LINE ? submatches.slice(0, MAX_RANGES_PER_LINE) : submatches;
+  if (!/[^\u0000-\u007f]/.test(text)) return shown.map((s) => [s.start, s.end]);
   const bytes = new TextEncoder().encode(text);
-  if (bytes.length === text.length) return byteOffset; // pure ASCII
-  return new TextDecoder().decode(bytes.subarray(0, byteOffset)).length;
+  const decoder = new TextDecoder();
+  const at = (offset: number): number => decoder.decode(bytes.subarray(0, offset)).length;
+  return shown.map((s) => [at(s.start), at(s.end)]);
 }
 
 /** Takes the jail rather than a bare folder: the fallback opens every file it
@@ -58,15 +113,37 @@ export async function* search(
   opts: SearchOpts,
   ripgrep: boolean,
   signal: Signal = { cancelled: false },
+  onProgress?: (p: ScanProgress) => void,
+  given: ScanLimits = {},
 ): AsyncGenerator<SearchHit, SearchSummary> {
+  const limits = scanLimits(given);
   const cap = opts.maxMatches ?? DEFAULT_MAX;
-  if (!opts.query) return { files: 0, matches: 0, truncated: false, engine: ripgrep ? "ripgrep" : "fallback" };
-  return ripgrep ? yield* rgSearch(jail.root, opts, cap, signal) : yield* jsSearch(jail, opts, cap, signal);
+  if (!opts.query) {
+    return {
+      files: 0,
+      matches: 0,
+      truncated: false,
+      engine: ripgrep ? "ripgrep" : "fallback",
+      reason: null,
+      scanned: ripgrep ? null : 0,
+      candidates: ripgrep ? null : 0,
+    };
+  }
+  const deadline = Date.now() + limits.scanMs;
+  return ripgrep
+    ? yield* rgSearch(jail.root, opts, cap, signal, deadline)
+    : yield* jsSearch(jail, opts, cap, signal, deadline, limits.requestMs, limits.progressEvery, onProgress);
 }
 
 // ── ripgrep ───────────────────────────────────────────────────────────────
 
-async function* rgSearch(root: string, o: SearchOpts, cap: number, signal: Signal): AsyncGenerator<SearchHit, SearchSummary> {
+async function* rgSearch(
+  root: string,
+  o: SearchOpts,
+  cap: number,
+  signal: Signal,
+  deadline: number,
+): AsyncGenerator<SearchHit, SearchSummary> {
   const args = ["rg", "--json", o.matchCase ? "-s" : "-i"];
   if (o.wholeWord) args.push("-w");
   if (!o.regex) args.push("-F");
@@ -79,6 +156,7 @@ async function* rgSearch(root: string, o: SearchOpts, cap: number, signal: Signa
   const files = new Set<string>();
   let matches = 0;
   let truncated = false;
+  let reason: SearchStop | null = null;
 
   try {
     const dec = new TextDecoder();
@@ -88,7 +166,16 @@ async function* rgSearch(root: string, o: SearchOpts, cap: number, signal: Signa
       const lines = tail.split("\n");
       tail = lines.pop() ?? "";
       for (const line of lines) {
-        if (signal.cancelled) break outer;
+        if (signal.cancelled) {
+          reason = "cancelled";
+          break outer;
+        }
+        if (Date.now() > deadline) {
+          // Same bound as the fallback, and the same sentence at the end: a scan
+          // that ran this long is one the caller has stopped waiting for.
+          reason = "time";
+          break outer;
+        }
         if (!line) continue;
         let msg: RgMessage;
         try {
@@ -103,14 +190,14 @@ async function* rgSearch(root: string, o: SearchOpts, cap: number, signal: Signa
         if (path === undefined || text === undefined) continue; // non-UTF8 path or line
 
         const stripped = text.replace(/\r?\n$/, "");
-        const ranges = (d.submatches ?? []).map(
-          (s) => [byteToChar(stripped, s.start), byteToChar(stripped, s.end)] as [number, number],
-        );
+        const submatches = d.submatches ?? [];
+        const ranges = toCharRanges(stripped, submatches);
         files.add(path);
-        matches += ranges.length || 1;
+        matches += submatches.length || 1;
         yield { path: path.replace(/\\/g, "/"), line: d.line_number ?? 0, col: ranges[0]?.[0] ?? 0, text: stripped, ranges };
         if (matches >= cap) {
           truncated = true;
+          reason = "matches";
           break outer;
         }
       }
@@ -118,9 +205,19 @@ async function* rgSearch(root: string, o: SearchOpts, cap: number, signal: Signa
   } finally {
     proc.kill();
   }
-  // A cancelled scan is a partial one; say so rather than reporting a complete
-  // result the caller would take at face value.
-  return { files: files.size, matches, truncated: truncated || signal.cancelled, engine: "ripgrep" };
+  // A scan that stopped early is a partial one; say so rather than reporting a
+  // complete result the caller would take at face value.
+  return {
+    files: files.size,
+    matches,
+    truncated: truncated || reason !== null,
+    engine: "ripgrep",
+    reason,
+    // ripgrep walks the tree itself: it never tells us how many files there were
+    // or how many it looked at, and inventing either would be worse than null.
+    scanned: null,
+    candidates: null,
+  };
 }
 
 interface RgMessage {
@@ -178,6 +275,8 @@ interface WorkerReply {
  *
  *  It is the only place a pattern from the client is ever executed. */
 function scanWorker(): void {
+  // The same limit as MAX_RANGES_PER_LINE, written out: this function is sent as text.
+  const MAX_RANGES = 500;
   let re: RegExp | null = null;
   let include: RegExp | null = null;
   let exclude: RegExp | null = null;
@@ -202,6 +301,7 @@ function scanWorker(): void {
         const ranges: [number, number][] = [];
         for (let x = re!.exec(text); x; x = re!.exec(text)) {
           ranges.push([x.index, x.index + x[0].length]);
+          if (ranges.length >= MAX_RANGES) break;
           if (x[0] === "") re!.lastIndex++; // zero-width match would loop forever
         }
         if (!ranges.length) continue;
@@ -216,10 +316,17 @@ function scanWorker(): void {
 
 const WORKER_SOURCE = `(${scanWorker.toString()})()`;
 
-const TOO_SLOW =
-  `The pattern took more than ${REQUEST_LIMIT_MS / 1000} s on one file, so the search was stopped. ` +
-  "ripgrep is not installed, and without it this code-agent matches in JavaScript, where a pattern with nested " +
-  "repetition can take exponential time. Install ripgrep, or simplify the pattern.";
+/** What a caller is told when one file took longer than its request deadline.
+ *  Built from the deadline rather than from the constant, because a caller may
+ *  have tightened it and a message with the wrong number in it is worse than
+ *  none. */
+function tooSlow(requestMs: number): string {
+  return (
+    `The pattern took more than ${requestMs / 1000} s on one file, so the search was stopped. ` +
+    "ripgrep is not installed, and without it this code-agent matches in JavaScript, where a pattern with nested " +
+    "repetition can take exponential time. Install ripgrep, or simplify the pattern."
+  );
+}
 
 /** Runs the client's patterns off the code-agent's thread, on a deadline.
  *
@@ -242,13 +349,43 @@ const TOO_SLOW =
  *  The globs are matched here as well. They become regular expressions too, and
  *  a run of `*` is a run of `[^/]*`, which backtracks polynomially on a long
  *  path — the same class of problem, reached through a different box. */
+/** One worker, shared by every scan in this process.
+ *
+ *  It used to be built per search — a Blob, an object URL and a Worker for every
+ *  keystroke of search-as-you-type, each thrown away at the end. That is startup
+ *  cost paid on the path a person feels most: the first result of the next
+ *  search. One worker serves them all, and the pattern is re-initialised at the
+ *  top of each scan, which is all the isolation the old arrangement bought.
+ *
+ *  A worker that misses a request deadline is the exception: it is still inside
+ *  the match that missed it and will never read another message, so it is
+ *  terminated and forgotten rather than handed to the next search. */
+let sharedWorker: ScanWorker | null = null;
+
+function sharedScanWorker(): ScanWorker {
+  sharedWorker ??= new ScanWorker();
+  return sharedWorker;
+}
+
+function dropWorker(worker: ScanWorker): void {
+  worker.close();
+  if (sharedWorker === worker) sharedWorker = null;
+}
+
 class ScanWorker {
   private readonly url = URL.createObjectURL(new Blob([WORKER_SOURCE], { type: "text/javascript" }));
   private readonly worker = new Worker(this.url);
+  /** Set when this worker has been given up on: a stuck worker is never reused. */
+  dead = false;
 
   /** One request at a time. Resolves null if the search was cancelled while it
-   *  waited; rejects if the deadline passed. Either way the caller closes. */
-  request(message: WorkerRequest, signal: Signal): Promise<WorkerReply | null> {
+   *  waited; rejects if the deadline passed, and then the worker is killed.
+   *
+   *  terminate() is what actually stops a catastrophic match — checked, not
+   *  assumed — and it has to happen here rather than in the caller's `finally`,
+   *  because the worker is shared: a caller that walked away from a stuck worker
+   *  would leave it for the next search to post into. */
+  request(message: WorkerRequest, signal: Signal, requestMs: number): Promise<WorkerReply | null> {
     return new Promise((resolve, reject) => {
       const started = Date.now();
       const settle = (finish: () => void): void => {
@@ -258,11 +395,19 @@ class ScanWorker {
         finish();
       };
       const timer = setInterval(() => {
-        if (signal.cancelled) settle(() => resolve(null));
-        else if (Date.now() - started > REQUEST_LIMIT_MS) settle(() => reject(new Error(TOO_SLOW)));
+        if (signal.cancelled) {
+          settle(() => resolve(null));
+        } else if (Date.now() - started > requestMs) {
+          this.dead = true;
+          dropWorker(this);
+          settle(() => reject(new Error(tooSlow(requestMs))));
+        }
       }, POLL_MS);
       this.worker.onmessage = (e: MessageEvent<WorkerReply>) => settle(() => resolve(e.data));
-      this.worker.onerror = (e: ErrorEvent) => settle(() => reject(new Error(e.message || "search worker failed")));
+      this.worker.onerror = (e: ErrorEvent) => {
+        this.dead = true;
+        settle(() => reject(new Error(e.message || "search worker failed")));
+      };
       this.worker.postMessage(message);
     });
   }
@@ -309,7 +454,16 @@ async function readSearchable(jail: Jail, rel: string): Promise<string | null> {
   }
 }
 
-async function* jsSearch(jail: Jail, o: SearchOpts, cap: number, signal: Signal): AsyncGenerator<SearchHit, SearchSummary> {
+async function* jsSearch(
+  jail: Jail,
+  o: SearchOpts,
+  cap: number,
+  signal: Signal,
+  deadline: number,
+  requestMs: number,
+  progressEvery: number,
+  onProgress?: (p: ScanProgress) => void,
+): AsyncGenerator<SearchHit, SearchSummary> {
   let src = o.regex ? o.query : escapeRe(o.query);
   if (o.wholeWord) src = `\\b(?:${src})\\b`;
   const flags = o.matchCase ? "g" : "gi";
@@ -323,9 +477,20 @@ async function* jsSearch(jail: Jail, o: SearchOpts, cap: number, signal: Signal)
 
   const files = new Set<string>();
   let matches = 0;
-  const partial = (): SearchSummary => ({ files: files.size, matches, truncated: true, engine: "fallback" });
+  let scanned = 0;
+  const candidates = listing.length;
+  const summary = (reason: SearchStop | null): SearchSummary => ({
+    files: files.size,
+    matches,
+    // Anything but a scan that reached the end is a partial answer.
+    truncated: reason !== null,
+    engine: "fallback",
+    reason,
+    scanned,
+    candidates,
+  });
 
-  const worker = new ScanWorker();
+  const worker = sharedScanWorker();
   try {
     const ready = await worker.request(
       {
@@ -336,30 +501,42 @@ async function* jsSearch(jail: Jail, o: SearchOpts, cap: number, signal: Signal)
         exclude: o.exclude ? globSource(o.exclude) : null,
       },
       signal,
+      requestMs,
     );
-    if (!ready) return partial();
-    const filtered = await worker.request({ op: "filter", paths: listing }, signal);
-    if (!filtered) return partial();
+    if (!ready) return summary("cancelled");
+    const filtered = await worker.request({ op: "filter", paths: listing }, signal, requestMs);
+    if (!filtered) return summary("cancelled");
 
     for (const rel of filtered.paths ?? []) {
-      if (signal.cancelled) return partial();
+      if (signal.cancelled) return summary("cancelled");
+      // The whole scan is on a clock, not just each request: see SCAN_LIMIT_MS.
+      if (Date.now() > deadline) return summary("time");
 
       const text = await readSearchable(jail, rel);
       if (text === null) continue;
+      scanned++;
+      // Every PROGRESS_EVERY files the caller is told how far this has got. The
+      // scan of a large repository is minutes of silence otherwise.
+      if (onProgress && scanned % progressEvery === 0) onProgress({ scanned, candidates });
 
-      const scanned = await worker.request({ op: "scan", text, budget: cap - matches }, signal);
-      if (!scanned) return partial();
-      for (const hit of scanned.hits ?? []) {
+      const scannedHits = await worker.request({ op: "scan", text, budget: cap - matches }, signal, requestMs);
+      if (!scannedHits) return summary("cancelled");
+      for (const hit of scannedHits.hits ?? []) {
         files.add(rel);
         matches += hit.ranges.length;
         yield { path: rel, line: hit.line, col: hit.ranges[0][0], text: hit.text, ranges: hit.ranges };
       }
-      if (matches >= cap) return partial();
+      if (matches >= cap) return summary("matches");
     }
   } finally {
-    worker.close();
+    // A worker that missed its deadline killed itself; a healthy one is kept for
+    // the next search. Either way this scan is done with it.
+    if (worker.dead) dropWorker(worker);
   }
-  return { files: files.size, matches, truncated: false, engine: "fallback" };
+  // A scan whose caller walked away during the last file has not reached the
+  // end, and saying it did would be a complete answer to a question nobody is
+  // listening to any more.
+  return summary(signal.cancelled ? "cancelled" : null);
 }
 
 /** Minimal glob support for the include/exclude boxes: * and ** only. Returns

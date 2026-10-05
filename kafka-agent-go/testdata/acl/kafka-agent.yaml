@@ -1,0 +1,52 @@
+# Clusters of the ACL stand (testdata/compose-acl.yaml, host ports 19192 and 19193).
+#
+#   ACL_HOST=192.168.56.111 \
+#   ACL_ADMIN_PASSWORD=... ACL_APP_PASSWORD=... \
+#   kafka-agent --config testdata/acl/kafka-agent.yaml
+#
+# Three clusters, two logins:
+#
+#   acl-admin       SCRAM admin — a super user of that broker: everything, including Create
+#   acl-admin-ssl   the same login over TLS (SASL_SSL)
+#   acl-app         SCRAM app — All on topics and groups, nothing on the cluster: it cannot
+#                   create a topic, and that refusal is the point of this stand
+#
+# The truststore is the one cmd/testpki writes for the other stand (testdata/pki), used
+# relatively so that this file keeps working from a checkout; both stands are given the same
+# certificates. They are issued for localhost, 127.0.0.1 and kafka, so a client that reaches
+# the broker by another address has to skip the hostname check — hence verifyHostname: false.
+#
+# The passwords come from the environment: nothing secret is written down here.
+
+clusters:
+  - name: acl-admin
+    bootstrap: ${ACL_HOST}:19192
+    security:
+      protocol: SASL_PLAINTEXT
+      sasl:
+        mechanism: SCRAM-SHA-512
+        username: admin
+        password: ${ACL_ADMIN_PASSWORD}
+
+  - name: acl-admin-ssl
+    bootstrap: ${ACL_HOST}:19193
+    security:
+      protocol: SASL_SSL
+      tls:
+        truststore:
+          location: ../pki/truststore.p12
+          password: ${ACL_STORE_PASSWORD}
+        verifyHostname: false
+      sasl:
+        mechanism: SCRAM-SHA-512
+        username: admin
+        password: ${ACL_ADMIN_PASSWORD}
+
+  - name: acl-app
+    bootstrap: ${ACL_HOST}:19192
+    security:
+      protocol: SASL_PLAINTEXT
+      sasl:
+        mechanism: SCRAM-SHA-512
+        username: app
+        password: ${ACL_APP_PASSWORD}

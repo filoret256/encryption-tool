@@ -20,10 +20,17 @@ your machine.
 | **ansible-vault** | PBKDF2-HMAC-SHA256 (10000) → AES-256-CTR + HMAC-SHA256 | `$ANSIBLE_VAULT;1.1;AES256` (interoperable with the `ansible-vault` CLI) |
 | **helm** | PBKDF2-HMAC-SHA256 (600000) → AES-256-GCM | `helm:v2:` + `base64(salt[16] + iv[12] + ciphertext + tag[16])`. The older `base64(salt[16] + iv[16] + ciphertext)` (AES-256-CBC, 10000 rounds, no authentication) is still decrypted, never written |
 | **code** | — | Editor over a local folder, backed by the system `git` |
+| **kafka** | — | Browser for Kafka clusters — topics, messages, consumer groups — through a local `kafka-agent` |
 
 ### Encryption tabs / Вкладки шифрования
 
 - **Client-side crypto (WebCrypto)** — шифрование в самой странице, пароль не покидает браузер
+- **Off the main thread** — the vault's double hex runs in a Web Worker (`public/crypto-worker.js`),
+  so a 10 MB buffer neither freezes the tab nor eats its memory; a megabyte-scale value is seconds of
+  work and the page stays usable. Where the worker cannot start, the work falls back to the page
+  itself. One action per tab at a time, and the buttons say what is running. Text over **16 million
+  characters** is refused with a message rather than attempted — the envelope is the input's hex a
+  second time, so that is where a tab runs out of memory
 - **Base64 encode/decode**, в том числе с Unix-окончаниями строк
 - **File import/export**, copy to clipboard
 - **Live YAML validity highlighting** — inline-подсветка ошибок YAML (CodeMirror lint)
@@ -57,7 +64,7 @@ your machine.
   регионом кнопки `accept current` / `accept incoming` / `accept both`, затем
   `save & mark resolved`
 - **Live file watching** — дерево и открытые файлы обновляются при изменениях на диске
-- **Get code-agent** — кнопка рядом с вкладками (только на этой вкладке): готовый бинарник
+- **⤓ code-agent** — кнопка в ряду вкладок сразу после `code` (только на этой вкладке): готовый бинарник
   агента под вашу ОС, команда запуска с уже подставленным origin и SHA-256
 
 ---
@@ -73,9 +80,9 @@ in a second mode.
 
 ```bash
 # point it at a folder — the binary can live anywhere
-enc-tool-code-agent ~/work/my-project
+code-agent ~/work/my-project
 # or run it inside one / или просто в нужной папке
-enc-tool-code-agent
+code-agent
 #   in dev / в деве:
 bun run code-agent -- ~/work/my-project
 ```
@@ -159,11 +166,11 @@ in a field or in the editor. Anything else is left to paste where it was aimed.
 The app itself normally runs in a container, and a code-agent there would be
 pointless: it would expose the pod's filesystem rather than yours, and its
 loopback is not your browser's. So the image carries cross-compiled code-agents and
-hands them out — **⤓ get code-agent**, beside the tabs, shown only on the code tab.
+hands them out — **⤓ code-agent**, in the tab strip right after `code`, shown only on the code tab.
 
 Само приложение обычно работает в контейнере, где агент бессмысленен — он открыл
 бы файловую систему пода, а не вашу. Поэтому образ несёт кросс-собранные
-бинарники и раздаёт их: кнопка **⤓ get code-agent** рядом с вкладками, видна только на
+бинарники и раздаёт их: кнопка **⤓ code-agent** в ряду вкладок сразу после `code`, видна только на
 вкладке code.
 
 The panel picks the archive for your platform, states its size and SHA-256, and
@@ -280,6 +287,389 @@ code-agent do that, so no token ever reaches the browser or the server.
 
 ---
 
+## Kafka tab and the local kafka-agent / Вкладка kafka и локальный агент
+
+The **kafka** tab browses and reads Kafka clusters: brokers and their settings, topics,
+messages, consumer groups and their lag. Like the code tab it needs a small program on
+your machine — a page cannot open a Kafka connection with TLS stores and SCRAM
+logins — and it is built the same way: a Go binary (`kafka-agent`) that listens on
+loopback, a token, an Origin allowlist, one page at a time.
+
+Вкладка **kafka** просматривает кластеры Kafka: брокеры и их настройки, топики,
+сообщения, consumer groups и их lag. Как и code, она работает через небольшой агент
+на вашей машине (`kafka-agent`, Go, loopback, токен, allowlist по Origin).
+
+**Every connection setting lives with the agent:** bootstrap servers, key and trust
+stores and their passwords, SCRAM logins. No key, store or password ever reaches the
+page. The page names a *cluster* from the agent's own configuration and nothing else, so
+it cannot point the agent at a host nobody configured. The one thing of a connection the
+page can read is what an error says about it, and that may name a broker's address —
+never a secret. **A cluster is read-only unless you say
+otherwise.** Every operation the agent has is marked *read* or *write*, and a write on a
+read-only cluster is refused inside the agent with the code `READ_ONLY`, before anything is
+sent to a broker — the page only reflects it (a `read-only` / `writable` tag on the cluster).
+`readOnly: false` on a cluster, or `--allow-write` for every cluster whose configuration
+says nothing, lifts it; an explicit `readOnly: true` is kept even under `--allow-write`.
+What a writable cluster can do: **send a message**, **create** and **delete a topic**, **change a topic's
+settings**, **add partitions**, **delete records below an offset**, **reset a consumer group's offsets** and
+**delete a consumer group** (all below).
+**Every write — done, failed or refused — leaves one line on the agent's stderr**
+(`kafka-agent: write time=… cluster=dev op=topics.delete topic=orders result=ok messages=6`):
+cluster, operation, what it acted on, result. Never a message's key, value or headers, never a
+setting's value, never an error's text — only its code.
+**A password for an Ansible Vault or helm envelope around a message's value goes nowhere:**
+the value is opened and wrapped inside this page, by the same modules the ansible and helm
+tabs use, and no endpoint of the agent or of this app would accept such a password.
+
+**Все настройки подключения — у агента, страница их не видит:** bootstrap-серверы,
+key/trust store и пароли к ним, SCRAM-логины. Страница называет только имя кластера из
+конфигурации агента. **Кластер только для чтения, пока не сказано иное.** Каждая операция
+агента помечена как чтение или запись; запись на кластере с `readOnly` (по умолчанию)
+отклоняется в самом агенте с кодом `READ_ONLY` — до обращения к брокеру. Снимают запрет
+`readOnly: false` у кластера или `--allow-write` для всех кластеров, у которых `readOnly`
+не задан; явный `readOnly: true` флаг не отменяет. На записываемом кластере можно
+**отправить сообщение**, **создать** и **удалить топик**, **изменить настройки топика**, **добавить партиции**,
+**удалить записи до оффсета**, **сбросить офсеты группы** и **удалить consumer group** (ниже).
+**Каждая запись — выполненная, неудачная или отклонённая — оставляет одну строку в stderr агента**
+(`kafka-agent: write time=… cluster=dev op=topics.delete topic=orders result=ok messages=6`):
+кластер, операция, цель, результат. Без ключей, значений и заголовков сообщений, без значений настроек,
+без текста ошибок — только их код.
+**Пароль от конверта ansible-vault или helm вокруг значения сообщения не уходит никуда:**
+значение открывается и заворачивается в самой странице, теми же модулями, что и вкладки
+ansible и helm; ни агент, ни сервер приложения такого пароля не принимают.
+
+### What the tab does / Что умеет вкладка
+
+- **Clusters** — state of each (`connected`, `unreachable`, `tls failed`, `login failed`),
+  with the reason worded in terms of the setting to change, cluster id, controller,
+  Kafka version
+- **Brokers** — address, rack, controller; every broker setting, with sensitive
+  values masked (the agent never reads them out)
+- **Topics** — a virtual list (thousands are fine), internal topics hidden by default;
+  partitions with leader, replicas, in-sync replicas, offsets and size; topic settings
+- **Messages** — newest / oldest / from an offset / from a time, one partition or all,
+  a limit; a **filter** (substring or regular expression, with or without case) applied
+  *by the agent*, so it can look through far more than it sends; keys and values read
+  as text, JSON (formatted), hex or base64; headers; a value over 256 KiB arrives cut
+  off, and **load full message** fetches the rest (up to 8 MiB)
+- **Values in an envelope** (ansible-vault, helm) — a value that says what it is (`$ANSIBLE_VAULT;…`
+  or `helm:v2:…`) offers **decrypt** in the message header: the password is asked for and the value is
+  opened **in this page**, with the same modules the crypto tabs use, so the password is never sent to
+  the agent, to this app's server or to the cluster. The plaintext replaces the ciphertext on screen —
+  with a tag and a **close it** button that puts the stored value back — and is dropped as soon as
+  another message is selected. A value cut off at 256 KiB is not offered: half an envelope cannot be
+  authenticated. A bare base64 value is not guessed at either (it could be the old helm format or just
+  text); the format can be picked by hand in the dialog
+- **ACLs** (K-44) — an **acls** view: every ACL the login may see, grouped by principal, with the
+  resource, its name, the pattern (literal, prefixed, match), the operation, the permission (a `deny`
+  row is marked) and the host. Two filters above the table — by principal and by resource — and the side
+  panel is the index of principals, with the number of ACLs each has; clicking one filters by it. Read
+  only: this agent has no op that creates or deletes an ACL. The listing asks for any pattern, so a
+  prefixed or wildcard ACL is in it — a listing that hides ACLs would be worse than none
+- **Schemas** (K-43, K-47) — a **schemas** view beside clusters, topics, consumers and brokers: the
+  registry's subjects, and for the one that is opened its versions (with each version's schema id and
+  format), its own compatibility level and mode (or the registry's, when it has none of its own), and
+  the text of a version. **compare** on any version opens a diff of it against the one on screen — the
+  same diff component the code tab uses, side by side or inline — so what changed between two versions
+  is read, not hunted for. A cluster with no registry says so here rather than showing an empty list.
+  Where the cluster may be changed, **new version…** (and `+ new` in the subject list) registers a
+  schema: a subject, its format, its text, and the schemas it is written in terms of. **check** asks the
+  registry whether it would take it — `schemas.check`, a read, so it is allowed on a read-only cluster —
+  and the refusal, when it comes, is the registry's own words about which field does not fit. The level
+  control in the subject's header holds it to `NONE`, `BACKWARD`, `BACKWARD_TRANSITIVE`, `FORWARD`,
+  `FORWARD_TRANSITIVE`, `FULL` or `FULL_TRANSITIVE`, or back to the registry's default
+- **Values that carry a schema** (K-42) — a value whose first byte is the Confluent magic byte is read
+  with the schema it names, without being asked: the agent asks the cluster's Schema Registry for that
+  schema id and decodes the payload — **Avro**, **Protobuf** (with the message indexes, so a .proto with
+  several messages works, and nested ones too) or **JSON Schema** — into JSON, which is what the viewer
+  then shows. A tag says which schema it was and where it is registered (`orders-value v3`, or just the
+  id when the registry does not say), choosing another reading in the select above the value (`text`, `hex`, `base64`) puts the stored bytes back, and a payload that
+  cannot be read leaves the value on screen with the reason under it. The schemas are read from the
+  registry once and kept for the connection, so a topic of a thousand schema-encoded messages is one
+  registry read. Nothing is guessed: a value that does not start with the magic byte is shown as it is
+- **Live** — follow a topic from where it ends now: new messages appear at the top as
+  they are written, **pause** holds them back while you read (they are kept), the list is
+  a 5000-message window, and a topic faster than the page can show is thinned to its
+  newest messages with the number dropped stated. Leaving the tab stops it
+- **Save messages** (K-46) — `save .jsonl` in a topic's message bar writes what the list holds as a
+  JSON Lines file: one message per line, oldest first within each partition, and every line names the
+  topic, partition, offset, time and how its key, value and headers were written — as the viewer reads
+  them (text, JSON, hex or base64, each one named) or as the bytes are (base64, what the topic holds).
+  A value the agent cut at 256 KiB is marked, and the dialog says how many were. The file is made in
+  the page and handed to the browser as a download; the messages were already here, nothing is asked
+  of the agent, and a message whose value is not text survives the trip
+- **Consumers** — groups with state, members and their partitions, lag per partition
+- **Output** — the status bar's `output` button (or `Ctrl+J`) opens a log of what the agent
+  and the clusters said: connections, each cluster's answer, every failure with the whole
+  message, the result of a config reload. A toast is one line for a moment; this stays
+- **Keyboard** — `Ctrl+P` goes to a topic or consumer group by name, `Ctrl+Shift+P` lists every
+  command, `Alt+1`…`Alt+6` switch the side list, `Alt+R` asks the cluster again. In a list the
+  arrow keys, `PageUp/PageDown`, `Home/End` move a cursor and `Enter` opens the row; `↓` in a
+  filter steps into its list, `Esc` clears it. In the message list the arrows read through the
+  messages. On a narrow window the tab stacks and the message table drops its time column
+- **Send a message** (writable clusters only) — the `send…` button in a topic's message bar: a
+  partition (automatic, or a chosen one), a key, a value in an editor, headers; each as text with an
+  encoding — `string`, `json` (checked before it is sent) or `base64` (for bytes that are not text) — or a
+  tombstone for no value. The value can be **wrapped** as an Ansible Vault or helm envelope before it is
+  sent (the value's format list offers the two envelopes): that happens in this page, so the agent and the cluster see the envelope only
+  and the password goes nowhere. The answer is the partition and offset it landed at, with **show in the
+  viewer** to read it back. The dialog names the cluster it is about. When the cluster has a Schema Registry
+  that answers, the value — and the key — can also be written **with a schema** (K-45): a subject and a
+  version, the latest by default. What is typed is then JSON, and the agent serializes it in that schema's own
+  format — Avro binary, a Protobuf message, or the JSON of a JSON Schema — with the schema's id in front of the
+  bytes, so what lands on the topic is what every other client of that registry expects. A value that does not
+  fit the schema is refused before anything is written, and the refusal names the field
+- **Delete a topic** (writable clusters only) — the `delete topic` button: the dialog names the cluster and
+  says how many messages the topic holds now, and asks for the topic's name to be typed. The agent asks for
+  the name again with the request and deletes nothing without it; internal topics (`__consumer_offsets` and
+  the like) are never deleted
+- **Create a topic** (writable clusters only) — `+ new` above the topic list: name, partitions, replication
+  factor, `retention.ms`, `cleanup.policy`, `min.insync.replicas` and any other setting as `name=value` lines.
+  **check** asks the cluster whether it would create it (`validateOnly`) and creates nothing; **create** asks
+  the same first and only then creates, and opens the new topic
+- **Reset a group's offsets** (writable clusters only) — `reset offsets…` on a consumer group: to the
+  beginning, the end, a point in time, an offset, or shifted by N messages; for the whole topic or chosen
+  partitions. The dialog **previews** what would change (was → will be, and the lag before and after) and
+  **apply** works only on exactly what was previewed. Only for a group with no running consumers — a running
+  one is refused, naming its clients, because the broker would let them commit over the reset
+- **Change a topic's settings** (writable clusters only) — `change settings…` in the config pane: the settings
+  the topic holds are listed with their values, each with a tick that takes it back to the cluster's default,
+  plus a field for one the cluster was never told. **preview** asks the agent for the difference (was →
+  will be) and has the cluster check the settings with `ValidateOnly`; **apply** writes exactly what was
+  previewed (incremental alter: every setting the dialog does not name is left alone)
+- **Add partitions** (writable clusters only) — `add partitions…` on the partitions pane: the number the topic
+  should have *afterwards*, as the Kafka CLI takes it. **check** asks the cluster (`validateOnly`) and adds
+  nothing; the dialog warns that Kafka never takes partitions away and that the partition a key goes to
+  changes with the count
+- **Delete records** (writable clusters only) — `delete records…` on the partitions pane: one partition and the
+  offset below which the records go (`-1` for everything it holds), with what that removes worked out from the
+  log's start and end. The topic's name is typed to confirm, and the agent asks for the name again with the
+  request; the end of the partition does not move, so a consumer that starts now begins after the deleted
+  records
+- **Delete a consumer group** (writable clusters only) — `delete group…` on a group in state `Empty`: the
+  dialog says how many committed offsets go with it, and the name is typed to confirm. A group with running
+  consumers is refused before the cluster is asked, naming them; nothing in the topics themselves is touched
+- Reading joins **no consumer group** and commits nothing, so looking at a topic cannot
+  start a rebalance in somebody's application
+
+### Running it / Запуск
+
+The `⤓ kafka-agent` button next to the tab hands over the right build for your
+platform, with the command to run and the checksum (see *Getting the code-agent* — the
+mechanism is the same). Or, from a checkout:
+
+```bash
+kafka-agent --config kafka-agent.yaml
+bun run kafka-agent -- --config kafka-agent.yaml     # in dev
+```
+
+It prints a `ws://127.0.0.1:5011/ws?token=…` URL and copies it to the clipboard; press
+**connect** on the kafka tab and it is taken from there — or paste it anywhere on the tab.
+(The code tab works the same way: the agent copies, the button takes.) The agent takes the
+**first free port in 5011-5020** (the code-agent has 5001-5010, so the port alone says which
+agent a URL belongs to, and a kafka URL pasted on the code tab does nothing).
+
+```
+--config <file>         clusters from a YAML file. Without it, and without a cluster on the
+                        command line, the agent reads ./kafka-agent.yaml, then
+                        <user config dir>/enc-tool/kafka-agent.yaml
+--bootstrap <hosts>     one more cluster from the command line: host:port,…
+--properties <file>     its settings from a Java client.properties — the file
+                        kafka-console-consumer takes with --consumer.config
+-X <key>=<value>        one Java client property, repeatable; wins over --properties
+--name <name>           that cluster's name (default: the first broker's host)
+--allow-write           let the agent change clusters: every cluster whose configuration does
+                        not say readOnly. A cluster's own readOnly: true still wins
+--port <n>              pin the loopback port (default: first free in 5011-5020)
+--token <str>           fixed token — prefer KAFKA_AGENT_TOKEN, --token shows in the process list
+--allow-origin <url>    origin allowed to connect, repeatable
+--allow-no-origin       also accept clients that send no Origin (curl, scripts)
+--allow-multiple        serve more than one page at once (default: one)
+--no-clipboard          do not copy the URL on startup
+```
+
+`ENC_TOOL_ALLOW_ORIGIN` (shared with the code-agent) and `KAFKA_AGENT_TOKEN` are read
+from the environment. The token variable is the agent's own, not `ENC_TOOL_TOKEN`: two
+agents on one token would let a URL meant for one open the other.
+
+**The two agents do not describe themselves alike, on purpose.** The code-agent answers
+`code-agent.info` with `codeAgent: "enc-tool"`; the kafka-agent answers `agent.info` with
+`agent: "kafka-agent"`. The first shape is older and is kept as it is: a page cached from before
+the kafka tab asks `code-agent.info`, and an alias would only add a second name to a protocol
+that already works. What the page needs from either is two lines in `AgentSpec`
+(`src/web/agent-client.ts`): the name of the info op and a `check` that refuses another agent's
+reply. A third agent should take the kafka-agent's shape (`agent.info`, an `agent` field naming
+itself, its own token variable) — the one a general client would be written against.
+
+### Configuring clusters / Настройка кластеров
+
+Settings come from three places and are reduced to the same **Java client property
+keys**, so a setting means the same thing wherever it was written:
+a `client.properties` file < `kafka-agent.yaml` < `-X` on the command line.
+
+```yaml
+# kafka-agent.yaml
+clusters:
+  - name: prod
+    bootstrap: [kafka1:9093, kafka2:9093]
+    properties: ./prod.client.properties      # an existing Java client.properties
+  - name: dev
+    bootstrap: localhost:9094
+    readOnly: false                           # lets the agent change this cluster (default: true)
+    security:
+      protocol: SASL_SSL
+      tls:
+        truststore: { location: ./truststore.jks, password: "${TS_PASS}" }
+        keystore:   { location: ./client.p12, type: PKCS12, password: "${KS_PASS}" }
+        # or PEM files:  ca: ca.pem   cert: client.pem   key: client.key
+        # verifyHostname: false                # skip only the name check, not the chain
+      sasl: { mechanism: SCRAM-SHA-512, username: app, password: "${file:~/.kafka/dev.pass}" }
+    schemaRegistry:                           # optional: a registry beside the cluster
+      url: https://registry.example.com:8081
+      username: app
+      password: "${REGISTRY_PASS}"
+      tls:                                    # its own stores; the cluster's are its own
+        truststore: { location: ./registry-ca.pem }
+        # cert: client.pem   key: client.key  # when the registry wants a client certificate
+        # verifyHostname: false
+```
+
+`schemaRegistry` (K-41) is a service of its own beside the cluster — Confluent's Schema
+Registry, or anything speaking the same REST API. It has its own URL, its own basic-auth
+login and its own stores, and none of them are the cluster's: a registry may be https while
+the brokers are plaintext, and a mistake in one is reported against the setting that has
+it (`schemaRegistry.tls.truststore.location`). The password follows the same rules as every
+other secret (`${ENV}`, `${file:…}`), and a login in the URL is refused — the agent prints
+URLs, and a password in one would end up in a message. With `http` the TLS settings are
+ignored, with a warning. The cluster view shows what the registry said about itself
+(`schemas.status`: mode, default compatibility, how many subjects) or, when it would not
+answer, the reason in its own words — an unreachable registry holds up nothing else about
+the cluster. A message's value is read with the schema it names (`messages.decode`, K-42):
+the schemas are cached in the agent for the life of the connection, and the decoders (Avro,
+Protobuf, JSON Schema) never run on bytes the value does not claim. Writing is the other
+direction (K-45): a send may name a subject and a version, and the agent serializes the
+JSON with that schema and puts its id in the header — a value that does not fit is refused
+before anything reaches the topic. A named version is read once and kept for the
+connection; the latest is asked for every time, because registering a version moves it.
+The registry's own writes are the schema browser's (K-47): a new version of a subject, and
+the compatibility level it is held to. Both are writes, so a read-only cluster refuses
+them before anything leaves the agent — the registry is a service beside the cluster, but
+the operator's switch is the cluster's. The compatibility a subject is checked against
+before a registration is the registry's decision, so its message is what is shown.
+
+Kinds of connection:
+
+| `security.protocol` | What it needs |
+|---|---|
+| `PLAINTEXT` | nothing |
+| `SSL` | a truststore (or the system CAs); a keystore if the broker asks for a client certificate (mTLS) |
+| `SASL_PLAINTEXT` | `SCRAM-SHA-256` or `SCRAM-SHA-512`, a user and a password |
+| `SASL_SSL` | both of the above |
+
+Store formats — **PEM, PKCS12 and JKS** — are told apart by the file's own bytes, not by
+`ssl.*.type` or an extension (a JKS renamed `.p12` still opens). A JKS key may have a password
+of its own (`ssl.key.password`). Not supported, and refused at startup with a message that
+says what to do instead: SASL `PLAIN`, Kerberos, OAuth and AWS MSK IAM; JCEKS stores;
+encrypted PEM keys (put the key in a PKCS12 keystore). A Java `client.properties` may
+carry keys that mean nothing here (`acks`, `group.id`): they are ignored with a note.
+
+Secrets need not sit in the file: `${NAME}` / `${env:NAME}` is an environment variable,
+`${file:/path}` the contents of a file, `$${` a literal `${`. An unset variable or
+unreadable file is an error, never an empty password. Relative paths are relative to
+the file that names them, not to where the agent was started.
+
+**Mistakes are found at startup, and they name the place**:
+`kafka-agent.yaml:4: security.sasl.password: ${PASS}: environment variable PASS is not
+set`. The stores are opened then too, so a wrong password is seen when the agent starts,
+not when somebody opens the tab. A misspelt key in the YAML is an error, not silently
+ignored.
+
+**File permissions** (Unix): the agent warns, once, when the config, a properties file, a
+keystore, a key or a `${file:…}` secret can be read by other users, with the `chmod 600`
+that fixes it. On Windows mode bits say nothing about access, and there is no warning.
+
+**Reloading:** **Reload the agent's config** in the toolbar's `agent…` menu (or the command palette, or
+the `config.reload` op) reads the files again with the same flags. Only a sound configuration replaces the running one — a file with
+a typo leaves the agent exactly as it was and says where the typo is. Clusters that did not
+change keep their connections; new, removed and changed ones take effect at once, in every
+open page.
+
+### Environment (server) / Переменные сервера
+
+| Variable | Meaning |
+|----------|---------|
+| `KAFKA_AGENT_DIR` | where the archives and `kafka-agents.json` live (default: `/usr/local/share/enc-tool/kafka-agents`, then `dist/kafka-agents`) |
+| `KAFKA_AGENT_DOWNLOAD_BASE` | serve the archives from a mirror rather than from this image |
+| `KAFKA_AGENT_PORTS` | loopback ports the kafka tab may connect to (default: `5011-5020`) — same rules as `CODE_AGENT_PORTS` |
+
+Build args: `KAFKA_AGENT_TARGETS`, like `CODE_AGENT_TARGETS`. Archives are built with
+`bun scripts/build-code-agents.ts --agent kafka` and signed the same way.
+
+### Trying it without a broker / Без брокера
+
+```bash
+bun run kafka-agent:pki                      # test certificates, stores and configs → kafka-agent-go/testdata/pki
+docker compose -f kafka-agent-go/testdata/compose.yaml up -d   # one broker, four listeners
+kafka-agent --config kafka-agent-go/testdata/pki/kafka-agent.yaml
+kafka-agent-go/testdata/verify.sh            # kafka-console-consumer with each client.properties, on the stand's machine
+
+cd kafka-agent-go && go run ./cmd/devstand -dir /tmp/stand -live   # no Docker, no Java
+kafka-agent --config /tmp/stand/kafka-agent.yaml
+```
+
+`cmd/devstand` starts three fake clusters (plaintext, mTLS, SCRAM) with topics,
+messages, consumer groups and — with `-live` — a writer for the live view. The tests use
+the same fake brokers (franz-go's `kfake`, real protocol, not real Kafka); the Docker
+stand is for checking against a real broker (run by hand, not in CI). On another machine
+start it with `KAFKA_HOST=<that machine's address>`; the certificates are issued for
+`localhost`, so over such an address set `verifyHostname: false` for the SSL clusters.
+
+```bash
+ACL_HOST=192.168.56.111 ACL_ADMIN_PASSWORD=… ACL_APP_PASSWORD=… \
+  docker compose -f kafka-agent-go/testdata/compose-acl.yaml up -d   # a second broker, with ACLs
+ACL_HOST=… ACL_ADMIN_PASSWORD=… ACL_APP_PASSWORD=… ACL_STORE_PASSWORD=changeit \
+  bun run kafka-agent:smoke --config kafka-agent-go/testdata/acl/kafka-agent.yaml \
+    --writes --writes-cluster acl-admin --denied-cluster acl-app --acl-expect 9
+```
+
+`testdata/compose-acl.yaml` is a stand of its own: its own ports (19192 SASL_PLAINTEXT,
+19193 SASL_SSL), its own compose project (`name: kafka-acl`, so that starting it cannot
+recreate the other stand's container), and an authorizer with two logins — `admin`, a super
+user, and `app`, which may do everything to a topic and a group but may not create a topic.
+It shares the certificates `cmd/testpki` writes. `--denied-cluster <name>` in the smoke is
+what uses it: creating a topic there has to come back as the broker's own refusal
+(`Authorization failed.`), word for word. The same smoke run over `--writes-cluster
+acl-admin-ssl` checks the same thing through SASL_SSL. `--acl-expect <n>` says how many ACLs
+that cluster has (the seed writes nine): the listing has to bring back at least that many,
+with a topic ACL and a group ACL among them, so a listing that silently dropped one is a
+failure rather than a smaller table.
+
+The seed takes the two passwords from the environment and only ever used them to create the
+SCRAM logins. If they are lost, set them again over the internal listener, which the seed
+itself uses as the super user `ANONYMOUS`:
+
+```bash
+docker exec kafka-acl-kafka-1 /opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:9090 \
+  --alter --add-config "SCRAM-SHA-512=[password=<new>]" --entity-type users --entity-name app
+```
+
+`bun run kafka-agent:test` runs the agent's tests. `bun run kafka-agent:smoke` builds the agent, starts
+`cmd/devstand` and talks to it over the WebSocket as the browser does — the front door's refusals, every
+connection kind, reading, the live tail and its cancel, and the write ops. Every write op is checked to be
+refused with `READ_ONLY` first; then a create / send / read back / change the settings / add a partition /
+delete records / delete cycle runs on a topic the test makes and removes itself, and on the devstand — whose
+data is thrown away — so do the offset reset (including its `timestamp` target) and the group's deletion.
+`--stand compose` or `--config <file>` points it at another stand, where the agent stays read-only unless
+`--writes` (with `--writes-cluster <name>`) asks for the cycle to run. A stand that is not the devstand gets
+no offset reset unless `--writes-group <name>` names a group that already has commits: making one needs a
+Kafka client, and this script has none
+(`kafka-console-consumer --bootstrap-server <broker> --topic <topic> --group <name> --from-beginning
+--max-messages 1` is the quickest way). That group's offsets are moved and the group is then deleted, so
+point it at one you are willing to lose. `bun run licenses` regenerates the
+Go dependencies' licences into `THIRD-PARTY-LICENSES.md` (`bun run audit` checks it).
+
+---
+
 ## Quick Start / Быстрый старт
 
 ### Local (Bun) / Локально
@@ -380,6 +770,9 @@ a certificate and an Apple developer account.
 | `CODE_AGENT_DOWNLOAD_BASE` | serve the archives from a mirror rather than from this image |
 | `CODE_AGENT_PORTS` | loopback ports the code tab may connect to — ports and `low-high` ranges, comma-separated (default: `5001-5010`) |
 
+The kafka-agent has variables of its own (`KAFKA_AGENT_DIR`, `KAFKA_AGENT_DOWNLOAD_BASE`,
+`KAFKA_AGENT_PORTS`) — see *Kafka tab and the local kafka-agent*.
+
 `CODE_AGENT_PORTS` is what `connect-src` in the CSP permits, and the code-agent binds the
 first free port in the same range, so the two agree out of the box and several
 folders can be open at once. If your users start code-agents with `--port` outside
@@ -448,6 +841,8 @@ Code-agent distribution:
 |---------------------|--------|------------------|
 | `/code-agent/downloads` | GET | `{version, builds[]}` — platform, size and SHA-256 of each published code-agent |
 | `/code-agent/download/<file>` | GET | the archive itself; only names present in `code-agents.json` are served |
+| `/kafka-agent/downloads` | GET | the same, for the kafka-agent |
+| `/kafka-agent/download/<file>` | GET | the archive itself; only names present in `kafka-agents.json` are served — and never a code-agent archive |
 
 ---
 
@@ -461,8 +856,13 @@ Nothing is shared between users, by construction rather than by convention:
 - **the code tab** talks only to the user's own loopback code-agent, jailed to one folder,
   and the CSP pins `connect-src` to that code-agent's port — not to loopback at large,
   which would be a channel to every other service on the machine;
-- **the download route** resolves a request only against the names in `code-agents.json`,
-  so nothing else on that directory's path is reachable through it;
+- **the kafka tab** talks only to the user's own loopback kafka-agent, on ports of its own
+  (5011-5020, named in `connect-src` like the code-agent's), and the page never learns a
+  bootstrap server, a store or a password — it names a cluster from the agent's
+  configuration and nothing else;
+- **the download routes** resolve a request only against the names in `code-agents.json`
+  and `kafka-agents.json`, so nothing else on that directory's path is reachable through
+  them, and neither agent's route serves the other's archives;
 - every response carries a strict **CSP**: `script-src 'self'`, nothing remote, and
   no `'unsafe-inline'` in any directive. The one `<style>` the app creates at
   runtime — CodeMirror mounting its themes — is admitted by a per-request nonce
@@ -487,7 +887,8 @@ Every suite spawns real processes — a real server, a real code-agent, a real `
 throwaway repositories. Ни один не использует моки.
 
 ```bash
-bun run crypto:smoke      # WebCrypto ports interoperate with the previous node:crypto code
+bun run crypto:smoke      # WebCrypto ports interoperate with the previous node:crypto code, and the worker that runs them
+bun run agent-client:smoke # an agent request that is never answered ends by its deadline, and the panel recovers
 bun run isolation:smoke   # 60 concurrent users, jail escapes, loopback binding, CSP
 bun run code-agent:smoke       # both code-agents, same checks, replies diffed against each other
 bun run code-agent:test        # the Go code-agent's unit tests (WebSocket codec, RFC 6455 vector)
@@ -496,7 +897,12 @@ bun run git:smoke         # staging, commits, branches, merge/rebase/revert/rese
 bun run graph:smoke       # commit-graph lane layout and its SVG output
 bun run search:smoke      # modifiers, globs, cancellation, preserve case, engine parity
 bun run pwa:smoke         # manifest, icon sizes read from the PNG header, worker scope
-bun run download:smoke    # archive formats read back, download route, origin allowlist
+bun run download:smoke    # archive formats read back, both agents' download routes, origin allowlist
+bun run kafka-agent:test  # the kafka-agent against an in-process Kafka: TLS/mTLS, SCRAM, topics, messages, tail, reload, writes
+bun run kafka-agent:smoke # a built agent over the WebSocket: front door, every connection kind, reading, tail, writes
+bun run kafka-web:smoke   # the kafka tab's own words: a saved JSON Lines message, a reference line, a compatibility level
+bun run agent-kit:test    # the front door both agents share: token, Origin, Host, WebSocket
+bun run licenses -- --check   # THIRD-PARTY-LICENSES.md matches the Go modules that are linked
 bunx tsc --noEmit
 ```
 
@@ -527,6 +933,12 @@ bunx tsc --noEmit
 │   │   ├── targets.ts     # the platforms code-agents are built for; shared naming
 │   │   └── protocol.ts    # wire types, shared with the browser — the definition
 │   │                      # both code-agents and the browser are written against
+├── agent-kit-go/               # what both agents share: WebSocket, token, Origin/Host checks, port choice
+├── kafka-agent-go/             # the kafka-agent: franz-go client, config, TLS stores, SCRAM
+│   ├── config.go, properties.go, jaas.go, tls.go, perm.go, reload.go
+│   ├── connect.go, ops.go, ops_read.go, ops_messages.go   # cluster status and the ops
+│   ├── protocol.go        # the Go side of src/kafka-agent/protocol.ts
+│   ├── cmd/testpki, cmd/devstand, testdata/compose.yaml   # certificates, fake clusters, a real broker
 ├── code-agent-go/              # the code-agent that actually ships: same protocol, ~7 MB
 │   ├── main.go            # CLI, startup banner, capability probes
 │   ├── server.go          # HTTP + WebSocket, auth, origin allowlist, op table
@@ -538,8 +950,11 @@ bunx tsc --noEmit
 │   └── web/
 │       ├── main.ts        # crypto tabs, capability badge, service-worker lifecycle
 │       ├── code.ts        # entry for the lazily-loaded code tab bundle
+│       ├── agent-client.ts # the socket, reconnecting, refusals — shared by both agents
+│       ├── kafka.ts       # entry for the lazily-loaded kafka tab bundle
+│       ├── kafka/         # model, side lists, topic/group/broker views, messages, status badge
 │       ├── code/          # explorer, tabs, search, git panel, history, graph,
-│       │                  # diff, conflicts, code-agent client, download panel
+│       │                  # diff, conflicts, code-agent client, download panel (both agents)
 │       ├── sw.ts          # service worker
 │       ├── manifest.webmanifest, icons/
 │       └── index.html, style.css, editor.ts, yaml-lint.ts

@@ -7,7 +7,7 @@
  */
 import { OutputTooLarge, run, runLimited } from "./proc.ts";
 import { isBinary, MAX_TEXT } from "./fs-ops.ts";
-import type { BlameRow, Branch, Commit, CommitDetail, CommitFile, DiffPair, GitOperation, GitStatus, ReflogEntry, StatusEntry } from "./protocol.ts";
+import type { BlamePage, BlameRow, Branch, BranchList, Commit, CommitDetail, CommitFile, DiffPair, GitOperation, GitStatus, ReflogEntry, StatusEntry } from "./protocol.ts";
 
 /** The oldest git this editor is written against.
  *
@@ -133,6 +133,8 @@ export async function repoRoot(cwd: string): Promise<string | null> {
  *  open folder has to start working without a reconnect.
  */
 const gitDirs = new Map<string, string>();
+/** More folders than anyone opens in one run; past it the oldest goes. */
+const GIT_DIRS_MAX = 64;
 
 async function gitDir(cwd: string): Promise<string | null> {
   const hit = gitDirs.get(cwd);
@@ -140,7 +142,10 @@ async function gitDir(cwd: string): Promise<string | null> {
   const r = await run(readOnly(["rev-parse", "--absolute-git-dir"]), cwd);
   if (r.code !== 0) return null;
   const dir = r.stdout.trim();
-  if (dir) gitDirs.set(cwd, dir);
+  if (dir) {
+    if (gitDirs.size >= GIT_DIRS_MAX) gitDirs.delete(gitDirs.keys().next().value!);
+    gitDirs.set(cwd, dir);
+  }
   return dir || null;
 }
 
@@ -273,6 +278,8 @@ export async function status(cwd: string): Promise<GitStatus> {
     behind: 0,
     oid: null,
     entries: [],
+    entryCount: 0,
+    truncated: false,
     operation: op,
     preparedMessage: prepared,
   };
@@ -324,7 +331,16 @@ export async function status(cwd: string): Promise<GitStatus> {
         e = { path: rec.slice(2), index: ".", work: ".", ignored: true };
         break;
     }
-    if (e) st.entries.push(e);
+    if (!e) continue;
+    // Counted whether or not it is kept: the panel says how many there are, and
+    // a repository with half a million untracked files should not put half a
+    // million objects in a frame.
+    st.entryCount++;
+    if (st.entries.length >= MAX_STATUS_ENTRIES) {
+      st.truncated = true;
+      continue;
+    }
+    st.entries.push(e);
   }
   return st;
 }
@@ -358,6 +374,23 @@ function parseCommits(out: string): Commit[] {
  *  short list is what a smaller limit would have returned anyway.
  *  code-agent-go/git.go has the same number. */
 const MAX_LOG_LIMIT = 20000;
+
+/** The most lines of blame one answer carries.
+ *
+ *  Blame is one row per line of the file, and the rows are wide: a million-line
+ *  file is about 600,000 porcelain rows and some 250 MB of JSON in one frame —
+ *  which the page would then have to parse, and which nothing can read. The
+ *  gutter shows the first page and the bar says which lines it covers. */
+const MAX_BLAME_LINES = 20000;
+
+/** The most status entries one answer carries, and the most refs.
+ *
+ *  Both are lists a person scans rather than reads: half a million untracked
+ *  files, or a mirror with fifty thousand refs, is a frame nothing can parse and
+ *  a panel nobody can use. What was left out is counted and said, so "I can see
+ *  5,000 changes" is never mistaken for "there are 5,000 changes". */
+const MAX_STATUS_ENTRIES = 5000;
+const MAX_BRANCHES = 5000;
 
 export async function log(
   cwd: string,
@@ -429,7 +462,7 @@ export async function reflog(cwd: string, limit = 50): Promise<ReflogEntry[]> {
   return entries;
 }
 
-export async function branches(cwd: string): Promise<Branch[]> {
+export async function branches(cwd: string): Promise<BranchList> {
   const out = await git(cwd, [
     "for-each-ref",
     // `upstream:track` prints "[ahead 1, behind 2]", "[gone]" or nothing;
@@ -441,11 +474,21 @@ export async function branches(cwd: string): Promise<Branch[]> {
     "refs/tags",
   ]);
   const list: Branch[] = [];
+  let seen = 0;
+  let truncated = false;
   for (const line of out.split("\n")) {
     if (!line.trim()) continue;
     const [ref, oid, upstream, head, track, time] = line.split("\0");
     // refs/remotes/<name>/HEAD is a symbolic pointer, not a branch users pick.
     if (/^refs\/remotes\/[^/]+\/HEAD$/.test(ref)) continue;
+    // Counted, not collected: past the limit the rest are still walked so the
+    // answer can say how many there were, and a mirror with fifty thousand refs
+    // does not put fifty thousand objects in a frame.
+    seen++;
+    if (list.length >= MAX_BRANCHES) {
+      truncated = true;
+      continue;
+    }
     const remote = ref.startsWith("refs/remotes/");
     list.push({
       ref,
@@ -460,7 +503,7 @@ export async function branches(cwd: string): Promise<Branch[]> {
       time: Number(time ?? 0) || 0,
     });
   }
-  return list;
+  return { refs: list, truncated: truncated || seen > list.length };
 }
 
 export async function commitDetail(cwd: string, oid: string, parent = 1): Promise<CommitDetail> {
@@ -628,9 +671,21 @@ export async function diffPair(
   };
 }
 
-export async function blame(cwd: string, path: string): Promise<BlameRow[]> {
-  const out = await git(cwd, ["blame", "--line-porcelain", "--", path]);
-  const rows: BlameRow[] = [];
+export async function blame(cwd: string, path: string, offset = 0, limit = MAX_BLAME_LINES): Promise<BlamePage> {
+  // Only the lines asked for, and one more than the page holds: `git blame -L`
+  // runs just that range, so a file with a million lines costs a page of blame
+  // instead of a million — and no longer dies at the 64 MB output limit before
+  // it can answer at all. The range's end is a count rather than a line number,
+  // so git clamps it at the end of the file instead of failing.
+  const start = Math.max(1, Math.floor(offset) + 1);
+  const want = Math.max(1, Math.min(Math.floor(limit), MAX_BLAME_LINES));
+  const out = await git(cwd, ["blame", "--line-porcelain", `-L`, `${start},+${want + 1}`, "--", path]).catch((e: unknown) => {
+    // The one failure that is not a failure: the range starts past the last
+    // line, which git reports as "has only N lines". There is no page there.
+    if (e instanceof GitError && /has only \d+ lines/.test(e.message)) return "";
+    throw e;
+  });
+  const all: BlameRow[] = [];
   let cur: BlameRow | null = null;
   for (const line of out.split("\n")) {
     const header = /^([0-9a-f]{40}) \d+ (\d+)/.exec(line);
@@ -646,9 +701,10 @@ export async function blame(cwd: string, path: string): Promise<BlameRow[]> {
     // per commit to answer "what change was this, again?".
     else if (line.startsWith("summary ")) cur.summary = line.slice(8);
     else if (line.startsWith("\t")) {
-      rows.push(cur);
+      all.push(cur);
       cur = null;
     }
   }
-  return rows;
+  const more = all.length > want;
+  return { rows: more ? all.slice(0, want) : all, offset: start - 1, more };
 }

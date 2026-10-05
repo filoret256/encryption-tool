@@ -5,8 +5,8 @@ import { join } from "node:path";
 import { createHash, randomBytes } from "node:crypto";
 import { brotliCompressSync, constants as zlibConstants, gzipSync } from "node:zlib";
 import { VERSION } from "./version.ts";
-import { CODE_AGENT_PORT_RANGE } from "./ports.ts";
-import { TARGETS, archiveName, type CodeAgentBuild } from "./code-agent/targets.ts";
+import { CODE_AGENT_PORT_RANGE, KAFKA_AGENT_PORT_RANGE } from "./ports.ts";
+import { TARGETS, archiveName, exeName, manifestName, type AgentName, type CodeAgentBuild } from "./code-agent/targets.ts";
 
 // Static assets are imported with the `file` loader so that `bun build --compile`
 // embeds them into the standalone binary — the runtime image then needs nothing
@@ -15,9 +15,18 @@ import { TARGETS, archiveName, type CodeAgentBuild } from "./code-agent/targets.
 import indexHtml from "./web/index.html" with { type: "file" };
 import mainJs from "../public/main.js" with { type: "file" };
 import mainCss from "../public/main.css" with { type: "file" };
-// The code tab is a second bundle, fetched on first use. Its name is fixed (no
-// --splitting) precisely so it can be embedded here like the rest.
+// The code tab is a second bundle, fetched on first use. Its name is fixed so it can be
+// embedded here like the rest.
 import codeJs from "../public/code.js" with { type: "file" };
+// The editor and its grammars, the one chunk code.js and kafka-diff.js share (X-11): built with
+// --splitting, and named by --chunk-naming so that it too can be embedded by path.
+import editorChunkJs from "../public/editor-chunk.js" with { type: "file" };
+// The kafka tab, the same way.
+import kafkaJs from "../public/kafka.js" with { type: "file" };
+// The schema diff, which the kafka tab fetches when two versions are first compared.
+import kafkaDiffJs from "../public/kafka-diff.js" with { type: "file" };
+// The crypto worker: the vault's hex work, off the page's main thread (P4).
+import cryptoWorkerJs from "../public/crypto-worker.js" with { type: "file" };
 // PWA assets. sw.js must be served from the root to get a "/" scope.
 import swJs from "../public/sw.js" with { type: "file" };
 import manifestJson from "./web/manifest.webmanifest" with { type: "file" };
@@ -52,9 +61,13 @@ if (process.argv.includes("--health")) {
  *
  *    CODE_AGENT_PORTS   comma-separated ports and ranges, e.g. "5001-5010,7000"
  *
+ *  The kafka-agent has a range of its own (5011-5020) and the same override:
+ *
+ *    KAFKA_AGENT_PORTS  the same syntax, for the kafka tab
+ *
  *  A malformed value stops the server rather than being quietly dropped: the
- *  symptom of a silently ignored port is a code tab that cannot connect and
- *  gives no reason, which is exactly the failure this is meant to prevent.
+ *  symptom of a silently ignored port is a tab that cannot connect and gives
+ *  no reason, which is exactly the failure this is meant to prevent.
  */
 
 /** Every source lands in connect-src in full, on every response, so the list is
@@ -62,9 +75,9 @@ if (process.argv.includes("--health")) {
  *  whatever a mistyped range expands to. */
 const MAX_CODE_AGENT_PORTS = 64;
 
-function parseCodeAgentPorts(spec: string): string[] {
+function parseAgentPorts(name: string, spec: string): string[] {
   const reject = (item: string, why: string): never => {
-    console.error(`CODE_AGENT_PORTS: "${item}" ${why}`);
+    console.error(`${name}: "${item}" ${why}`);
     process.exit(1);
   };
   const port = (text: string, item: string): number => {
@@ -85,25 +98,35 @@ function parseCodeAgentPorts(spec: string): string[] {
 
   const unique = [...new Set(out)].sort((a, b) => a - b);
   if (unique.length > MAX_CODE_AGENT_PORTS) {
-    console.error(`CODE_AGENT_PORTS: ${unique.length} ports listed, more than the ${MAX_CODE_AGENT_PORTS} this policy will name`);
+    console.error(`${name}: ${unique.length} ports listed, more than the ${MAX_CODE_AGENT_PORTS} this policy will name`);
     process.exit(1);
   }
   return unique.map(String);
 }
 
-const CODE_AGENT_PORTS = parseCodeAgentPorts(process.env.CODE_AGENT_PORTS ?? CODE_AGENT_PORT_RANGE);
+const CODE_AGENT_PORTS = parseAgentPorts("CODE_AGENT_PORTS", process.env.CODE_AGENT_PORTS ?? CODE_AGENT_PORT_RANGE);
+const KAFKA_AGENT_PORTS = parseAgentPorts("KAFKA_AGENT_PORTS", process.env.KAFKA_AGENT_PORTS ?? KAFKA_AGENT_PORT_RANGE);
 
 if (!CODE_AGENT_PORTS.length) {
   console.error("CODE_AGENT_PORTS: no ports left after parsing — the code tab could reach no code-agent at all");
+  process.exit(1);
+}
+if (!KAFKA_AGENT_PORTS.length) {
+  console.error("KAFKA_AGENT_PORTS: no ports left after parsing — the kafka tab could reach no kafka-agent at all");
   process.exit(1);
 }
 
 /** The code-agent binds 127.0.0.1 only (code-agent-go/server.go: listenLoopback), and the
  *  page reaches it two ways: the WebSocket, and a plain fetch of /ping. Hence
  *  four schemes — but each pinned to a port, not to `:*`. */
-const CODE_AGENT_SOURCES = CODE_AGENT_PORTS.flatMap((port) =>
-  ["ws", "wss", "http", "https"].flatMap((scheme) => [`${scheme}://127.0.0.1:${port}`, `${scheme}://localhost:${port}`]),
-);
+const loopbackSources = (ports: string[]): string[] =>
+  ports.flatMap((port) =>
+    ["ws", "wss", "http", "https"].flatMap((scheme) => [`${scheme}://127.0.0.1:${port}`, `${scheme}://localhost:${port}`]),
+  );
+
+/** A port both variables name is listed once: connect-src gains nothing from
+ *  the repeat but length. */
+const AGENT_SOURCES = [...new Set(loopbackSources([...CODE_AGENT_PORTS, ...KAFKA_AGENT_PORTS]))];
 
 /** Stands where the nonce goes while the policy is cut in two; see CSP_PARTS. */
 const NONCE_MARK = "\u0000";
@@ -117,8 +140,8 @@ const NONCE_MARK = "\u0000";
  *  policy costs nothing — the one relaxation is inline styles, which CodeMirror
  *  needs because it injects its themes as a <style> element at runtime.
  *
- *  connect-src has to allow loopback so the page can reach the user's code-agent —
- *  but only on the ports a code-agent is allowed to bind. Opening every loopback
+ *  connect-src has to allow loopback so the page can reach the user's code-agent
+ *  and kafka-agent — but only on the ports those agents are allowed to bind. Opening every loopback
  *  port would hand injected script a channel to every other service on the
  *  machine, which is a far larger grant than the one thing the tab needs.
  *
@@ -136,7 +159,7 @@ const CSP_PARTS = [
     `style-src 'self' 'nonce-${NONCE_MARK}'`,
     "img-src 'self' data:",
     "font-src 'self'",
-    `connect-src 'self' ${CODE_AGENT_SOURCES.join(" ")}`,
+    `connect-src 'self' ${AGENT_SOURCES.join(" ")}`,
     "worker-src 'self'",
     "manifest-src 'self'",
     "object-src 'none'",
@@ -211,6 +234,12 @@ const STATIC: Record<string, { path: string; type: string; cache?: string }> = {
   "/public/main.js": { path: mainJs, type: "text/javascript" },
   "/public/main.css": { path: mainCss, type: "text/css" },
   "/public/code.js": { path: codeJs, type: "text/javascript" },
+  "/public/kafka.js": { path: kafkaJs, type: "text/javascript" },
+  "/public/kafka-diff.js": { path: kafkaDiffJs, type: "text/javascript" },
+  "/public/editor-chunk.js": { path: editorChunkJs, type: "text/javascript" },
+  // The crypto tabs' worker (P4): the vault's hex work off the thread that draws. It has a
+  // fixed name like the bundles — the compiled binary embeds it by path.
+  "/public/crypto-worker.js": { path: cryptoWorkerJs, type: "text/javascript" },
   // Never cache the worker itself: a stale sw.js pins the app to an old shell
   // and no later deploy can dislodge it.
   "/sw.js": { path: swJs, type: "text/javascript", cache: "no-cache" },
@@ -355,92 +384,148 @@ async function serveStatic(req: Request, pathname: string, asset: { path: string
   return new Response(chosen.body.body, { headers });
 }
 
-// ── prebuilt code-agents ───────────────────────────────────────────────────────
+// ── prebuilt agents ────────────────────────────────────────────────────────────
 //
-// The code tab needs a code-agent on the *user's* machine. This process usually
-// runs in a container, where a code-agent could only ever expose the pod — so the
-// deployment carries the cross-compiled binaries and hands them out instead.
-// They are read from disk rather than embedded: `bun build --compile` would
-// otherwise fold ~160 MB of executables into this executable.
+// The code tab needs a code-agent on the *user's* machine, and the kafka tab a
+// kafka-agent. This process usually runs in a container, where an agent could
+// only ever expose the pod — so the deployment carries the cross-compiled
+// binaries and hands them out instead. They are read from disk rather than
+// embedded: `bun build --compile` would otherwise fold ~160 MB of executables
+// into this executable. Both agents are served the same way, each from its own
+// folder, manifest and route:
 //
-//   CODE_AGENT_DIR             where the archives and code-agents.json live
-//   CODE_AGENT_DOWNLOAD_BASE   serve them from a mirror instead, so an air-gapped
-//                         site can keep the image small
-
-const CODE_AGENT_BASE = (process.env.CODE_AGENT_DOWNLOAD_BASE ?? "").replace(/[/]+$/, "");
-
-// An explicit CODE_AGENT_DIR is taken literally — falling back to a default when it
-// turns out to be empty would quietly serve something other than what was
-// configured.
-const CODE_AGENT_DIRS = process.env.CODE_AGENT_DIR
-  ? [process.env.CODE_AGENT_DIR]
-  : ["/usr/local/share/enc-tool/code-agents", "dist/code-agents"];
+//   CODE_AGENT_DIR / KAFKA_AGENT_DIR                    where the archives and
+//                              code-agents.json / kafka-agents.json live
+//   CODE_AGENT_DOWNLOAD_BASE / KAFKA_AGENT_DOWNLOAD_BASE  serve them from a mirror
+//                              instead, so an air-gapped site can keep the image small
 
 interface ManifestBuild extends Omit<CodeAgentBuild, "url"> {
   size: number;
   sha256: string;
 }
 
-/** Archives actually present on disk, keyed by file name. This is the
- *  allowlist the download route checks against, so no string from a request is
- *  ever joined onto a filesystem path. */
-const codeAgentFiles = new Map<string, string>();
-let codeAgentBuilds: CodeAgentBuild[] = [];
+/** One agent's downloads: what is on disk, and what the panel is told about. */
+class AgentDownloads {
+  /** Archives actually present on disk, keyed by file name. This is the
+   *  allowlist the download route checks against, so no string from a request is
+   *  ever joined onto a filesystem path. */
+  readonly files = new Map<string, string>();
+  builds: CodeAgentBuild[] = [];
+  private readonly base: string;
+  private readonly dirs: string[];
 
-async function loadCodeAgents(): Promise<void> {
-  for (const dir of CODE_AGENT_DIRS) {
-    const manifest = Bun.file(join(dir, "code-agents.json"));
-    if (!(await manifest.exists())) continue;
-    let parsed: { version: string; builds: ManifestBuild[] };
-    try {
-      parsed = (await manifest.json()) as { version: string; builds: ManifestBuild[] };
-    } catch {
-      console.warn(`code-agents: ${dir}/code-agents.json is not valid JSON — ignoring`);
-      continue;
-    }
-    for (const b of parsed.builds ?? []) {
-      const path = join(dir, b.file);
-      if (!(await Bun.file(path).exists())) {
-        if (CODE_AGENT_BASE) {
-          // A manifest without its archives, and a mirror to fetch them from:
-          // the image ships the checksums and the mirror ships the files. The
-          // point of the split is where the checksum comes from — the build that
-          // made this image, not the host that serves the download — so a
-          // mirror that is swapped or compromised cannot vouch for itself. The
-          // link is the mirror's; there is nothing local to serve, so the
-          // download route (which only serves what is on disk) stays a 404.
-          codeAgentBuilds.push({ ...b, url: `${CODE_AGENT_BASE}/${b.file}` });
-          continue;
-        }
-        console.warn(`code-agents: ${b.file} is in the manifest but missing on disk`);
+  constructor(
+    readonly agent: AgentName,
+    dirEnv: string | undefined,
+    baseEnv: string | undefined,
+    installDir: string,
+    devDir: string,
+  ) {
+    this.base = (baseEnv ?? "").replace(/[/]+$/, "");
+    // An explicit dir is taken literally — falling back to a default when it
+    // turns out to be empty would quietly serve something other than what was
+    // configured.
+    this.dirs = dirEnv ? [dirEnv] : [installDir, devDir];
+  }
+
+  async load(): Promise<void> {
+    const tag = `${this.agent}s`;
+    for (const dir of this.dirs) {
+      const manifest = Bun.file(join(dir, manifestName(this.agent)));
+      if (!(await manifest.exists())) continue;
+      let parsed: { version: string; builds: ManifestBuild[] };
+      try {
+        parsed = (await manifest.json()) as { version: string; builds: ManifestBuild[] };
+      } catch {
+        console.warn(`${tag}: ${dir}/${manifestName(this.agent)} is not valid JSON — ignoring`);
         continue;
       }
-      codeAgentFiles.set(b.file, path);
-      codeAgentBuilds.push({ ...b, url: CODE_AGENT_BASE ? `${CODE_AGENT_BASE}/${b.file}` : `/code-agent/download/${b.file}` });
+      for (const b of parsed.builds ?? []) {
+        const path = join(dir, b.file);
+        if (!(await Bun.file(path).exists())) {
+          if (this.base) {
+            // A manifest without its archives, and a mirror to fetch them from:
+            // the image ships the checksums and the mirror ships the files. The
+            // point of the split is where the checksum comes from — the build that
+            // made this image, not the host that serves the download — so a
+            // mirror that is swapped or compromised cannot vouch for itself. The
+            // link is the mirror's; there is nothing local to serve, so the
+            // download route (which only serves what is on disk) stays a 404.
+            this.builds.push({ ...b, url: `${this.base}/${b.file}` });
+            continue;
+          }
+          console.warn(`${tag}: ${b.file} is in the manifest but missing on disk`);
+          continue;
+        }
+        this.files.set(b.file, path);
+        this.builds.push({ ...b, url: this.base ? `${this.base}/${b.file}` : `/${this.agent}/download/${b.file}` });
+      }
+      if (this.builds.length) {
+        console.log(`${tag}: serving ${this.builds.length} prebuilt ${this.agent}(s) from ${dir}`);
+        return;
+      }
     }
-    if (codeAgentBuilds.length) {
-      console.log(`code-agents: serving ${codeAgentBuilds.length} prebuilt code-agent(s) from ${dir}`);
-      return;
+
+    // Nothing on disk, but a mirror is configured: the release names are known
+    // from the target table, so the panel can still link to it. Size and
+    // checksum stay absent — we have not seen those files.
+    if (this.base) {
+      this.builds = TARGETS.map((t) => ({
+        id: t.id,
+        os: t.os,
+        arch: t.arch,
+        label: t.label,
+        exe: exeName(t, this.agent),
+        kind: t.kind,
+        file: archiveName(t, VERSION, this.agent),
+        url: `${this.base}/${archiveName(t, VERSION, this.agent)}`,
+      }));
+      console.log(`${tag}: linking to the mirror at ${this.base}`);
     }
   }
 
-  // Nothing on disk, but a mirror is configured: the release names are known
-  // from the target table, so the panel can still link to it. Size and
-  // checksum stay absent — we have not seen those files.
-  if (CODE_AGENT_BASE) {
-    codeAgentBuilds = TARGETS.map((t) => ({
-      id: t.id,
-      os: t.os,
-      arch: t.arch,
-      label: t.label,
-      exe: t.exe,
-      kind: t.kind,
-      file: archiveName(t, VERSION),
-      url: `${CODE_AGENT_BASE}/${archiveName(t, VERSION)}`,
-    }));
-    console.log(`code-agents: linking to the mirror at ${CODE_AGENT_BASE}`);
+  /** The route for `/<agent>/download/<file>`, or null when the path is not one. */
+  download(pathname: string): Response | null {
+    const prefix = `/${this.agent}/download/`;
+    if (!pathname.startsWith(prefix)) return null;
+    // A name that is not valid percent-encoding is not a name in the table
+    // either. decodeURIComponent throws on it, and an exception out of a
+    // route is not a 404 — see `error` below for what it used to be.
+    let file: string;
+    try {
+      file = decodeURIComponent(pathname.slice(prefix.length));
+    } catch {
+      return new Response("Not found", { status: 404 });
+    }
+    const path = this.files.get(file);
+    if (!path) return new Response("Not found", { status: 404 });
+    return new Response(Bun.file(path), {
+      headers: {
+        "content-type": CODE_AGENT_TYPE[file.endsWith(".zip") ? "zip" : "tar.gz"],
+        // The version is part of the name, so a given file never changes.
+        "cache-control": IMMUTABLE,
+        "content-disposition": `attachment; filename="${file}"`,
+      },
+    });
   }
 }
+
+const AGENT_DOWNLOADS: AgentDownloads[] = [
+  new AgentDownloads(
+    "code-agent",
+    process.env.CODE_AGENT_DIR,
+    process.env.CODE_AGENT_DOWNLOAD_BASE,
+    "/usr/local/share/enc-tool/code-agents",
+    "dist/code-agents",
+  ),
+  new AgentDownloads(
+    "kafka-agent",
+    process.env.KAFKA_AGENT_DIR,
+    process.env.KAFKA_AGENT_DOWNLOAD_BASE,
+    "/usr/local/share/enc-tool/kafka-agents",
+    "dist/kafka-agents",
+  ),
+];
 
 /** Placeholder in src/web/index.html, swapped for the request's nonce. */
 const NONCE_SLOT = "__CSP_NONCE__";
@@ -462,7 +547,9 @@ async function shellParts(): Promise<string[]> {
     shell.checked = now;
     return shell.parts;
   }
-  const text = (await file.text()).replaceAll(PORTS_SLOT, CODE_AGENT_PORTS.join(","));
+  const text = (await file.text())
+    .replaceAll(PORTS_SLOT, CODE_AGENT_PORTS.join(","))
+    .replaceAll(KAFKA_PORTS_SLOT, KAFKA_AGENT_PORTS.join(","));
   shell = { stamp, checked: now, parts: text.split(NONCE_SLOT) };
   return shell.parts;
 }
@@ -477,6 +564,8 @@ async function shellParts(): Promise<string[]> {
  *  list up front lets it name the real reason at the moment it fails, in every
  *  browser, instead of racing an event that may arrive too late. */
 const PORTS_SLOT = "__CODE_AGENT_PORTS__";
+/** The same, for the kafka tab and the kafka-agent's range. */
+const KAFKA_PORTS_SLOT = "__KAFKA_AGENT_PORTS__";
 
 const CODE_AGENT_TYPE: Record<string, string> = { zip: "application/zip", "tar.gz": "application/gzip" };
 
@@ -488,7 +577,7 @@ if (process.argv[2] === "code-agent") {
   const { startCodeAgent } = await import("./code-agent/main.ts");
   await startCodeAgent(process.argv.slice(3));
 } else {
-  await loadCodeAgents();
+  await Promise.all(AGENT_DOWNLOADS.map((a) => a.load()));
 
   async function route(req: Request, nonce: string): Promise<Response> {
     const { pathname } = new URL(req.url);
@@ -504,32 +593,13 @@ if (process.argv[2] === "code-agent") {
       return new Response(html, { headers: { "content-type": "text/html", "cache-control": "no-store" } });
     }
 
-    // Fetched only when the user opens the code tab, so the crypto tabs
-    // never ask for it.
-    if (req.method === "GET" && pathname === "/code-agent/downloads") {
-      return json({ version: VERSION, builds: codeAgentBuilds });
-    }
-
-    if (req.method === "GET" && pathname.startsWith("/code-agent/download/")) {
-      // A name that is not valid percent-encoding is not a name in the table
-      // either. decodeURIComponent throws on it, and an exception out of a
-      // route is not a 404 — see `error` below for what it used to be.
-      let file: string;
-      try {
-        file = decodeURIComponent(pathname.slice("/code-agent/download/".length));
-      } catch {
-        return new Response("Not found", { status: 404 });
-      }
-      const path = codeAgentFiles.get(file);
-      if (!path) return new Response("Not found", { status: 404 });
-      return new Response(Bun.file(path), {
-        headers: {
-          "content-type": CODE_AGENT_TYPE[file.endsWith(".zip") ? "zip" : "tar.gz"],
-          // The version is part of the name, so a given file never changes.
-          "cache-control": IMMUTABLE,
-          "content-disposition": `attachment; filename="${file}"`,
-        },
-      });
+    // Fetched only when the user opens the agent's own tab, so the crypto tabs
+    // never ask for them.
+    for (const agent of AGENT_DOWNLOADS) {
+      if (req.method !== "GET") break;
+      if (pathname === `/${agent.agent}/downloads`) return json({ version: VERSION, builds: agent.builds });
+      const file = agent.download(pathname);
+      if (file) return file;
     }
 
     if (req.method === "GET" && pathname in STATIC) {

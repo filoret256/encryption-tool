@@ -17,33 +17,62 @@ const SNIFF = 8000;
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 
+/** How many filesystem calls one request has in flight at once. A listing of ten thousand entries
+ *  asked ten thousand questions one after another; on Windows or a network drive each is a round
+ *  trip, and the listing took seconds while holding one of the connection's few process slots.
+ *  Sixteen at once is enough to hide the latency and few enough not to flood the disk. */
+const FS_PARALLEL = 16;
+
+/** `fn` over `items`, `limit` at a time, results in the order of the items. A rejection waits for
+ *  the calls already started, then rejects with the first one. */
+async function mapLimit<T, R>(items: readonly T[], limit: number, fn: (item: T, i: number) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  let failure: { error: unknown } | null = null;
+  const worker = async (): Promise<void> => {
+    while (failure === null && next < items.length) {
+      const i = next++;
+      try {
+        out[i] = await fn(items[i], i);
+      } catch (error) {
+        failure ??= { error };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  if (failure) throw (failure as { error: unknown }).error;
+  return out;
+}
+
 export async function readDir(jail: Jail, path: string): Promise<DirEntry[]> {
   const abs = await jail.toAbsExisting(path);
-  const dirents = await readdir(abs, { withFileTypes: true });
-  const out: DirEntry[] = [];
+  // The jail refuses to open anything under the git directory, so listing it
+  // would only offer the explorer a row that errors when clicked.
+  const dirents = (await readdir(abs, { withFileTypes: true })).filter((d) => !isGitDirName(d.name));
 
-  for (const d of dirents) {
-    // The jail refuses to open anything under the git directory, so listing it
-    // would only offer the explorer a row that errors when clicked.
-    if (isGitDirName(d.name)) continue;
+  const out = await mapLimit(dirents, FS_PARALLEL, async (d): Promise<DirEntry> => {
     const link = d.isSymbolicLink();
     let isDir = d.isDirectory();
     let size: number | undefined;
     let mtime: number | undefined;
 
-    try {
-      // stat() follows symlinks, so a link to a directory sorts with directories.
-      const st = await stat(abs + "/" + d.name);
-      isDir = st.isDirectory();
-      if (!isDir) {
-        size = st.size;
-        mtime = st.mtimeMs;
+    // A real directory is already known to be one, and a directory reports no size or time:
+    // there is nothing to ask. What needs the call is a file (its size and time are the row's)
+    // and a link (stat follows it, so a link to a directory sorts with directories).
+    if (!isDir || link) {
+      try {
+        const st = await stat(abs + "/" + d.name);
+        isDir = st.isDirectory();
+        if (!isDir) {
+          size = st.size;
+          mtime = st.mtimeMs;
+        }
+      } catch {
+        // Broken symlink or a race with an external delete — list it anyway.
       }
-    } catch {
-      // Broken symlink or a race with an external delete — list it anyway.
     }
-    out.push(link ? { name: d.name, dir: isDir, size, mtime, link } : { name: d.name, dir: isDir, size, mtime });
-  }
+    return link ? { name: d.name, dir: isDir, size, mtime, link } : { name: d.name, dir: isDir, size, mtime };
+  });
 
   // Directories first, then natural-order by name — matches VS Code's explorer.
   out.sort((a, b) => (a.dir === b.dir ? collator.compare(a.name, b.name) : a.dir ? -1 : 1));
@@ -191,10 +220,11 @@ export async function movePath(jail: Jail, from: string, to: string): Promise<vo
 }
 
 export async function deletePaths(jail: Jail, paths: string[]): Promise<void> {
-  for (const p of paths) {
-    const abs = await jail.toAbsExisting(p);
-    await rm(abs, { recursive: true, force: true });
-  }
+  // Every path is checked before anything is removed: a path outside the workspace refuses the
+  // whole request instead of the part of it that came after the deletions.
+  const targets: string[] = [];
+  for (const p of paths) targets.push(await jail.toAbsExisting(p));
+  await mapLimit(targets, FS_PARALLEL, (abs) => rm(abs, { recursive: true, force: true }));
 }
 
 export async function statPath(jail: Jail, path: string): Promise<{ dir: boolean; size: number; mtime: number }> {

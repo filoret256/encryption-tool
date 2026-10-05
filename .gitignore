@@ -15,13 +15,29 @@ server.exe
 # the release-signing private key (scripts/release-key.ts writes it to the
 # current directory by default); the .pub.pem beside it is meant to be shared
 release-key.pem
-.claude
+
 backlog.md
 ./backlog.md
-to-do.md
-./to-do.md
+to-do*.md
+./to-do*.md
 ux*.md
 ./ux*.md
 
 # cross-compiled code-agent binaries (bun run code-agents:build)
 dist/
+
+# the Kafka stand's generated test keys (kafka-agent-go/cmd/testpki)
+kafka-agent-go/testdata/pki/
+
+# local tool state, not part of the project
+.claude/
+
+# what a file-permission repair left behind (the report and its rollback)
+.dsh-acl-recovery/
+
+# Go's build cache, its temporary files, and staticcheck's cache, when a shell
+# confined to the workspace cannot write to the usual places for them
+.gocache/
+.gotmp/
+.sc-cache/
+.askpass.cmd

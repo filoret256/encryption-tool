@@ -4,27 +4,26 @@
 // Security posture (all four are load-bearing):
 //  1. binds 127.0.0.1 only — never reachable from the network;
 //  2. a token, printed at startup, is required on every connection;
-//  3. the Origin header is checked against an allowlist — a token in
-//     localStorage is only as good as the origins that can read it — and the
-//     Host header against this code-agent's own name, which is what stops a rebound
-//     DNS name from reaching it under someone else's;
+//  3. the Origin header is checked against an allowlist, and the Host header
+//     against this code-agent's own name (DNS rebinding);
 //  4. every path is confined to the workspace by the jail.
+//
+// The first three are agent-kit-go's Guard, shared with the kafka-agent; the
+// jail is this agent's own.
 package main
 
 import (
 	"context"
-	"crypto/subtle"
+	agentkit "enc-tool/agent-kit"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"unicode"
+	"time"
 )
 
 // ── request parameter coercion ────────────────────────────────────────────
@@ -134,8 +133,69 @@ func spawnsProcess(op string) bool {
 	return op == "search" || strings.HasPrefix(op, "git.")
 }
 
+// How many search hits one frame carries, how heavy it may get, and how long a
+// partial one waits.
+//
+// A scan used to send one frame per hit: one with the 5,000-hit cap was 5,000
+// frames, 5,000 JSON parses and 5,000 calls into the page's main thread, for a
+// list that repaints on a timer anyway. A batch goes out when it is full, when
+// it is heavy — a single line of minified JavaScript can be megabytes — or when
+// it has waited, and the timer is what keeps a slow scan showing what it has
+// found as it finds it, which is the whole reason hits are streamed at all.
+//
+// The TypeScript code-agent has the same three numbers (src/code-agent/main.ts):
+// the two must behave alike, and a test compares them through the same wire.
+const (
+	hitBatch      = 64
+	hitBatchBytes = 1 << 20
+	hitBatchDelay = 100 * time.Millisecond
+)
+
+// hitBatcher collects search hits into frames. Safe to use from two goroutines:
+// the scan calls add, and the waiting timer calls flush.
+type hitBatcher struct {
+	mu      sync.Mutex
+	pending []searchHit
+	bytes   int
+	timer   *time.Timer
+	send    func([]searchHit)
+}
+
+func (b *hitBatcher) add(h searchHit) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.pending = append(b.pending, h)
+	b.bytes += len(h.Text) + len(h.Path) + 64
+	if len(b.pending) >= hitBatch || b.bytes >= hitBatchBytes {
+		b.flushLocked()
+		return
+	}
+	if b.timer == nil {
+		b.timer = time.AfterFunc(hitBatchDelay, b.flush)
+	}
+}
+
+func (b *hitBatcher) flush() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.flushLocked()
+}
+
+func (b *hitBatcher) flushLocked() {
+	if b.timer != nil {
+		b.timer.Stop()
+		b.timer = nil
+	}
+	if len(b.pending) == 0 {
+		return
+	}
+	batch := b.pending
+	b.pending, b.bytes = nil, 0
+	b.send(batch)
+}
+
 type connection struct {
-	ws *wsConn
+	ws *agentkit.Conn
 
 	// The queue behind maxConcurrentProcs: a send takes a slot, a receive gives
 	// it back. Blocking on a full buffer is the wait, and it always ends —
@@ -152,7 +212,7 @@ func (c *connection) send(frame any) {
 	if err != nil {
 		return
 	}
-	_ = c.ws.sendText(b)
+	_ = c.ws.SendText(b)
 }
 
 type opCtx struct {
@@ -234,7 +294,7 @@ func init() {
 			}
 			return map[string]any{"text": text, "binary": binary}, nil
 		},
-		"git.blame": func(c *opCtx, p *req) (any, error) { return gitBlame(c.ctx, c.cwd, p.str("path")) },
+		"git.blame": func(c *opCtx, p *req) (any, error) { return gitBlame(c.ctx, c.cwd, p.str("path"), p.number("offset", 0), p.number("limit", 0)) },
 		"git.diff": func(c *opCtx, p *req) (any, error) {
 			path := p.str("path")
 			return gitDiffPair(c.ctx, c.cwd, path, p.str("kind"), func() *string {
@@ -342,6 +402,16 @@ func init() {
 
 		// ── search (streams hits) ──
 		"search": func(c *opCtx, p *req) (any, error) {
+			// Hits leave in batches; the numbers and the reason are where they
+			// are declared. flush is called from the waiting timer as well as
+			// from here, so it is the only place the batch and the timer are
+			// touched, and it is under the mutex.
+			b := &hitBatcher{send: func(hits []searchHit) {
+				c.chunk(map[string]any{"hits": hits})
+			}}
+			// Whatever the batch holds goes out before the reply does, and the
+			// timer never outlives the request.
+			defer b.flush()
 			return runSearch(c.ctx, c.jail, searchOpts{
 				query:      p.str("query"),
 				matchCase:  p.truthy("matchCase"),
@@ -350,8 +420,11 @@ func init() {
 				include:    p.str("include"),
 				exclude:    p.str("exclude"),
 				maxMatches: p.number("maxMatches", 0),
-			}, c.info.Ripgrep != nil, func(h searchHit) {
-				c.chunk(map[string]any{"hit": h})
+			}, c.info.Ripgrep != nil, b.add, func(p scanProgress) {
+				// How far the scan has got, while it runs: a large repository in
+				// the fallback engine is otherwise minutes of a page saying
+				// "searching…".
+				c.chunk(map[string]any{"progress": map[string]any{"scanned": p.scanned, "candidates": p.candidates}})
 			}), nil
 		},
 
@@ -418,20 +491,6 @@ func errCodeOf(err error) string {
 
 // ── HTTP ──────────────────────────────────────────────────────────────────
 
-// Origins trusted without being named on the command line: the port the web app
-// is served from by default (src/server.ts PORT), and nothing else.
-//
-// What this replaced was a pattern matching any loopback origin on any port,
-// which meant every other dev server on the machine — and script injected into
-// any of them — spoke to this code-agent with the same authority as the app itself.
-// A user serving the app elsewhere names it with --allow-origin: one flag,
-// against a whole class of silent access.
-var defaultOrigins = []string{"http://localhost:5000", "http://127.0.0.1:5000", "http://[::1]:5000"}
-
-// Names this code-agent answers to. net.SplitHostPort strips the brackets from an
-// IPv6 literal, so ::1 is stored without them.
-var loopbackHosts = map[string]bool{"127.0.0.1": true, "localhost": true, "::1": true}
-
 // workspace is one answer to "where is this code-agent pointed, and what is there" —
 // the jail, whether it is a repository, and what code-agent.info reports about it.
 //
@@ -454,69 +513,18 @@ type server struct {
 	ws     atomic.Pointer[workspace]
 	rootMu sync.Mutex
 
-	token   string
-	origins []string
-	// The port actually bound: the same as the one asked for today, but the name
-	// this code-agent answers to should be the one it actually got.
-	port          int
-	allowNoOrigin bool
-	allowMultiple bool
+	// The front door: token, origins, Host, the one-client lock. Shared with
+	// the kafka-agent (agent-kit-go), which must turn away exactly what this one does.
+	agentkit.Guard
+
 	// Folders code-agent.setRoot may move the workspace into. The startup root is
 	// always the first; --allow-root adds the rest. See setRoot below.
 	rerootBases []string
 
-	// Connections held right now. The lock in the /ws branch reads it, and the
-	// startup banner promises what it will do.
-	mu      sync.Mutex
-	clients int
 	// Live connections, so a reroot can re-aim watchers that are running on a
 	// folder this code-agent has left.
+	mu    sync.Mutex
 	conns map[*connection]bool
-	// Whether the current lock has already been reported. Reset when it lifts:
-	// a refused tab keeps reconnecting on a backoff, and a line every few
-	// seconds would bury the one event worth seeing.
-	refusalLogged bool
-}
-
-// take reserves a connection slot, or reports that the code-agent is already held.
-//
-// Counted before the handshake rather than after: between the check and a
-// completed upgrade there is room for a second request to have seen zero.
-func (s *server) take() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.allowMultiple && s.clients > 0 {
-		return false
-	}
-	s.clients++
-	return true
-}
-
-// logRefusalOnce reports that the lock turned a client away, the first time it
-// happens for the connection currently holding it.
-func (s *server) logRefusalOnce() {
-	s.mu.Lock()
-	first := !s.refusalLogged
-	s.refusalLogged = true
-	s.mu.Unlock()
-	if first {
-		lifecycle("refused a second client — this code-agent is locked to the one already connected (--allow-multiple lifts that); further attempts stay quiet until it disconnects")
-	}
-}
-
-// release gives the slot back and reports how many are still held.
-func (s *server) release() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.clients--
-	s.refusalLogged = false
-	return s.clients
-}
-
-func (s *server) held() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.clients
 }
 
 // setRoot moves the workspace to another folder without a restart.
@@ -592,7 +600,7 @@ func (s *server) setRoot(ctx context.Context, dir string) (any, error) {
 		}
 		c.mu.Unlock()
 	}
-	lifecycle("workspace is now " + next.root)
+	agentkit.Lifecycle("workspace is now " + next.root)
 	return &info, nil
 }
 
@@ -606,186 +614,13 @@ func (s *server) mayRoot(abs string) bool {
 	return false
 }
 
-// lifecycle reports a connection coming or going, on stderr rather than stdout.
-//
-// stdout carries exactly one thing scripts parse — the URL with the token — and
-// a line arriving there later, on somebody else's schedule, is the kind of
-// thing that breaks a pipe reader six months from now.
-func lifecycle(message string) {
-	fmt.Fprintf(os.Stderr, "code-agent: %s\n", printable(message))
-}
-
-// printable makes a value from a request safe to write to a terminal.
-//
-// The Origin and Host of a request are chosen by whoever sends it, and they are
-// echoed to the operator's terminal when refused. A control character in one is
-// not text there but an instruction: an escape sequence can move the cursor,
-// overwrite the lines above and make a refusal look like something else — or
-// like nothing. Every control character becomes "?", and a value longer than a
-// line is cut, so nothing sent over the socket can rewrite what the operator
-// reads.
-func printable(s string) string {
-	const longest = 300
-	out := make([]rune, 0, len(s))
-	for _, r := range s {
-		if len(out) == longest {
-			out = append(out, '…')
-			break
-		}
-		if unicode.IsControl(r) {
-			r = '?'
-		}
-		out = append(out, r)
-	}
-	return string(out)
-}
-
-// refuse logs why a request was turned away and reports it as not allowed.
-//
-// From the browser's side a rejected upgrade looks exactly like a code-agent that
-// is not running, so without this line the user goes off to debug a process
-// that is doing precisely what it was told.
-func refuse(what, value, hint string) bool {
-	if value == "" {
-		value = "(none)"
-	}
-	fmt.Fprintf(os.Stderr, "code-agent: refused %s %s — %s\n", printable(what), printable(value), printable(hint))
-	return false
-}
-
-func (s *server) originAllowed(origin string) bool {
-	if origin == "" {
-		// A browser always sends one. The absence of the header is therefore
-		// never the app, and it used to be the way past this check entirely.
-		if s.allowNoOrigin {
-			return true
-		}
-		return refuse("client with no Origin", "", "pass --allow-no-origin to permit non-browser clients")
-	}
-	trimmed := strings.TrimRight(origin, "/")
-	for _, o := range defaultOrigins {
-		if o == trimmed {
-			return true
-		}
-	}
-	for _, o := range s.origins {
-		if o == trimmed {
-			return true
-		}
-	}
-	return refuse("origin", origin, "pass --allow-origin "+origin)
-}
-
-// hostAllowed is the second lock, and the one that does not depend on the
-// browser volunteering a header we like.
-//
-// A page on attacker.example whose DNS answers 127.0.0.1 reaches this process
-// directly — DNS rebinding. Such a request carries the attacker's own Origin
-// and the check above refuses it, but that is one check, and under
-// --allow-no-origin there is no Origin to judge. The name the request arrived
-// under is the other half: the browser puts the rebound hostname in Host, and
-// that is never one of ours.
-func (s *server) hostAllowed(host string) bool {
-	expected := "127.0.0.1:" + strconv.Itoa(s.port)
-	if host == "" {
-		return refuse("request with no Host header", "", "expected "+expected)
-	}
-	name, port, err := net.SplitHostPort(host)
-	if err != nil {
-		return refuse("unparseable Host", host, "expected "+expected)
-	}
-	if loopbackHosts[name] && port == strconv.Itoa(s.port) {
-		return true
-	}
-	return refuse("Host", host, "this code-agent answers to "+expected+" only")
-}
-
-func (s *server) cors(w http.ResponseWriter, origin string) {
-	if origin == "" || !s.originAllowed(origin) {
-		return
-	}
-	h := w.Header()
-	h.Set("access-control-allow-origin", origin)
-	h.Set("access-control-allow-headers", "content-type")
-	// Forward-compat with Chrome's Private Network Access preflight, which
-	// would otherwise start blocking https -> loopback without warning.
-	h.Set("access-control-allow-private-network", "true")
-	h.Set("vary", "origin")
-}
-
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	origin := r.Header.Get("Origin")
-
-	// Before anything else, the preflight included: a request that reached this
-	// port under a name that is not ours gets nothing back, not even the CORS
-	// grant that would tell the page it is worth trying again.
-	if !s.hostAllowed(r.Host) {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	s.cors(w, origin)
-
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-
-	switch r.URL.Path {
-	case "/ping":
-		// Unauthenticated liveness probe: the UI's capability badge needs to
-		// tell "code-agent not running" apart from "wrong token", and this reveals
-		// nothing beyond the code-agent's presence to origins already on the list.
-		if !s.originAllowed(origin) {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		w.Header().Set("content-type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"codeAgent": "enc-tool", "version": version})
-
-	case "/ws":
-		// Order matters: the specific refusals first, so a foreign origin or a
-		// bad token still says so rather than "busy".
-		if !s.originAllowed(origin) {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		// Constant time: `!=` returns at the first differing byte, so how long a
-		// refusal takes says how much of a guess was right — a signal a page on
-		// another origin can measure through its own failed connections. The
-		// length is compared first and is not secret.
-		if subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("token")), []byte(s.token)) != 1 {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		if !s.take() {
-			s.logRefusalOnce()
-			http.Error(w, "code-agent busy", http.StatusConflict)
-			return
-		}
-		ws, err := wsUpgrade(w, r)
-		if err != nil {
-			s.release()
-			http.Error(w, "upgrade failed", http.StatusBadRequest)
-			return
-		}
-		s.serveConn(ws, origin)
-
-	default:
-		http.Error(w, "not found", http.StatusNotFound)
-	}
+	s.Serve(w, r, s.serveConn)
 }
 
-func (s *server) serveConn(ws *wsConn, origin string) {
-	if origin == "" {
-		origin = "(no Origin)"
-	}
-	if s.allowMultiple {
-		lifecycle(fmt.Sprintf("client connected — %s (%d connected)", origin, s.held()))
-	} else {
-		lifecycle(fmt.Sprintf("client connected — %s — locked: no other client until this one disconnects", origin))
-	}
-
+// serveConn runs one client's session. agentkit.Guard has already checked it,
+// holds its slot, and closes the socket when this returns.
+func (s *server) serveConn(ws *agentkit.Conn, _ string) {
 	conn := &connection{
 		ws:       ws,
 		slots:    make(chan struct{}, maxConcurrentProcs),
@@ -801,13 +636,6 @@ func (s *server) serveConn(ws *wsConn, origin string) {
 		s.mu.Lock()
 		delete(s.conns, conn)
 		s.mu.Unlock()
-		left := s.release()
-		if s.allowMultiple {
-			lifecycle(fmt.Sprintf("client disconnected — %s (%d connected)", origin, left))
-		} else {
-			lifecycle(fmt.Sprintf("client disconnected — %s — unlocked, accepting a connection again", origin))
-		}
-		ws.close()
 		conn.mu.Lock()
 		if conn.watcher != nil {
 			conn.watcher.close()
@@ -822,11 +650,11 @@ func (s *server) serveConn(ws *wsConn, origin string) {
 	}()
 
 	for {
-		opcode, payload, err := ws.readMessage()
+		opcode, payload, err := ws.ReadMessage()
 		if err != nil {
 			return
 		}
-		if opcode != opText {
+		if opcode != agentkit.OpText {
 			continue
 		}
 		var params map[string]json.RawMessage
@@ -908,54 +736,4 @@ func (s *server) dispatch(conn *connection, r *req) {
 		}
 		conn.send(resOK{ID: r.id, OK: true, Data: data})
 	}()
-}
-
-// listenLoopback binds 127.0.0.1 only. Port 0 asks the OS to choose, and the
-// chosen port is read back off the listener for the banner.
-func listenLoopback(port int) (net.Listener, error) {
-	return net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(port))
-}
-
-// listen binds the first free port in the range, or the one --port named, and
-// stops with a sentence rather than a stack trace when there is none.
-//
-// Running a second code-agent on a second folder is an ordinary thing to do, and
-// what used to happen is that it stopped dead on "address already in use",
-// leaving the user to pick a port by hand — and then to find out that the page
-// is only allowed to reach some of them. Walking the range is that decision
-// made once, here.
-//
-// An explicit --port is never second-guessed. It names a port, and quietly
-// serving a different one would hand this folder to a tab that asked for
-// somebody else's.
-func listen(o options) net.Listener {
-	candidates := []int{o.port}
-	if !o.portExplicit {
-		candidates = candidates[:0]
-		for p := codeAgentPortMin; p <= codeAgentPortMax; p++ {
-			candidates = append(candidates, p)
-		}
-	}
-
-	var last error
-	for _, p := range candidates {
-		l, err := listenLoopback(p)
-		if err == nil {
-			return l
-		}
-		// Any refusal moves on to the next candidate rather than stopping: a
-		// taken port is not reported as the same errno on every platform, and
-		// the last error is still reported if none of them work.
-		last = err
-	}
-
-	if o.portExplicit {
-		fmt.Fprintf(os.Stderr, "code-agent: cannot listen on 127.0.0.1:%d: %v\n", o.port, last)
-		fmt.Fprintf(os.Stderr, "code-agent: drop --port and the code-agent takes the first free port in %s\n", codeAgentPortRange)
-	} else {
-		fmt.Fprintf(os.Stderr, "code-agent: no free loopback port in %s: %v\n", codeAgentPortRange, last)
-		fmt.Fprintln(os.Stderr, "code-agent: stop a code-agent you are done with, or pass --port <n> and start the web app with CODE_AGENT_PORTS naming that port")
-	}
-	os.Exit(1)
-	return nil
 }

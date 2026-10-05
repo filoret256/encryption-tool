@@ -1,0 +1,104 @@
+# A single-broker Kafka (KRaft) with one listener per kind of connection the
+# kafka-agent supports. For trying the agent by hand and for the wire smoke test.
+#
+#   go run ./cmd/testpki -out testdata/pki       # certificates, stores, client configs
+#   docker compose -f testdata/compose.yaml up -d
+#   kafka-agent --config testdata/pki/kafka-agent.yaml
+#
+# On another machine (a VM, say) the broker has to advertise that machine's address, or
+# a client is sent back to "localhost" after its first request:
+#
+#   KAFKA_HOST=192.168.56.111 docker compose -f testdata/compose.yaml up -d
+#
+# The certificates are issued for localhost, 127.0.0.1 and kafka, so over such an address a
+# client has to skip the hostname check (ssl.endpoint.identification.algorithm= empty).
+#
+# host port  listener         what the client needs
+# 19092      PLAINTEXT        nothing
+# 19093      SSL              trust the CA and present a client certificate (mTLS)
+# 19094      SASL_PLAINTEXT   SCRAM login   user app / app-secret
+# 19095      SASL_SSL         trust the CA and SCRAM login
+#
+# Not run in CI, and not pinned by digest like the production images: it is a
+# development fixture. The tag is the last one this file was written against.
+
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    hostname: kafka
+    ports:
+      - "19092:9092"
+      - "19093:9093"
+      - "19094:9094"
+      - "19095:9095"
+    volumes:
+      - ./pki:/etc/kafka/secrets:ro
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      # The image's start script refuses to go on with SASL enabled unless this is set; the
+      # logins themselves are per listener (the JAAS lines below), so the value is a formality.
+      KAFKA_OPTS: "-Dfile.encoding=UTF-8"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9091
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LISTENERS: INTERNAL://:9090,CONTROLLER://:9091,PLAINTEXT://:9092,SSL://:9093,SASL_PLAINTEXT://:9094,SASL_SSL://:9095
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9090,PLAINTEXT://${KAFKA_HOST:-localhost}:19092,SSL://${KAFKA_HOST:-localhost}:19093,SASL_PLAINTEXT://${KAFKA_HOST:-localhost}:19094,SASL_SSL://${KAFKA_HOST:-localhost}:19095
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SSL:SSL,SASL_PLAINTEXT:SASL_PLAINTEXT,SASL_SSL:SASL_SSL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # TLS: the broker's own certificate, and the CA it trusts for clients.
+      # The image's start script insists on these six names: file names are
+      # relative to /etc/kafka/secrets, and each *_CREDENTIALS file holds a
+      # password. It derives the *_LOCATION and *_PASSWORD settings from them.
+      KAFKA_SSL_KEYSTORE_FILENAME: server.p12
+      KAFKA_SSL_KEYSTORE_CREDENTIALS: store-password
+      KAFKA_SSL_KEY_CREDENTIALS: store-password
+      KAFKA_SSL_TRUSTSTORE_FILENAME: truststore.p12
+      KAFKA_SSL_TRUSTSTORE_CREDENTIALS: store-password
+      KAFKA_SSL_KEYSTORE_TYPE: PKCS12
+      KAFKA_SSL_TRUSTSTORE_TYPE: PKCS12
+      # The script derives the truststore's location and password from the two names above
+      # only when KAFKA_SSL_CLIENT_AUTH is set for the whole broker. Here it is set on the SSL
+      # listener alone, so without these two the broker has no truststore and turns every
+      # client certificate away. "changeit" is testpki.StorePassword, the same as store-password.
+      KAFKA_SSL_TRUSTSTORE_LOCATION: /etc/kafka/secrets/truststore.p12
+      KAFKA_SSL_TRUSTSTORE_PASSWORD: changeit
+      KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: ""
+      # Only the SSL listener demands a client certificate; SASL_SSL logs in with SCRAM.
+      KAFKA_LISTENER_NAME_SSL_SSL_CLIENT_AUTH: required
+
+      # SCRAM on the two SASL listeners. Env names: "." is "_", "_" is "__", "-" is "___".
+      KAFKA_SASL_ENABLED_MECHANISMS: SCRAM-SHA-256,SCRAM-SHA-512
+      KAFKA_LISTENER_NAME_SASL__PLAINTEXT_SCRAM___SHA___256_SASL_JAAS_CONFIG: org.apache.kafka.common.security.scram.ScramLoginModule required;
+      KAFKA_LISTENER_NAME_SASL__PLAINTEXT_SCRAM___SHA___512_SASL_JAAS_CONFIG: org.apache.kafka.common.security.scram.ScramLoginModule required;
+      KAFKA_LISTENER_NAME_SASL__SSL_SCRAM___SHA___256_SASL_JAAS_CONFIG: org.apache.kafka.common.security.scram.ScramLoginModule required;
+      KAFKA_LISTENER_NAME_SASL__SSL_SCRAM___SHA___512_SASL_JAAS_CONFIG: org.apache.kafka.common.security.scram.ScramLoginModule required;
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9092"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+
+  # Creates the SCRAM user, a topic and a few messages, then exits.
+  seed:
+    image: apache/kafka:3.9.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        B=/opt/kafka/bin
+        # One mechanism per request: Kafka 3.9 refuses to alter a user's credential twice in one.
+        for m in SCRAM-SHA-256 SCRAM-SHA-512; do
+          $$B/kafka-configs.sh --bootstrap-server kafka:9090 --alter --entity-type users --entity-name app \
+            --add-config "$$m=[password=app-secret]"
+        done
+        $$B/kafka-topics.sh --bootstrap-server kafka:9090 --create --if-not-exists --topic demo --partitions 3 --replication-factor 1
+        printf 'k1:hello\nk2:world\nk3:{"json":true}\n' | $$B/kafka-console-producer.sh \
+          --bootstrap-server kafka:9090 --topic demo --property parse.key=true --property key.separator=:

@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	agentkit "enc-tool/agent-kit"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -10,7 +11,6 @@ import (
 	"net"
 	"os/exec"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -100,28 +100,6 @@ func TestWorkspaceSnapshotsNeverTear(t *testing.T) {
 	}
 }
 
-// ── printable ─────────────────────────────────────────────────────────────
-
-func TestPrintableNeutralisesWhatATerminalWouldObey(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"http://localhost:5000", "http://localhost:5000"},
-		{"пароль ключ 日本語", "пароль ключ 日本語"},
-		{"evil\x1b[2J\x1b[Hfake", "evil?[2J?[Hfake"}, // escape sequences
-		{"two\nlines\r\nhere", "two?lines??here"},    // a value that starts a fresh line
-		{"c1\u009bcontrol\x7f", "c1?control?"},       // C1 CSI and DEL
-		{"", ""},
-	}
-	for _, c := range cases {
-		if got := printable(c.in); got != c.want {
-			t.Errorf("printable(%q) = %q, want %q", c.in, got, c.want)
-		}
-	}
-	long := printable(strings.Repeat("x", 1000))
-	if r := []rune(long); len(r) != 301 || r[300] != '…' {
-		t.Errorf("a long value should be cut at 300 runes plus an ellipsis, got %d runes", len(r))
-	}
-}
-
 // ── requests in flight ────────────────────────────────────────────────────
 
 // frames decodes the server's text frames off the client end of the pipe.
@@ -155,7 +133,7 @@ func frames(c net.Conn) <-chan map[string]any {
 				return
 			}
 			var m map[string]any
-			if h[0]&0x0f == opText && json.Unmarshal(payload, &m) == nil {
+			if h[0]&0x0f == agentkit.OpText && json.Unmarshal(payload, &m) == nil {
 				out <- m
 			}
 		}
@@ -202,7 +180,7 @@ func testConn(t *testing.T, isRepo bool) (*server, *connection, <-chan map[strin
 	j := &jail{root: t.TempDir()}
 	s.ws.Store(&workspace{jail: j, isRepo: isRepo, info: &codeAgentInfo{Root: j.root}})
 	conn := &connection{
-		ws:       &wsConn{conn: side},
+		ws:       agentkit.NewConn(side),
 		slots:    make(chan struct{}, maxConcurrentProcs),
 		inflight: map[int64]context.CancelFunc{},
 	}

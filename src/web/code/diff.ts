@@ -8,14 +8,15 @@
  *  resolving a conflict, and conflicts are edited in the normal editor where
  *  git has already written the markers.
  */
-import { EditorState, Text, type Extension } from "@codemirror/state";
+import { Compartment, EditorState, type Extension } from "@codemirror/state";
 import { EditorView, lineNumbers } from "@codemirror/view";
-import { Chunk, MergeView, goToNextChunk, goToPreviousChunk, unifiedMergeView } from "@codemirror/merge";
+import { MergeView, getChunks, goToNextChunk, goToPreviousChunk, unifiedMergeView } from "@codemirror/merge";
 import { defaultHighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { oneDarkHighlightStyle } from "@codemirror/theme-one-dark";
 import type { DiffPair } from "../../code-agent/protocol.ts";
 import { grammarFor } from "./grammars.ts";
 import { cmBase, cmDark } from "../cm-theme.ts";
+import { cspNonce } from "../csp.ts";
 import { esc, startTrimmed } from "./ui.ts";
 
 // Everything but the type size comes from cmBase now. A diff is read, not
@@ -73,6 +74,13 @@ export class DiffView {
    *  after the last one they looked at. */
   private at = 0;
   private chunkCount = 0;
+  /** How many changes the last pair had, by the pair: a redraw for the width of the window, or
+   *  for the mode, shows the number at once instead of waiting for the view to count again. */
+  private counted: { before: string; after: string; n: number } | null = null;
+  /** The colours of the editors, which a change of theme swaps in place. Rebuilding the view for it
+   *  meant the diff of both files was worked out again to draw the same changes in other colours. */
+  private readonly cDark = new Compartment();
+  private readonly cHighlight = new Compartment();
   /** Set while the working side may be edited — see show(). */
   private onEdit: ((text: string) => void) | undefined;
   /** What "stage this change" does here, when the caller offers it. */
@@ -98,7 +106,10 @@ export class DiffView {
         <button class="t-icon js-next" type="button" title="Next change (F7)">▼</button>
         <button class="t-btn js-hunk-apply" type="button" hidden></button>
         <button class="t-icon js-swap" type="button" title="Swap the sides" hidden>⇄</button>
-        <button class="t-btn js-mode" type="button">inline</button>
+        <span class="kf-seg" role="group" aria-label="Layout">
+          <button class="t-btn js-mode-split" type="button" aria-pressed="true">split</button>
+          <button class="t-btn js-mode-inline" type="button" aria-pressed="false">inline</button>
+        </span>
       </div>
       <div class="diff-columns js-columns" hidden>
         <span class="diff-col js-col-a"></span>
@@ -107,13 +118,17 @@ export class DiffView {
       <div class="diff-body"></div>`;
     this.header = host.querySelector(".diff-head")!;
     this.body = host.querySelector(".diff-body")!;
-    this.header.querySelector(".js-mode")!.addEventListener("click", () => {
-      // Toggling while the window is forcing inline switches the *preference*,
-      // which takes effect the moment there is room for it again.
-      this.mode = this.effectiveMode === "split" ? "unified" : "split";
-      saveMode(this.mode);
+    // Each button states the layout it gives, so the pair shows the current one. Choosing
+    // split while the window is forcing inline sets the *preference*, which takes effect the
+    // moment there is room for it again.
+    const choose = (mode: DiffMode): void => {
+      if (this.mode === mode && !this.narrow) return;
+      this.mode = mode;
+      saveMode(mode);
       this.render();
-    });
+    };
+    this.header.querySelector(".js-mode-split")!.addEventListener("click", () => choose("split"));
+    this.header.querySelector(".js-mode-inline")!.addEventListener("click", () => choose("unified"));
     this.header.querySelector(".js-swap")!.addEventListener("click", () => this.onSwap?.());
     this.header.querySelector(".js-hunk-apply")!.addEventListener("click", () => void this.applyCurrentHunk());
     this.header.querySelector(".js-next")!.addEventListener("click", () => this.step(1));
@@ -159,17 +174,22 @@ export class DiffView {
   }
 
   private updateModeButton(): void {
-    const btn = this.header.querySelector<HTMLButtonElement>(".js-mode")!;
-    btn.textContent = this.effectiveMode === "split" ? "inline" : "side-by-side";
-    // Three things this button has to say, in order of what the reader needs:
-    // that the window is the reason for the current shape; that per-chunk
-    // buttons live in the inline view; and otherwise just what it does.
-    btn.title = this.narrow && this.mode === "split"
+    const split = this.header.querySelector<HTMLButtonElement>(".js-mode-split")!;
+    const inline = this.header.querySelector<HTMLButtonElement>(".js-mode-inline")!;
+    const effective = this.effectiveMode;
+    for (const [btn, on] of [[split, effective === "split"], [inline, effective !== "split"]] as const) {
+      btn.classList.toggle("is-active", on);
+      btn.setAttribute("aria-pressed", String(on));
+    }
+    // What a button has to say, in order of what the reader needs: that the window is the
+    // reason for the current shape; that per-chunk buttons live in the inline view; and
+    // otherwise what the layout is.
+    const forced = this.narrow && this.mode === "split";
+    split.title = forced
       ? "The window is too narrow for two columns — widen it to get side-by-side back"
-      : this.onEdit && this.effectiveMode === "split"
-        ? "Switch to inline to revert individual changes"
-        : "Switch the diff layout";
-    btn.classList.toggle("is-forced", this.narrow && this.mode === "split");
+      : "Side by side: the older text on the left, the newer on the right";
+    inline.title = this.onEdit && effective === "split" ? "Inline, to revert individual changes" : "Inline: one column, the changes in place";
+    split.classList.toggle("is-forced", forced);
   }
 
   /** What the view actually draws, which is the stored preference unless the
@@ -283,7 +303,12 @@ export class DiffView {
 
   setTheme(dark: boolean): void {
     this.dark = dark;
-    if (this.pair) this.render();
+    const effects = [this.cDark.reconfigure(cmDark(dark)), this.cHighlight.reconfigure(this.highlight())];
+    for (const view of [this.merge?.a, this.merge?.b, this.single]) view?.dispatch({ effects });
+  }
+
+  private highlight(): Extension {
+    return syntaxHighlighting(this.dark ? oneDarkHighlightStyle : defaultHighlightStyle);
   }
 
   private dispose(): void {
@@ -297,12 +322,15 @@ export class DiffView {
     const lang = grammarFor(path);
     return [
       lineNumbers(),
+      // Every editor of a diff carries the nonce itself. The <style> a view mounts is admitted by it,
+      // and whichever view mounts first is the one that decides whether the styles are dropped: the
+      // schema diff (kafka-diff.js) has no other editor on the page to have done it before.
+      EditorView.cspNonce.of(cspNonce),
       cmBase,
       theme,
-      // Rebuilt rather than reconfigured on a theme switch — `setTheme` re-runs
-      // `render()` — so this needs no compartment, unlike the two editors.
-      cmDark(this.dark),
-      syntaxHighlighting(this.dark ? oneDarkHighlightStyle : defaultHighlightStyle),
+      // In compartments, so that a theme switch changes the colours of the views that are there.
+      this.cDark.of(cmDark(this.dark)),
+      this.cHighlight.of(this.highlight()),
       // Read-only unless the caller asked for the working side to be editable:
       // a diff is normally something you read, and an accidental keystroke in
       // one should not become a change to a file.
@@ -391,7 +419,16 @@ export class DiffView {
     // strict comparison this used to do let such a file through as a diff —
     // two identical-looking columns, no highlighting, and nothing saying why.
     const normalise = (s: string): string => s.replace(/\r\n/g, "\n").replace(/\n+$/, "");
-    if (normalise(before) === normalise(after)) {
+    // Two copies of both texts, to compare them — only when they could be equal after it. A text
+    // with no carriage return and the same run of newlines at its end is changed by normalising
+    // in no way at all, so then they are the same exactly when they are the same already.
+    const trailing = (s: string): number => {
+      let n = 0;
+      while (n < s.length && s.charCodeAt(s.length - 1 - n) === 10) n++;
+      return n;
+    };
+    const couldMatch = before.includes("\r") || after.includes("\r") || trailing(before) !== trailing(after);
+    if (before === after || (couldMatch && normalise(before) === normalise(after))) {
       const onlyWhitespace = before !== after;
       this.body.innerHTML = `<div class="diff-note">No changes — ${esc(pair.beforeLabel)} and ${esc(pair.afterLabel)} are identical${
         onlyWhitespace ? ", apart from line endings" : ""
@@ -399,10 +436,13 @@ export class DiffView {
       return;
     }
 
-    // How many changes there are, counted the same way the view groups them,
-    // so the number matches what the reader is about to walk through.
-    this.chunkCount = Chunk.build(Text.of(before.split("\n")), Text.of(after.split("\n"))).length;
-    this.updateCount();
+    // The number of changes is the view's own, read once it exists (below): it used to be worked
+    // out here from both whole texts, and then again by the view. A pair seen before has it already.
+    const seen = this.counted;
+    if (seen && seen.before === before && seen.after === after) {
+      this.chunkCount = seen.n;
+      this.updateCount();
+    }
 
     // collapseUnchanged keeps long files navigable; margin leaves a few lines of
     // context around every change so a hunk is never shown without its bearings.
@@ -418,6 +458,7 @@ export class DiffView {
         gutter: true,
       });
       this.linkHorizontalScroll();
+      this.chunkCount = this.merge.chunks.length;
     } else {
       const editable = Boolean(this.onEdit);
       this.single = new EditorView({
@@ -440,6 +481,9 @@ export class DiffView {
           ],
         }),
       });
+      this.chunkCount = getChunks(this.single.state)?.chunks.length ?? 0;
     }
+    this.counted = { before, after, n: this.chunkCount };
+    this.updateCount();
   }
 }

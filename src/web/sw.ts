@@ -49,7 +49,8 @@ const CACHE = `enc-tool-v${VERSION}`;
 // this list on purpose: it is the largest asset in the app and it belongs to
 // one of three tabs, so precaching it made everyone who came to decrypt a
 // string pay for the editor. It is cached the same way as everything else the
-// moment the code tab is opened — see the fetch handler below.
+// moment the code tab is opened — see the fetch handler below. kafka.js, the
+// kafka tab's chunk, is left off for the same reason.
 const SHELL = [
   "/",
   "/public/main.js",

@@ -122,7 +122,13 @@ export type MenuEntry = MenuItem | [string, () => void];
 
 const asItem = (entry: MenuEntry): MenuItem => (Array.isArray(entry) ? { label: entry[0], run: entry[1] } : entry);
 
+/** Closes the menu on screen, with its listeners; null when there is none. */
+let closeOpenMenu: (() => void) | null = null;
+
 export function showMenu(x: number, y: number, entries: MenuEntry[]): void {
+  // Closed, not just removed from the page: a removed menu's key handler would stay
+  // registered and keep answering Escape and the arrows until the next click.
+  closeOpenMenu?.();
   document.querySelector(".ctx-menu")?.remove();
   const items = entries.map(asItem);
   // Where focus was, so Escape (or picking something) can put it back rather
@@ -135,12 +141,19 @@ export function showMenu(x: number, y: number, entries: MenuEntry[]): void {
   menu.style.left = `${x}px`;
   menu.style.top = `${y}px`;
 
+  let armTimer: ReturnType<typeof setTimeout> | undefined;
   const close = (restoreFocus: boolean): void => {
+    clearTimeout(armTimer); // closed before the outside listeners were added: they never are
     menu.remove();
     document.removeEventListener("keydown", onKey, true);
     document.removeEventListener("contextmenu", onOutsideContext, true);
+    document.removeEventListener("click", onOutsideClick);
+    if (closeOpenMenu === closeThis) closeOpenMenu = null;
     if (restoreFocus) opener?.focus?.();
   };
+  const closeThis = (): void => close(false);
+  closeOpenMenu = closeThis;
+  const onOutsideClick = (): void => close(false);
 
   const buttons: HTMLButtonElement[] = [];
   for (const item of items) {
@@ -207,11 +220,10 @@ export function showMenu(x: number, y: number, entries: MenuEntry[]): void {
     menu.style.top = above >= 4 ? `${above}px` : `${Math.max(4, innerHeight - r.height - 4)}px`;
   }
   live()[0]?.focus();
-  setTimeout(() => {
+  armTimer = setTimeout(() => {
     // A right-click elsewhere should move the menu, not leave two of them
-    // behind: showMenu removes the old element, but its key handler would stay
-    // registered and keep answering Escape and the arrows.
-    document.addEventListener("click", () => close(false), { once: true });
+    // behind: showMenu closes the old one, handlers included.
+    document.addEventListener("click", onOutsideClick);
     document.addEventListener("contextmenu", onOutsideContext, true);
   });
 
@@ -236,7 +248,7 @@ export function showMenu(x: number, y: number, entries: MenuEntry[]): void {
  *
  *  Returns the cleanup, which also restores focus to whatever opened it.
  */
-function trapFocus(container: HTMLElement): () => void {
+export function trapFocus(container: HTMLElement): () => void {
   const opener = document.activeElement as HTMLElement | null;
   const focusable = (): HTMLElement[] =>
     [...container.querySelectorAll<HTMLElement>("button, input, select, textarea, [tabindex]:not([tabindex='-1'])")].filter(
@@ -269,7 +281,7 @@ function trapFocus(container: HTMLElement): () => void {
 
 /** Mark a dialog for assistive technology: it is a dialog, it is modal, and
  *  this is what it is called. */
-function markDialog(form: HTMLElement, labelledBy: HTMLElement | null): void {
+export function markDialog(form: HTMLElement, labelledBy: HTMLElement | null): void {
   form.setAttribute("role", "dialog");
   form.setAttribute("aria-modal", "true");
   if (labelledBy) {

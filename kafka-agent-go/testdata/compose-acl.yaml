@@ -1,0 +1,130 @@
+# A second, separate single-broker Kafka (KRaft) that has an authorizer: everything
+# compose.yaml does, plus ACLs, so that a right the login does not have can be seen
+# arriving at the page as the broker's own sentence. Its own host ports, so the stand
+# beside it (compose.yaml, 19092-19095) keeps running untouched.
+#
+#   go run ./cmd/testpki -out testdata/pki       # certificates, stores, client configs
+#   ACL_HOST=192.168.56.111 ACL_ADMIN_PASSWORD=... ACL_APP_PASSWORD=... \
+#     docker compose -f testdata/compose-acl.yaml up -d
+#   ACL_HOST=... ACL_ADMIN_PASSWORD=... ACL_APP_PASSWORD=... \
+#     kafka-agent --config testdata/acl/kafka-agent.yaml
+#
+# Two logins, both SCRAM-SHA-512:
+#
+#   admin   a super user of the broker (super.users): everything, including Create
+#   app     every operation on every topic except Create, and everything on every group: it
+#           may read, write, alter and delete, but not create a topic. Create on the topic
+#           would have been enough for that (Kafka takes it for the named topic), which is
+#           why the list is spelled out instead of "All".
+#
+# The seed reaches the broker over the INTERNAL listener, whose principal is ANONYMOUS;
+# super.users makes it a super user too. No plaintext listener is published, so no client
+# can arrive as ANONYMOUS — the two SASL listeners below are the only way in.
+#
+# host port  listener         what the client needs
+# 19192      SASL_PLAINTEXT   SCRAM login (admin or app)
+# 19193      SASL_SSL         trust the CA and SCRAM login
+#
+# Not run in CI, and not pinned by digest: it is a development fixture. The tag is the
+# last one this file was written against.
+#
+# The project name is set here on purpose: without it compose takes the directory's name,
+# which is the same "testdata" the other stand uses — and starting this file would then
+# recreate that stand's container out from under it.
+
+name: kafka-acl
+
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    hostname: kafka
+    ports:
+      - "19192:9092"
+      - "19193:9093"
+    volumes:
+      - ./pki:/etc/kafka/secrets:ro
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_OPTS: "-Dfile.encoding=UTF-8"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9091
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LISTENERS: INTERNAL://:9090,CONTROLLER://:9091,SASL_PLAINTEXT://:9092,SASL_SSL://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9090,SASL_PLAINTEXT://${ACL_HOST:-localhost}:19192,SASL_SSL://${ACL_HOST:-localhost}:19193
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,SASL_PLAINTEXT:SASL_PLAINTEXT,SASL_SSL:SASL_SSL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # The authorizer. Without allow.everyone a principal with no ACL at all is refused
+      # everything, which is what makes the two logins below matter.
+      KAFKA_AUTHORIZER_CLASS_NAME: org.apache.kafka.metadata.authorizer.StandardAuthorizer
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "false"
+      KAFKA_SUPER_USERS: "User:ANONYMOUS;User:admin"
+
+      # TLS for the SASL_SSL listener: the broker's certificate and nothing else — a
+      # client logs in with SCRAM there, and presents no certificate.
+      KAFKA_SSL_KEYSTORE_FILENAME: server.p12
+      KAFKA_SSL_KEYSTORE_CREDENTIALS: store-password
+      KAFKA_SSL_KEY_CREDENTIALS: store-password
+      KAFKA_SSL_TRUSTSTORE_FILENAME: truststore.p12
+      KAFKA_SSL_TRUSTSTORE_CREDENTIALS: store-password
+      KAFKA_SSL_KEYSTORE_TYPE: PKCS12
+      KAFKA_SSL_TRUSTSTORE_TYPE: PKCS12
+      KAFKA_SSL_TRUSTSTORE_LOCATION: /etc/kafka/secrets/truststore.p12
+      KAFKA_SSL_TRUSTSTORE_PASSWORD: changeit
+      KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: ""
+
+      # SCRAM on both listeners. Env names: "." is "_", "_" is "__", "-" is "___".
+      KAFKA_SASL_ENABLED_MECHANISMS: SCRAM-SHA-512
+      KAFKA_LISTENER_NAME_SASL__PLAINTEXT_SCRAM___SHA___512_SASL_JAAS_CONFIG: org.apache.kafka.common.security.scram.ScramLoginModule required;
+      KAFKA_LISTENER_NAME_SASL__SSL_SCRAM___SHA___512_SASL_JAAS_CONFIG: org.apache.kafka.common.security.scram.ScramLoginModule required;
+    healthcheck:
+      test: ["CMD", "/opt/kafka/bin/kafka-broker-api-versions.sh", "--bootstrap-server", "localhost:9090"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+
+  # Creates the two logins, their ACLs, a topic with messages, and then exits. Everything
+  # here goes over the INTERNAL listener as the super user ANONYMOUS.
+  seed:
+    image: apache/kafka:3.9.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      # Compose substitutes these into the container's environment; the script below reads
+      # them as $$ACL_..., which compose turns back into a shell variable reference.
+      ACL_ADMIN_PASSWORD: ${ACL_ADMIN_PASSWORD:?set ACL_ADMIN_PASSWORD}
+      ACL_APP_PASSWORD: ${ACL_APP_PASSWORD:?set ACL_APP_PASSWORD}
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        B=/opt/kafka/bin
+        test -n "$$ACL_ADMIN_PASSWORD" || { echo "ACL_ADMIN_PASSWORD is empty" >&2; exit 1; }
+        test -n "$$ACL_APP_PASSWORD" || { echo "ACL_APP_PASSWORD is empty" >&2; exit 1; }
+        for u in admin app; do
+          case "$$u" in
+            admin) pw="$$ACL_ADMIN_PASSWORD" ;;
+            app)   pw="$$ACL_APP_PASSWORD" ;;
+          esac
+          $$B/kafka-configs.sh --bootstrap-server kafka:9090 --alter --entity-type users --entity-name "$$u" \
+            --add-config "SCRAM-SHA-512=[password=$$pw]"
+        done
+        # A topic to read from, made by the super user: app has no right to make one.
+        $$B/kafka-topics.sh --bootstrap-server kafka:9090 --create --if-not-exists --topic demo --partitions 3 --replication-factor 1
+        printf 'k1:hello\nk2:world\nk3:{"json":true}\n' | $$B/kafka-console-producer.sh \
+          --bootstrap-server kafka:9090 --topic demo --property parse.key=true --property key.separator=:
+        # app: everything a topic or a group can be asked for — and no Create. Kafka takes a
+        # CREATE on the topic itself as enough to create that topic, so "All on topics" would
+        # have let app create one after all; Create is left out on purpose. One --operation
+        # per operation: this build's kafka-acls.sh does not take a list.
+        $$B/kafka-acls.sh --bootstrap-server kafka:9090 --add --allow-principal User:app \
+          --operation Read --operation Write --operation Delete --operation Describe \
+          --operation DescribeConfigs --operation AlterConfigs --topic '*'
+        $$B/kafka-acls.sh --bootstrap-server kafka:9090 --add --allow-principal User:app \
+          --operation Read --operation Describe --operation Delete --group '*'
+        $$B/kafka-acls.sh --bootstrap-server kafka:9090 --list

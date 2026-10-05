@@ -17,6 +17,14 @@ import { readFile } from "node:fs/promises";
 const TS_FILE = "src/code-agent/protocol.ts";
 const GO_FILE = "code-agent-go/protocol.go";
 
+// The kafka-agent is held to the same standard, by the same two comparisons:
+// every interface against its struct, and the op table against the ops the Go
+// agent registers. Its op table is typed rather than read out of handlers —
+// see checkKafka() below.
+const KAFKA_TS_FILE = "src/kafka-agent/protocol.ts";
+const KAFKA_GO_FILE = "kafka-agent-go/protocol.go";
+const KAFKA_GO_OPS_FILE = "kafka-agent-go/server.go";
+
 /** Frame envelopes the Go code-agent handles without a tagged struct. Listed
  *  explicitly so the omission is a decision on the record rather than a gap
  *  nobody noticed.
@@ -193,10 +201,106 @@ for (const [name, tsP] of tsOps) {
 }
 console.log(`  ok    ${String(opsCompared).padStart(3)} op(s), same names, same parameters`);
 
+// ── the kafka-agent ───────────────────────────────────────────────────────
+
+/** The same envelopes as the code-agent's, plus the op table itself. */
+const KAFKA_NOT_MIRRORED: Record<string, string> = {
+  Req: "decoded from the raw frame — the params are op-specific",
+  Chunk: "built as chunkFrame",
+  Push: "built as pushFrame",
+  KafkaOps: "the op table, compared below",
+};
+
+/** `"topics.list": { params: ClusterParams; ...` -> op name -> parameter type. */
+function kafkaTsOps(source: string): Map<string, string> {
+  const block = /export interface KafkaOps\s*\{([\s\S]*?)\n\}/.exec(source);
+  if (!block) throw new Error(`${KAFKA_TS_FILE} has no KafkaOps interface — the format changed`);
+  const out = new Map<string, string>();
+  for (const m of decomment(block[1]).matchAll(/"([A-Za-z.]+)":\s*\{\s*params:\s*(\w+);/g)) out.set(m[1], m[2]);
+  return out;
+}
+
+/** `"topics.list": readOp(typed[clusterParams](...))` -> op name -> parameter type. The
+ *  type argument is the whole of an op's contract, which is why the Go table is
+ *  written that way and not with handlers that read their own parameters.
+ *
+ *  Every entry says `readOp` or `writeOp`. Go will not compile an entry without one,
+ *  but a write that was marked a read compiles, and passes the read-only gate too — so
+ *  the marks are collected here as well (`marks`: op name -> readOp | writeOp), and an
+ *  entry with none is reported. */
+function kafkaGoOps(source: string, marks: Map<string, string> = new Map()): Map<string, string> {
+  const body = source.slice(source.indexOf("ops = map[string]opEntry{"));
+  const out = new Map<string, string>();
+  for (const m of decomment(body).matchAll(/"([A-Za-z.]+)":\s*(?:(readOp|writeOp)\()?typed\[(\w+)\]/g)) {
+    out.set(m[1], m[3]);
+    if (m[2]) marks.set(m[1], m[2]);
+  }
+  return out;
+}
+
+async function checkKafka(): Promise<void> {
+  const kts = parseTs(await readFile(KAFKA_TS_FILE, "utf8"));
+  const kgo = parseGo(await readFile(KAFKA_GO_FILE, "utf8"));
+  if (kts.size === 0) throw new Error(`${KAFKA_TS_FILE} parsed to zero interfaces — the format changed`);
+  if (kgo.size === 0) throw new Error(`${KAFKA_GO_FILE} parsed to zero structs — the format changed`);
+
+  let ok = 0;
+  for (const [name, tsFields] of kts) {
+    if (KAFKA_NOT_MIRRORED[name]) continue;
+    const goName = name[0].toLowerCase() + name.slice(1);
+    const goFields = kgo.get(goName);
+    if (!goFields) {
+      problems.push(`${name}: no Go struct named ${goName} in ${KAFKA_GO_FILE}`);
+      continue;
+    }
+    compared++;
+    ok++;
+    const missing = tsFields.filter((f) => !goFields.includes(f));
+    const extra = goFields.filter((f) => !tsFields.includes(f));
+    if (missing.length || extra.length) {
+      problems.push(
+        `${name} / ${goName}:` +
+          (missing.length ? `\n    only in ${KAFKA_TS_FILE}: ${missing.join(", ")}` : "") +
+          (extra.length ? `\n    only in ${KAFKA_GO_FILE}: ${extra.join(", ")}` : ""),
+      );
+    }
+  }
+  console.log(`  ok    kafka-agent: ${ok} type(s) compared`);
+
+  const tsOps = kafkaTsOps(await readFile(KAFKA_TS_FILE, "utf8"));
+  const marks = new Map<string, string>();
+  const goOps = kafkaGoOps(await readFile(KAFKA_GO_OPS_FILE, "utf8"), marks);
+  if (tsOps.size === 0) throw new Error(`${KAFKA_TS_FILE}: KafkaOps parsed to zero ops — the format changed`);
+  if (goOps.size === 0) throw new Error(`${KAFKA_GO_OPS_FILE}: no typed ops found — the table format changed`);
+
+  for (const name of tsOps.keys()) if (!goOps.has(name)) problems.push(`kafka op only in ${KAFKA_TS_FILE}: ${name}`);
+  for (const name of goOps.keys()) if (!tsOps.has(name)) problems.push(`kafka op only in ${KAFKA_GO_OPS_FILE}: ${name}`);
+  let same = 0;
+  for (const [name, tsType] of tsOps) {
+    const goType = goOps.get(name);
+    if (!goType) continue;
+    if (goType[0].toUpperCase() + goType.slice(1) !== tsType) {
+      problems.push(`kafka op ${name}: takes ${tsType} in ${KAFKA_TS_FILE} but ${goType} in ${KAFKA_GO_OPS_FILE}`);
+    } else {
+      same++;
+    }
+  }
+  console.log(`  ok    kafka-agent: ${same} op(s), same names, same parameter types`);
+
+  const unmarked = [...goOps.keys()].filter((name) => !marks.has(name));
+  for (const name of unmarked) problems.push(`kafka op ${name}: not marked readOp or writeOp in ${KAFKA_GO_OPS_FILE}`);
+  if (unmarked.length === 0) {
+    const writes = [...marks].filter(([, mark]) => mark === "writeOp").map(([name]) => name);
+    console.log(`  ok    kafka-agent: every op is marked read or write (${writes.length} write: ${writes.join(", ") || "none"})`);
+  }
+}
+
+await checkKafka();
+
 console.log("");
 if (problems.length) {
   for (const p of problems) console.log(`  FAIL  ${p}`);
-  console.log(`\n${problems.length} type(s) differ between ${TS_FILE} and ${GO_FILE}`);
+  console.log(`\n${problems.length} problem(s): the TypeScript and Go sides of a protocol differ`);
   process.exit(1);
 }
-console.log(`${compared} type(s) match field for field`);
+console.log(`${compared} type(s) match field for field, in both protocols`);

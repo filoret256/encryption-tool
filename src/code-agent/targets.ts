@@ -32,7 +32,7 @@ export const TARGETS: CodeAgentTarget[] = [
     os: "windows",
     arch: "x64",
     label: "Windows (x64)",
-    exe: "enc-tool-code-agent.exe",
+    exe: "code-agent.exe",
     kind: "zip",
   },
   {
@@ -43,7 +43,7 @@ export const TARGETS: CodeAgentTarget[] = [
     os: "macos",
     arch: "arm64",
     label: "macOS (Apple Silicon)",
-    exe: "enc-tool-code-agent",
+    exe: "code-agent",
     kind: "tar.gz",
   },
   {
@@ -54,7 +54,7 @@ export const TARGETS: CodeAgentTarget[] = [
     os: "macos",
     arch: "x64",
     label: "macOS (Intel)",
-    exe: "enc-tool-code-agent",
+    exe: "code-agent",
     kind: "tar.gz",
   },
   {
@@ -65,7 +65,7 @@ export const TARGETS: CodeAgentTarget[] = [
     os: "linux",
     arch: "x64",
     label: "Linux (x64)",
-    exe: "enc-tool-code-agent",
+    exe: "code-agent",
     kind: "tar.gz",
   },
   {
@@ -76,17 +76,29 @@ export const TARGETS: CodeAgentTarget[] = [
     os: "linux",
     arch: "arm64",
     label: "Linux (arm64)",
-    exe: "enc-tool-code-agent",
+    exe: "code-agent",
     kind: "tar.gz",
   },
 ];
 
 export const byId = (id: string): CodeAgentTarget | undefined => TARGETS.find((t) => t.id === id);
 
-/** `enc-tool-code-agent-4.0.0-darwin-arm64.tar.gz` — the version is in the name so a
+/** The two local agents this app hands out. They are built for the same
+ *  platforms, from the same table, and differ in a name and a source folder. */
+export type AgentName = "code-agent" | "kafka-agent";
+
+/** The executable's name inside the archive: the table says `code-agent`, and
+ *  the other agent is the same file under its own name. */
+export const exeName = (t: CodeAgentTarget, agent: AgentName = "code-agent"): string =>
+  t.exe.replace(/^code-agent/, agent);
+
+/** `code-agent-4.0.0-darwin-arm64.tar.gz` — the version is in the name so a
  *  mirror can hold several releases side by side. */
-export const archiveName = (t: CodeAgentTarget, version: string): string =>
-  `enc-tool-code-agent-${version}-${t.id}.${t.kind}`;
+export const archiveName = (t: CodeAgentTarget, version: string, agent: AgentName = "code-agent"): string =>
+  `${agent}-${version}-${t.id}.${t.kind}`;
+
+/** The manifest an agent's build writes and the server reads: `code-agents.json`. */
+export const manifestName = (agent: AgentName): string => `${agent}s.json`;
 
 /** One build as published to the browser. `url` is filled in by the server:
  *  either a local route or an entry in an external mirror. */

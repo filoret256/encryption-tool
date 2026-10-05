@@ -5,8 +5,9 @@
  *  the grammar set never lands in the crypto tabs' bundle.
  */
 import type { EditorState } from "@codemirror/state";
+import type { ViewUpdate } from "@codemirror/view";
 import { isCodeAgentUrl, type CodeAgentClient } from "./code-agent.ts";
-import type { CodeAgentInfo, Commit, CommitDetail, DiffPair, DirEntry, FileRead, FsChange, GitStatus } from "../../code-agent/protocol.ts";
+import type { BlamePage, CodeAgentInfo, Commit, CommitDetail, DiffPair, DirEntry, FileRead, FsChange, GitStatus } from "../../code-agent/protocol.ts";
 import { CodeEditor } from "./editor.ts";
 import { distinguish, FileTree } from "./tree.ts";
 import { GitPanel, mergeSource } from "./git-panel.ts";
@@ -16,15 +17,18 @@ import { SearchPanel } from "./search-panel.ts";
 import { DiffView, type HunkAction } from "./diff.ts";
 import { hunkPatches } from "./hunkpatch.ts";
 import { findConflicts, type ConflictSides } from "./conflicts.ts";
-import { applyRowHeight, copyToClipboard, esc, modalConfirm, modalPrompt, showMenu, type MenuItem } from "./ui.ts";
+import { applyRowHeight, copyToClipboard, esc, modalConfirm, modalPrompt, ROW_H, showMenu, type MenuItem } from "./ui.ts";
 import { draftsFor, dropDraft, putDraft } from "./drafts.ts";
 import { singleFlight } from "./singleflight.ts";
+import { VirtualList } from "./vlist.ts";
 import { OutputLog } from "./output.ts";
 import { Commands, keyLabel } from "./commands.ts";
+import { rankPaths } from "./quickrank.ts";
 import { quickPick } from "./quickpick.ts";
-import { compareFolders, type EntryState, type FolderEntry } from "./foldercompare.ts";
+import { compareFolders, COMPARE_CONCURRENCY, mapLimited, type EntryState, type FolderEntry } from "./foldercompare.ts";
 import type { BlameLine } from "./blame.ts";
 import { ansible } from "../../crypto/index.ts";
+import { clampSideWidth, loadSide, saveSide } from "../side-width.ts";
 import { indentOfLine, isVaultFile, schemeName, schemes, unwrapVaultBlock, vaultBlock, type Scheme } from "./vault.ts";
 import { iconBranch, iconFiles, iconHistory, iconNewFile, iconNewFolder, iconRefresh, iconSearch } from "./icons.ts";
 
@@ -42,7 +46,7 @@ export interface CodeContext {
   dismissScope: (scope: string) => void;
   /** Called whenever code-agent state changes so the header badge can repaint. */
   onCapsChanged: () => void;
-  /** Open the "get code-agent" popover in the header. */
+  /** Open the "⤓ code-agent" popover in the tab strip. */
   getCodeAgent: () => void;
 }
 
@@ -52,33 +56,18 @@ export interface CodeTab {
   focus(): void;
   /** main.ts owns the code-agent client and forwards its state changes here. */
   onCodeAgentState(): void;
+  /** Take this mount's listeners off window and document. Called before a
+   *  remount, so that the tab is mounted once in practice and can never be
+   *  mounted twice by accident: the second mount would replace the markup while
+   *  the first one's listeners stayed, holding the whole editor stack alive and
+   *  handling every resize and every watcher event a second time.
+   *
+   *  The tree's ResizeObserver is disconnected here. Those of the virtual lists
+   *  disconnect themselves once their markup has left the document (observeSize). */
+  dispose(): void;
 }
 
 type View = "explorer" | "search" | "scm" | "history";
-
-/** Side-panel geometry, remembered between sessions. */
-interface SideState {
-  width: number;
-  collapsed: boolean;
-}
-const SIDE_KEY = "enc-code-side";
-
-function loadSide(): SideState {
-  const fallback: SideState = { width: 260, collapsed: false };
-  try {
-    return { ...fallback, ...(JSON.parse(localStorage.getItem(SIDE_KEY) ?? "{}") as Partial<SideState>) };
-  } catch {
-    return fallback;
-  }
-}
-
-function saveSide(s: SideState): void {
-  try {
-    localStorage.setItem(SIDE_KEY, JSON.stringify(s));
-  } catch {
-    /* private mode */
-  }
-}
 
 const SHELL = `
   <div class="toolbar code-toolbar">
@@ -169,6 +158,14 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   const editorHost = $(".code-editor-host");
   const diffHost = $(".code-diff-host");
   const folderHost = $(".code-folder-host");
+
+  /** Everything this mount puts on window or document, and how to take it off.
+   *
+   *  Collected rather than remembered one by one: a listener left behind keeps
+   *  the closure that registered it — and therefore this whole editor stack —
+   *  alive, and a second mount would then handle every resize, every keystroke
+   *  and every watcher event twice. */
+  const teardown: (() => void)[] = [];
 
   // ── the output log ──
   // Every operation this tab performs on the user's behalf reports here, and
@@ -347,6 +344,11 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     error?: string;
     entries: FolderEntry[];
     truncated: boolean;
+    /** How far a running comparison has got: paths settled out of paths found.
+     *  A comparison of two commits settles one path at a time, and on a wide
+     *  pair that is thousands of round trips — the header says so while it
+     *  happens rather than showing a growing list with no explanation. */
+    progress?: { done: number; total: number };
     /** Are identical files listed? Off by default — the answer to "what is
      *  different" should not open with three hundred rows saying "same". */
     showSame: boolean;
@@ -357,6 +359,30 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   /** Keyed by tab id, never by path — see FileTab.id. */
   const states = new Map<string, EditorState>();
   const baselines = new Map<string, string>();
+
+  /** Which buffers have moved away from what was last read or written.
+   *
+   *  A flag, and not a comparison of strings. The comparison used to run on every
+   *  keystroke, for every open tab, and each one materialized a whole document into a
+   *  string: with twenty 1 MB files that was 20 MB of new strings per keystroke, on the
+   *  thread that has to draw the character being typed. The flag is set by the one event
+   *  that can make a buffer dirty — an edit to the tab on screen — and cleared by the two
+   *  things that make it clean again: a write, and an undo back to the file. */
+  const dirtyBuffers = new Map<string, boolean>();
+  const setDirty = (id: string, on: boolean): void => {
+    if (on) dirtyBuffers.set(id, true);
+    else dirtyBuffers.delete(id);
+  };
+
+  /** The indentation of each tab's buffer, as it was last read.
+   *
+   *  detectIndent answers from the first 4000 lines of the document, and it was asked on
+   *  every move of the caret — which meant materializing the whole document (`editor.value`)
+   *  and running a regular expression per line, for a line of text in the status bar that
+   *  changes only when the text does. The answer is read when a tab is opened (the text is
+   *  in hand there) and again once typing stops; a caret move reads this map. */
+  const indents = new Map<string, { kind: "tab" | "space"; width: number }>();
+  let indentTimer: ReturnType<typeof setTimeout> | null = null;
   let nextTabId = 1;
   const newTabId = (): string => `f${nextTabId++}`;
 
@@ -393,6 +419,24 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  save — so changes arriving right after our own write are ignored. */
   let lastSelfWrite = 0;
 
+  /** What each file tab last saw of its file on disk: the size and the modified time. A burst of
+   *  watcher events says that something under a folder changed, not what; a tab whose file still
+   *  has the size and time it was read with has nothing to reload, and reloading it anyway threw
+   *  away its editor state (the undo history, the scroll) for a file that had not changed. */
+  const diskStamps = new Map<string, { mtime: number; size: number }>();
+
+  /** Look at the file once more and remember what is there — after a save, whose echo the
+   *  watcher is told to ignore: without this the next burst would find a file that differs from
+   *  the stamp and reload the buffer that wrote it. */
+  async function restamp(tab: FileTab): Promise<void> {
+    try {
+      const st = await codeAgent.call<{ size: number; mtime: number }>("fs.stat", { path: tab.path });
+      diskStamps.set(tab.id, { mtime: st.mtime, size: st.size });
+    } catch {
+      /* gone, or not reachable: the next event decides */
+    }
+  }
+
   // ── editor + diff ──
   // Typing into a previewed file is what makes it worth keeping, so the first
   // real edit promotes it. `swappingState` keeps a tab switch — which also
@@ -401,9 +445,9 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     editorHost,
     ctx.isDark(),
     () => void save(),
-    () => {
+    (change) => {
       if (!swappingState) pin(openFile?.id ?? null);
-      onEditorChange();
+      onEditorChange(change);
     },
     (oid) => void revealCommit(oid),
     () => renderStatusSegments(),
@@ -423,7 +467,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     saveBtn.disabled = why !== "";
     // The accent belongs to the thing worth pressing. On an empty screen the
     // brightest element used to be a blue "save" that saved nothing, while the
-    // one route into the setup — "get code-agent" — was a muted chip.
+    // one route into the setup — the "⤓ code-agent" button — was a muted chip.
     saveBtn.classList.toggle("t-btn-primary", !saveBtn.disabled);
     saveBtn.title = why || (openFile?.missing ? "Save — the file is gone from disk and will be created again" : "Save the open file");
     renderWelcome();
@@ -440,7 +484,16 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     const show = codeAgent.state !== "online" && tabs.length === 0;
     el.hidden = !show;
     editorHost.classList.toggle("is-welcome", show);
-    if (!show || el.dataset.built) return;
+    if (!show) return;
+    // Why the agent is not connected, when an attempt failed — a busy agent, a stale token.
+    // The page connects by itself on load, so this card is the only place the reason can be
+    // read without a dialog having been opened (X-05).
+    const reason = el.querySelector<HTMLElement>(".js-welcome-error");
+    if (reason) {
+      reason.textContent = codeAgent.state === "error" ? codeAgent.lastError : "";
+      reason.hidden = reason.textContent === "";
+    }
+    if (el.dataset.built) return;
     el.dataset.built = "1";
     el.innerHTML = `<div class="welcome">
       <h2>Open a project folder</h2>
@@ -448,16 +501,18 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
          folder to this page over a loopback socket — nothing is uploaded.</p>
       <ol>
         <li><b>Get the code-agent.</b> One binary, no installer.
-            <button class="t-btn js-welcome-get" type="button">get code-agent</button></li>
+            <button class="t-btn js-welcome-get" type="button">⤓ code-agent</button></li>
         <li><b>Run it in your project folder.</b>
-            <code>enc-tool-code-agent</code> — it prints a <code>ws://127.0.0.1:…</code> URL.</li>
+            <code>code-agent</code> — it prints a <code>ws://127.0.0.1:…</code> URL.</li>
         <li><b>Paste that URL here.</b>
             <button class="t-btn t-btn-primary js-welcome-connect" type="button">connect…</button></li>
       </ol>
+      <div class="kf-note kf-note-bad js-welcome-error" role="status" hidden></div>
       <p class="welcome-note">The crypto tabs above need none of this — they run entirely in the browser.</p>
     </div>`;
     el.querySelector(".js-welcome-get")!.addEventListener("click", () => ctx.getCodeAgent());
     el.querySelector(".js-welcome-connect")!.addEventListener("click", () => void connect());
+    renderWelcome();
   }
 
   /** Nothing open: the editor holds only its placeholder, so it is dimmed and
@@ -509,32 +564,51 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
 
   /** Has this tab's buffer moved away from what was last read or written?
    *
-   *  The tab on screen is compared against the live editor, every other one
-   *  against its stashed state — the stash is only refreshed on a tab switch,
-   *  so for the active tab it is always one step behind. */
+   *  A flag per tab, set by an edit and cleared by a write or by an undo back to the
+   *  file — see dirtyBuffers. The line-ending change is kept on the tab because it
+   *  touches every line of the file without touching a character of the buffer:
+   *  CodeMirror holds \n either way, and saying otherwise would let the tab be closed
+   *  without a word. */
   const isDirty = (tab: FileTab | null | undefined): boolean =>
-    !!tab &&
-    states.has(tab.id) &&
-    // A line-ending change touches every line of the file without touching a
-    // single character of the buffer — CodeMirror holds \n either way. It is
-    // still an unsaved change, and saying otherwise would let it be closed
-    // without a word.
-    (tab.eolChanged === true ||
-      baselines.get(tab.id) !== (tab.id === openFile?.id ? editor.value : states.get(tab.id)!.doc.toString()));
+    !!tab && (tab.eolChanged === true || dirtyBuffers.get(tab.id) === true);
 
-  function onEditorChange(): void {
-    const dirty = isDirty(openFile);
+  function onEditorChange(change?: ViewUpdate): void {
+    const tab = openFile;
+    if (change && tab) {
+      // An edit makes the buffer dirty. An undo can make it the file again, and that is
+      // the one moment a comparison is worth its cost — and only for the tab on screen.
+      const back = change.transactions.some((tr) => tr.isUserEvent("undo") || tr.isUserEvent("redo"));
+      setDirty(tab.id, back ? baselines.get(tab.id) !== editor.value : true);
+    }
+    const dirty = isDirty(tab);
     dirtyLabel.textContent = dirty ? "● unsaved" : "";
     dirtyLabel.classList.toggle("is-dirty", dirty);
-    renderTabs();
+    // Only the tab that was typed in can have changed, so the strip is not rebuilt: the
+    // rest of it — the crumbs, the session — does not depend on the buffer's text.
+    updateTabBadge(tab?.id ?? null);
     renderConflictBar();
     renderOfflineBar();
     // Blame describes the last commit. The moment the buffer moves away from
     // it, the bar has to say so — waiting for a tab switch to notice would
     // leave the gutter looking current while it no longer is.
-    if (openFile && blaming.has(openFile.id)) renderBlameBar();
+    if (tab && blaming.has(tab.id)) renderBlameBar();
     renderVaultBar();
+    if (change) scheduleIndent();
     scheduleDraft();
+  }
+
+  /** The dirty mark of one tab, without rebuilding the strip. Doing nothing for a tab
+   *  that is not in the strip (a diff or folder tab, or one just closed) is right: there
+   *  is no row to patch. */
+  function updateTabBadge(id: string | null): void {
+    if (id === null) return;
+    const row = $(".js-tabs").querySelector<HTMLElement>(`[data-id="${CSS.escape(id)}"]`);
+    if (!row) return;
+    const tab = tabs.find((t) => t.id === id);
+    const dirty = isDirty(tab?.kind === "file" ? tab : null);
+    row.classList.toggle("dirty", dirty);
+    const closer = row.querySelector<HTMLElement>(".code-tab-close");
+    if (closer) closer.textContent = dirty ? "●" : "✕";
   }
 
   // ── drafts ──
@@ -543,11 +617,18 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   // into IndexedDB shortly after it stops changing, and dropped the moment it
   // reaches disk. See drafts.ts for why it is not localStorage.
   let draftTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The document last written as a draft, by path. A document is immutable, so the same one is the
+   *  same text: a caret that moved, or a change that was undone to what was already stored, writes
+   *  nothing. */
+  const draftDocs = new Map<string, unknown>();
 
   function scheduleDraft(): void {
     if (draftTimer) clearTimeout(draftTimer);
     // Long enough that typing never queues a write per keystroke, short enough
-    // that what is lost to a crash is a sentence, not a session.
+    // that what is lost to a crash is a sentence, not a session. The pause grows with the
+    // buffer, because a write is a copy of all of it: 0.8 s for a page of text, about 5 s for the
+    // few megabytes at which a file stops opening whole.
+    const pause = Math.min(5000, 800 + (editor.state.doc.length / (1024 * 1024)) * 1100);
     draftTimer = setTimeout(() => {
       draftTimer = null;
       const tab = openFile;
@@ -561,9 +642,16 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         // than the decryption, so restoring it would offer a state that never
         // existed on screen, and nothing is gained by keeping it.
         void dropDraft(root, tab.path);
-      } else if (isDirty(tab)) void putDraft(root, tab.path, editor.value);
-      else void dropDraft(root, tab.path);
-    }, 800);
+      } else if (isDirty(tab)) {
+        const doc = editor.state.doc;
+        if (draftDocs.get(tab.path) === doc) return;
+        draftDocs.set(tab.path, doc);
+        void putDraft(root, tab.path, editor.value);
+      } else {
+        draftDocs.delete(tab.path);
+        void dropDraft(root, tab.path);
+      }
+    }, pause);
   }
 
   /** Drafts for this workspace that no open tab already accounts for.
@@ -616,7 +704,12 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     states.set(tab.id, editor.newState(draft.path, draft.text, readOnly));
     // The baseline is what is on disk — or, for a file that is gone, something
     // the buffer cannot equal, so the tab stays honest about being unsaved.
-    baselines.set(tab.id, raw?.replace(/\r\n/g, "\n") ?? `${draft.text} `);
+    const onDiskText = raw?.replace(/\r\n/g, "\n") ?? null;
+    baselines.set(tab.id, onDiskText ?? `${draft.text}\0`);
+    // Restoring a draft is the one place a buffer starts out dirty: the draft was kept
+    // because it did not match the file.
+    setDirty(tab.id, onDiskText !== draft.text);
+    indents.set(tab.id, detectIndent(draft.text));
     activate(tab.id);
   }
 
@@ -658,7 +751,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     });
     bar.querySelector(".js-disk-theirs")!.addEventListener("click", () => {
       conflictingTabs.delete(tab.id);
-      baselines.set(tab.id, ""); // force the reload past the isDirty guard
+      setDirty(tab.id, true); // make the reload in open() treat the buffer as edited
       void open(tab.path, true);
     });
   }
@@ -806,7 +899,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
           danger: true,
         });
         if (!ok) {
-          baselines.set(tab.id, ""); // past the isDirty guard in open()
+          setDirty(tab.id, true); // past the isDirty guard in open()
           await open(path, true);
           return;
         }
@@ -929,14 +1022,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   const splitter = $(".code-splitter");
   const side = loadSide();
 
-  /** The one rule about how wide the panel may be.
-   *
-   *  It used to live only inside the drag handler, so a width chosen on a
-   *  1440px monitor was restored verbatim on a 760px laptop: the panel took
-   *  more than half the window and the editor became the gutter. The stored
-   *  number is a preference, not a measurement — it has to be read against the
-   *  window it is being applied to. */
-  const clampWidth = (w: number): number => Math.round(Math.min(Math.max(w, 150), window.innerWidth * 0.6));
+  const clampWidth = clampSideWidth;
 
   function applySide(): void {
     // Not written back to storage: narrowing the window for an hour should not
@@ -966,6 +1052,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   };
   onViewportChange();
   window.addEventListener("resize", onViewportChange);
+  teardown.push(() => window.removeEventListener("resize", onViewportChange));
 
   splitter.addEventListener("pointerdown", (e) => {
     const ev = e as PointerEvent;
@@ -1012,16 +1099,15 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   // (see commands.ts), so nothing can be bound without also being findable in
   // the palette. Captured, because CodeMirror has its own keymap and would
   // otherwise swallow anything it recognises before the tab sees it.
-  document.addEventListener(
-    "keydown",
-    (e) => {
-      if (!host.classList.contains("active")) return;
-      // A dialog is on screen: it owns the keyboard until it closes.
-      if (document.querySelector(".modal-back")) return;
-      if (commands.handleKey(e)) e.preventDefault();
-    },
-    true,
-  );
+  const onKeydown = (e: KeyboardEvent): void => {
+    if (!host.classList.contains("active")) return;
+    // A dialog is on screen: it owns the keyboard until it closes.
+    if (document.querySelector(".modal-back")) return;
+    if (commands.handleKey(e)) e.preventDefault();
+  };
+  document.addEventListener("keydown", onKeydown, true);
+  teardown.push(() => document.removeEventListener("keydown", onKeydown, true));
+  teardown.push(() => tree.dispose());
 
   // ── commands ──
   // Declared once; the palette, the keyboard and (later) any menu all read
@@ -1253,22 +1339,16 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     return indexing;
   }
 
-  /** Rank a path against what has been typed. Subsequence matching, the way
-   *  every quick open works: "wcdx" finds "web/code/index.ts". */
-  function score(path: string, query: string): number {
-    if (!query) return 0;
-    const haystack = path.toLowerCase();
-    const needle = query.toLowerCase();
-    const direct = haystack.lastIndexOf(needle);
-    // A contiguous match wins, and one in the file name beats one in a
-    // directory further up.
-    if (direct !== -1) return 1000 - (haystack.length - direct);
-    let at = -1;
-    for (const ch of needle) {
-      at = haystack.indexOf(ch, at + 1);
-      if (at === -1) return -1;
+  /** The index, lower-cased once: the ranking compares lower-case text, and doing it per path on
+   *  every keystroke was twenty thousand allocations a letter. */
+  let lowerFor: string[] | null = null;
+  let lowerPaths: string[] = [];
+  function lowerOf(all: string[]): string[] {
+    if (lowerFor !== all) {
+      lowerFor = all;
+      lowerPaths = all.map((p) => p.toLowerCase());
     }
-    return 500 - haystack.length;
+    return lowerPaths;
   }
 
   async function quickOpenFile(): Promise<void> {
@@ -1280,13 +1360,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       placeholder: "type part of a path",
       buttons: false,
       items: (query) => {
-        const ranked = query
-          ? all
-              .map((p) => ({ p, s: score(p, query) }))
-              .filter((r) => r.s >= 0)
-              .sort((a, b) => b.s - a.s)
-          : all.slice(0, 50).map((p) => ({ p, s: 0 }));
-        return ranked.slice(0, 50).map(({ p }) => ({
+        const ranked = query ? rankPaths(all, lowerOf(all), query, 50) : all.slice(0, 50);
+        return ranked.map((p) => ({
           value: p,
           label: p.split("/").pop() ?? p,
           detail: p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "",
@@ -1414,6 +1489,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     if (tab.kind !== "file") return;
     states.delete(tab.id);
     baselines.delete(tab.id);
+    dirtyBuffers.delete(tab.id);
+    indents.delete(tab.id);
     blaming.delete(tab.id);
   }
 
@@ -1530,6 +1607,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       }
       forget(tab);
       conflictingTabs.delete(tab.id);
+      draftDocs.delete(tab.path);
       if (boundRoot) void dropDraft(boundRoot, tab.path);
     }
     // Awaiting the dialog above means the list can have moved under us.
@@ -1757,6 +1835,11 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       placeTab(tab, preview && !reload);
       states.set(tab.id, editor.newState(path, text, readOnly));
       baselines.set(tab.id, text);
+      // The buffer is the file it was just read from, and its indentation is read here,
+      // from the text in hand, rather than later from the document.
+      setDirty(tab.id, false);
+      indents.set(tab.id, detectIndent(text));
+      diskStamps.set(tab.id, { mtime: file.mtime, size: file.size });
 
       // A later click already won the screen. The tab still opens — nothing the
       // user asked for is dropped — it just does not steal focus.
@@ -2204,6 +2287,29 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     return { kind: "space", width: best || 2 };
   }
 
+  /** The indentation of one tab's buffer: what was read for it, or a first read of the
+   *  document. See `indents` for why this is not asked on every caret move. */
+  function indentFor(id: string): { kind: "tab" | "space"; width: number } {
+    const known = indents.get(id);
+    if (known) return known;
+    const found = detectIndent(editor.value);
+    indents.set(id, found);
+    return found;
+  }
+
+  /** An edit can change the indentation of a file; the answer is read again once typing
+   *  stops, and never on a move of the caret. */
+  function scheduleIndent(): void {
+    const id = openFile?.id;
+    if (id === undefined) return;
+    if (indentTimer) clearTimeout(indentTimer);
+    indentTimer = setTimeout(() => {
+      indentTimer = null;
+      indents.delete(id);
+      renderStatusSegments();
+    }, 400);
+  }
+
   function renderStatusSegments(): void {
     const pos = $<HTMLButtonElement>(".js-sb-pos");
     const eolEl = $<HTMLButtonElement>(".js-sb-eol");
@@ -2220,7 +2326,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     eolEl.textContent = tab.eol === "\r\n" ? "CRLF" : "LF";
     eolEl.title = `Line endings — click to write this file with ${tab.eol === "\r\n" ? "LF" : "CRLF"} instead`;
 
-    const indent = detectIndent(editor.value);
+    const indent = indentFor(tab.id);
     indentEl.textContent = indent.kind === "tab" ? "Tab" : `Spaces: ${indent.width}`;
     indentEl.title = "Indentation, as this file uses it — click to convert it";
 
@@ -2279,6 +2385,9 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       .join("\n");
     if (converted === editor.value) return report("editor", "Indentation is already that.");
     editor.replaceAll(converted);
+    // The whole point of this command is the indentation: read it again now rather than
+    // leaving the status bar showing what the file used to use.
+    if (openFile) indents.delete(openFile.id);
     renderStatusSegments();
   }
 
@@ -2296,6 +2405,10 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     editor.setLanguage(ext ? grammarFor(`x.${ext}`) : null);
     if (choice === languageOf(tab.path)) forcedLanguage.delete(tab.id);
     else forcedLanguage.set(tab.id, choice);
+    // The indentation is derived from the text and not from the grammar, so this is not
+    // strictly needed; it is read again because the language was just chosen deliberately
+    // and one read of 4000 lines is not worth arguing about.
+    indents.delete(tab.id);
     renderStatusSegments();
   }
 
@@ -2314,7 +2427,15 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  Blame belongs to a document, and the rows live in that document's editor
    *  state — but the bar above the editor is one element shared by every tab,
    *  so it needs to be told which tab it is describing. */
-  const blaming = new Map<string, { path: string; stale: boolean }>();
+  const blaming = new Map<string, { path: string; stale: boolean; more: boolean }>();
+
+  /** How many of the file's lines the blame gutter covers, once it is on. The
+   *  code-agent sends one page rather than one row per line: a million-line file
+   *  is 250 MB of JSON, and the gutter for it is unreadable anyway. */
+  function blamedLines(more: boolean): string {
+    if (!more) return "click a line to open the commit it came from";
+    return `the first 20,000 lines only — blame is one row per line, and the code-agent stops there`;
+  }
 
   async function toggleBlame(): Promise<void> {
     const tab = openFile;
@@ -2326,15 +2447,15 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       return;
     }
     try {
-      const rows = await codeAgent.call<BlameLine[]>("git.blame", { path: tab.path });
+      const page = await codeAgent.call<BlamePage>("git.blame", { path: tab.path });
       if (openFile?.id !== tab.id) return; // the reader moved on while git ran
-      editor.setBlame(rows);
+      editor.setBlame(page.rows);
       // Blame describes the committed file. An edited buffer has lines that
       // commit never had, so the rows below the first edit line up with
       // nothing — said once, in the bar, rather than left to be discovered.
-      blaming.set(tab.id, { path: tab.path, stale: isDirty(tab) });
+      blaming.set(tab.id, { path: tab.path, stale: isDirty(tab), more: page.more });
       renderBlameBar();
-      report("git blame", `blamed ${tab.path}`, { detail: `${rows.length} line(s)` });
+      report("git blame", `blamed ${tab.path}`, { detail: `${page.rows.length} line(s)${page.more ? ", first page only" : ""}` });
     } catch (e) {
       reportError("git blame", e);
     }
@@ -2359,7 +2480,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       <span class="compare-path">${
         dirty
           ? "the buffer has unsaved edits — these lines are the last commit's, and no longer line up"
-          : "click a line to open the commit it came from"
+          : blamedLines(state.more)
       }</span>
       <span class="t-spacer"></span>
       <button class="t-btn js-blame-history" type="button">file history</button>
@@ -2416,10 +2537,18 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         },
         left,
         right,
+        // The list fills in as the pairs are read: reading four thousand of them
+        // is dozens of seconds, and a page that says nothing for that long reads
+        // as broken.
+        (done, total) => {
+          tab.progress = { done, total };
+          if (activeId === tab.id) renderFolderTab(tab);
+        },
       );
       tab.entries = result.entries;
       tab.truncated = result.truncated;
       tab.state = "done";
+      tab.progress = undefined;
       const differing = result.entries.filter((e) => e.state !== "same").length;
       report("compare", `${left} ↔ ${right}: ${differing || "no"} difference${differing === 1 ? "" : "s"}`);
     } catch (e) {
@@ -2549,8 +2678,11 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         codeAgent.call<Commit[]>("git.log", { ref: `${to.oid}..${from.oid}`, limit: REV_WALK }),
       ]);
       const between = [...ahead, ...behind];
-      const details = await Promise.all(
-        between.map((c) => codeAgent.call<CommitDetail>("git.commitDetail", { oid: c.oid }).catch(() => null)),
+      // Eight at a time. This was one `Promise.all` over every commit on both
+      // sides — up to four hundred requests at once, for a file list that the
+      // page then reduced to a set of paths.
+      const details = await mapLimited(between, COMPARE_CONCURRENCY, (c) =>
+        codeAgent.call<CommitDetail>("git.commitDetail", { oid: c.oid }).catch(() => null),
       );
       const paths = new Set<string>();
       for (const d of details) {
@@ -2565,22 +2697,46 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       const normalise = (s: string | null): string => (s ?? "").replace(/\r\n/g, "\n").replace(/\n+$/, "");
 
       const entries: FolderEntry[] = [];
-      for (const rel of [...paths].sort()) {
+      const rels = [...paths].sort();
+      // Two blobs per path, eight paths at a time, and the tab says how far it
+      // has got. Settling them one path at a time was two thousand round trips
+      // in a row with nothing on screen changing.
+      //
+      // The rows go in as they are settled rather than at the end: on a wide
+      // pair this runs for a minute, and a list that stayed empty for that long
+      // while the note counted upwards was the progress bar and the page
+      // disagreeing about what was happening.
+      const byIndex = new Array<FolderEntry | null>(rels.length).fill(null);
+      let settled = 0;
+      let painted = 0;
+      const repaint = (): void => {
+        const now = Date.now();
+        if (now - painted < 100 || activeId !== tab.id) return;
+        painted = now;
+        tab.entries = byIndex.filter((e): e is FolderEntry => e !== null);
+        tab.progress = { done: settled, total: rels.length };
+        renderFolderTab(tab);
+      };
+      await mapLimited<string, void>(rels, COMPARE_CONCURRENCY, async (rel, index) => {
         const [x, y] = await Promise.all([blob(from.oid, rel), blob(to.oid, rel)]);
         // `git.blob` answers with a null text for a path the commit does not
         // have, which is how "only on one side" is told from "empty file".
         const inA = x !== null && (x.text !== null || x.binary);
         const inB = y !== null && (y.text !== null || y.binary);
-        if (inA && !inB) entries.push({ rel, state: "left", leftPath: rel });
-        else if (!inA && inB) entries.push({ rel, state: "right", rightPath: rel });
+        if (inA && !inB) byIndex[index] = { rel, state: "left", leftPath: rel };
+        else if (!inA && inB) byIndex[index] = { rel, state: "right", rightPath: rel };
         else if (inA && inB) {
           const same = x!.binary || y!.binary ? x!.binary === y!.binary : normalise(x!.text) === normalise(y!.text);
-          entries.push({ rel, state: same ? "same" : "differs", leftPath: rel, rightPath: rel });
+          byIndex[index] = { rel, state: same ? "same" : "differs", leftPath: rel, rightPath: rel };
         }
-      }
+        settled++;
+        repaint();
+      });
+      entries.push(...byIndex.filter((e): e is FolderEntry => e !== null));
       tab.entries = entries;
       tab.truncated = ahead.length >= REV_WALK || behind.length >= REV_WALK;
       tab.state = "done";
+      tab.progress = undefined;
       const differing = entries.filter((e) => e.state !== "same").length;
       report("compare", `${a7} ↔ ${b7}: ${differing || "no"} file${differing === 1 ? "" : "s"} differ`);
     } catch (e) {
@@ -2638,25 +2794,100 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   };
 
   /** The same states after a number, where the row wording does not read as
-   *  English: "2 differs" is not a count of anything. */
-  const countWord = (tab: FolderTab, state: EntryState): string =>
+   *  English: "2 differs" is not a count of anything — and "1 differ" is not one either, so
+   *  the verb agrees with the number. */
+  const countWord = (tab: FolderTab, state: EntryState, n: number): string =>
     tab.mode === "folders"
-      ? { left: "only left", right: "only right", differs: "differ", same: "identical" }[state]
+      ? { left: "only left", right: "only right", differs: n === 1 ? "differs" : "differ", same: "identical" }[state]
       : stateWord(tab, state);
 
+  /** The comparison list, kept between renders and between tabs.
+   *
+   *  It used to be one `innerHTML` of up to 4,000 rows with two listeners hung on
+   *  each of them: eight thousand nodes and eight thousand closures built in a
+   *  single frame, thrown away and built again on every repaint — and a repaint
+   *  happened while the comparison was still running. A virtual list holds the
+   *  rows that are on screen, and the shell around it is built once. */
+  let compareList: VirtualList<FolderEntry> | null = null;
+  /** The tab whose rows the list is holding. */
+  let compareView: FolderTab | null = null;
+  /** The rows the list was last given, in the order it was given them. */
+  let compareShown: FolderEntry[] = [];
+
+  /** The shell: a header, a note, and the list. Built once per code tab, then
+   *  only its text changes. */
+  function buildCompareShell(): void {
+    folderHost.innerHTML = `<div class="dircmp">
+      <div class="js-dircmp-head"></div>
+      <div class="js-dircmp-note"></div>
+      <div class="js-dircmp-rows"></div>
+    </div>`;
+    const rowsHost = folderHost.querySelector<HTMLElement>(".js-dircmp-rows")!;
+    rowsHost.setAttribute("role", "list");
+    compareList = new VirtualList<FolderEntry>(
+      rowsHost,
+      ROW_H,
+      (entry) =>
+        `<span class="dircmp-badge" aria-hidden="true">${FOLDER_BADGE[entry.state]}</span>
+          <span class="dircmp-path">${esc(entry.rel)}</span>
+          <span class="dircmp-word">${stateWord(compareView!, entry.state)}</span>`,
+      {
+        // The list owns the row element and resets its class when it rebuilds
+        // one, so what belongs on the row itself — its state, whether it opens,
+        // focus and its name — is put back after every paint. The rows on screen
+        // are a few dozen, so this is a few dozen attribute writes.
+        afterRender: () => {
+          for (const row of rowsHost.querySelectorAll<HTMLElement>(".vlist-row")) {
+            const entry = compareShown[Number(row.dataset.i)];
+            if (!entry) continue;
+            const openable = entry.state === "differs";
+            const word = stateWord(compareView!, entry.state);
+            row.className = `vlist-row dircmp-row ${entry.state}${openable ? " openable" : ""}`;
+            row.setAttribute("role", "listitem");
+            row.tabIndex = 0;
+            row.title = `${entry.rel} — ${word}${openable ? " · click to see the difference" : ""}`;
+          }
+        },
+      },
+    );
+    compareList.onClick((entry) => openCompareRow(entry));
+    // One listener for the whole list, and the row is the thing that is focused:
+    // per-row handlers were the other eight thousand closures.
+    folderHost.querySelector<HTMLElement>(".js-dircmp-rows")!.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter" && ev.key !== " ") return;
+      const row = (ev.target as HTMLElement).closest<HTMLElement>(".vlist-row");
+      const entry = row ? compareShown[Number(row.dataset.i)] : undefined;
+      if (!entry) return;
+      ev.preventDefault();
+      openCompareRow(entry);
+    });
+  }
+
+  /** Open the diff for a row: against HEAD there is one path and two versions of
+   *  it, between two folders there are two paths, and between two commits there
+   *  are two revisions. All three end up in the same diff view. */
+  function openCompareRow(entry: FolderEntry): void {
+    const tab = compareView;
+    if (!tab || entry.state !== "differs") return;
+    if (tab.mode === "head") void openDiff(entry.leftPath!, "head");
+    else if (tab.mode === "commits" && tab.revs) void compareRevs(entry.rel, tab.revs.from, tab.revs.to);
+    else void compare(entry.leftPath!, entry.rightPath!);
+  }
+
   function renderFolderTab(tab: FolderTab): void {
-    if (tab.state === "running") {
-      folderHost.innerHTML = `<div class="dircmp"><p class="dircmp-note">Comparing ${esc(tab.leftName)} with ${esc(tab.rightName)}…</p></div>`;
-      return;
-    }
     if (tab.state === "failed") {
       folderHost.innerHTML = `<div class="dircmp"><p class="dircmp-note is-error">Could not compare these folders: ${esc(tab.error ?? "unknown error")}</p></div>`;
+      compareList = null;
+      compareView = null;
       return;
     }
+    compareView = tab;
+    if (!compareList || !folderHost.querySelector(".js-dircmp-rows")) buildCompareShell();
 
     const counts = { left: 0, right: 0, differs: 0, same: 0 };
     for (const e of tab.entries) counts[e.state]++;
     const shown = tab.entries.filter((e) => tab.showSame || e.state !== "same");
+    compareShown = shown;
 
     // The header says which side is which *by name*, because "left" and
     // "right" mean nothing an hour later when the tab is still open.
@@ -2672,7 +2903,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         // matches still has to say so, hence the fallback.
         (["differs", "left", "right", "same"] as const)
           .filter((s) => counts[s] > 0)
-          .map((s) => `${counts[s]} ${countWord(tab, s)}`)
+          .map((s) => `${counts[s]} ${countWord(tab, s, counts[s])}`)
           .join(" · ") || "no differences"
       }</span>
       ${counts.same ? `<label class="dircmp-toggle"><input type="checkbox" class="js-show-same"${tab.showSame ? " checked" : ""}> show identical</label>` : ""}
@@ -2680,34 +2911,35 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       <button class="t-btn js-dircmp-again" type="button">re-run</button>
     </div>`;
 
-    const note = tab.truncated
-      ? `<p class="dircmp-note is-warn">More than 4000 files on one side — this list is partial. Compare a folder further in.</p>`
-      : "";
+    // Two notes, and both can be true at once: the list is partial because the
+    // walk hit its ceiling, and it is partial because the comparison is still
+    // running. A page that showed a growing list with no word about it would
+    // read as a comparison that had finished.
+    const progress = tab.progress;
+    const note = [
+      tab.truncated
+        ? `<p class="dircmp-note is-warn">More than 4000 files on one side — this list is partial. Compare a folder further in.</p>`
+        : "",
+      tab.state === "running"
+        ? `<p class="dircmp-note">Comparing ${esc(tab.leftName)} with ${esc(tab.rightName)}${
+            progress && progress.total ? `… ${progress.done} of ${progress.total} files compared` : "…"
+          }</p>`
+        : "",
+    ].join("");
 
-    const body = shown.length
-      ? `<div class="dircmp-list" role="list">${shown
-          .map((e, i) => {
-            const word = stateWord(tab, e.state);
-            const openable = e.state === "differs";
-            return `<div class="dircmp-row ${e.state}${openable ? " openable" : ""}" role="listitem" data-i="${i}"
-              tabindex="0" title="${esc(e.rel)} — ${word}${openable ? " · click to see the difference" : ""}">
-              <span class="dircmp-badge" aria-hidden="true">${FOLDER_BADGE[e.state]}</span>
-              <span class="dircmp-path">${esc(e.rel)}</span>
-              <span class="dircmp-word">${word}</span>
-            </div>`;
-          })
-          .join("")}</div>`
-      : `<p class="dircmp-note">${
-          counts.same && !tab.showSame
-            ? `No differences — all ${counts.same} files match. Tick “show identical” to list them.`
-            : tab.mode === "head"
-              ? `Nothing under ${esc(tab.left)} has changed since the last commit.`
-              : tab.mode === "commits"
-                ? "These two commits leave every file the same."
-                : "Both folders are empty."
-        }</p>`;
+    const empty = `<p class="dircmp-note">${
+      counts.same && !tab.showSame
+        ? `No differences — all ${counts.same} files match. Tick “show identical” to list them.`
+        : tab.mode === "head"
+          ? `Nothing under ${esc(tab.left)} has changed since the last commit.`
+          : tab.mode === "commits"
+            ? "These two commits leave every file the same."
+            : "Both folders are empty."
+    }</p>`;
 
-    folderHost.innerHTML = `<div class="dircmp">${head}${note}${body}</div>`;
+    folderHost.querySelector(".js-dircmp-head")!.innerHTML = head;
+    folderHost.querySelector(".js-dircmp-note")!.innerHTML = note + (shown.length || tab.state === "running" ? "" : empty);
+    compareList!.setItems(shown);
 
     folderHost.querySelector(".js-show-same")?.addEventListener("change", () => {
       tab.showSame = !tab.showSame;
@@ -2721,26 +2953,6 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     folderHost.querySelector(".js-dircmp-swap")?.addEventListener("click", () => {
       if (tab.right !== null) void compareFolderTree(tab.right, tab.left);
     });
-
-    const openRow = (i: number): void => {
-      const entry = shown[i];
-      if (!entry || entry.state !== "differs") return;
-      // Against HEAD there is one path and two versions of it; between two
-      // folders there are two paths. Both end up in the same diff view.
-      if (tab.mode === "head") void openDiff(entry.leftPath!, "head");
-      else if (tab.mode === "commits" && tab.revs) void compareRevs(entry.rel, tab.revs.from, tab.revs.to);
-      else void compare(entry.leftPath!, entry.rightPath!);
-    };
-    for (const row of folderHost.querySelectorAll<HTMLElement>(".dircmp-row")) {
-      const i = Number(row.dataset.i);
-      row.addEventListener("click", () => openRow(i));
-      row.addEventListener("keydown", (e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          openRow(i);
-        }
-      });
-    }
   }
 
   /** What a commit diff is a diff *of*, when the caller knows.
@@ -2815,9 +3027,12 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     try {
       await codeAgent.call("fs.write", { path, text: eol === "\n" ? text : text.replace(/\n/g, "\r\n") });
       lastSelfWrite = Date.now();
+      void restamp(tab);
       // What is on disk is now the baseline, so the tab stops showing dirty.
       baselines.set(tab.id, text);
+      setDirty(tab.id, false);
       tab.eolChanged = false;
+      draftDocs.delete(path);
       if (boundRoot) void dropDraft(boundRoot, path);
       conflictingTabs.delete(tab.id);
       tab.missing = false;
@@ -2973,9 +3188,11 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   // Folders opened in the tree do not go through any of the hooks above, and a
   // reload right after expanding one would lose it. The page going away is the
   // last moment anything can be written, so everything is flushed here.
-  window.addEventListener("pagehide", () => {
+  const onPageHide = (): void => {
     if (!restoringSession) writeSession();
-  });
+  };
+  window.addEventListener("pagehide", onPageHide);
+  teardown.push(() => window.removeEventListener("pagehide", onPageHide));
 
   async function restoreSession(root: string): Promise<void> {
     const saved = loadSessions()[root];
@@ -3005,7 +3222,8 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     // The same button now covers disconnecting and switching folders, so it
     // stops claiming there is nothing connected.
     $(".js-connect").textContent = "folder…";
-    rootLabel.textContent = root;
+    // The name of the folder, as the menu and the badge say it; the whole path is the tooltip (I-06).
+    rootLabel.textContent = folderName(root);
     rootLabel.title = root;
     engineLabel.textContent = codeAgent.info?.ripgrep ? "rg" : "built-in search";
     rememberWorkspace(codeAgent.savedUrl(), root);
@@ -3141,7 +3359,10 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     if (historyStale) void history.refresh();
   }
 
-  codeAgent.on("fs.change", (data) => {
+  // `on` hands back the unsubscribe, so unmounting takes the subscription off
+  // the client as well: a listener left on a shared client outlives the markup
+  // it refreshes.
+  teardown.push(codeAgent.on("fs.change", (data) => {
     const { paths } = data as FsChange;
     // The watcher collapses everything under .git into one sentinel, and adds a
     // second when what changed was HEAD or a ref. "*" is a burst too large to
@@ -3155,9 +3376,46 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     // Never react to the echo of the save we just performed.
     const echo = Date.now() - lastSelfWrite < 1000;
     if (echo) return;
-    const touched = (path: string): boolean => fsPaths.includes(path) || fsPaths.includes("*");
-    for (const tab of fileTabs()) if (touched(tab.path)) void syncWithDisk(tab);
-  });
+    for (const p of fsPaths) pendingSync.add(p);
+    scheduleSync();
+  }));
+
+  /** Paths the watcher has named since the last pass over the tabs, or "*" for a burst too large
+   *  to name them. One event, one `fs.stat` for each of twenty open tabs, and a build writing a
+   *  hundred files sent a hundred events: two thousand requests for what is one question. The
+   *  events of a window are gathered, and the tabs are looked at once, a few at a time. */
+  const pendingSync = new Set<string>();
+  let syncTimer: ReturnType<typeof setTimeout> | undefined;
+  const SYNC_WINDOW_MS = 150;
+  const SYNC_PARALLEL = 4;
+
+  function scheduleSync(): void {
+    // A window that starts with the first event and is not pushed back by the ones that follow:
+    // a storm that never pauses still gets a pass every window.
+    if (syncTimer !== undefined) return;
+    syncTimer = setTimeout(() => {
+      syncTimer = undefined;
+      const named = [...pendingSync];
+      pendingSync.clear();
+      const every = named.includes("*");
+      const tabs = fileTabs().filter((t) => every || named.includes(t.path));
+      for (const id of [...diskStamps.keys()]) if (!fileTabs().some((t) => t.id === id)) diskStamps.delete(id);
+      void syncTabs(tabs);
+    }, SYNC_WINDOW_MS);
+  }
+
+  async function syncTabs(tabs: FileTab[]): Promise<void> {
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < tabs.length) {
+        const tab = tabs[next++];
+        // Closed while it waited its turn.
+        if (!fileTabs().some((t) => t.id === tab.id)) continue;
+        await syncWithDisk(tab).catch(() => undefined);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(SYNC_PARALLEL, tabs.length) }, worker));
+  }
 
   /** A watched path under an open tab changed. Two questions, in order: is the
    *  file still there, and should the buffer be refreshed from it?
@@ -3166,12 +3424,11 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  app used to leave a tab that looked perfectly healthy and would write
    *  itself back to the old path on the next save. */
   async function syncWithDisk(tab: FileTab): Promise<void> {
-    const exists = await codeAgent
-      .call<{ dir: boolean }>("fs.stat", { path: tab.path })
-      .then(() => true)
-      .catch(() => false);
+    const stat = await codeAgent
+      .call<{ dir: boolean; size: number; mtime: number }>("fs.stat", { path: tab.path })
+      .catch(() => null);
 
-    if (!exists) return markMissing(tab);
+    if (!stat) return markMissing(tab);
     if (tab.missing) {
       // Something put it back — a git checkout, an editor elsewhere, an undo.
       tab.missing = false;
@@ -3183,6 +3440,11 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
         updateSaveEnabled();
       }
     }
+
+    // The file is what it was when the buffer last read or wrote it: nothing to refresh, nothing
+    // to mark stale, and no editor state to rebuild.
+    const seen = diskStamps.get(tab.id);
+    if (seen && seen.mtime === stat.mtime && seen.size === stat.size) return;
 
     if (isDirty(tab)) {
       // Unsaved edits: nothing is reloaded over them, but the buffer is now
@@ -3214,11 +3476,14 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     // ordinary way when they are next opened; there is nothing to lose in them.
     if (!file || file.text === null || file.binary || file.tooLarge || tab.window) return;
     const text = file.text.replace(/\r\n/g, "\n");
+    diskStamps.set(tab.id, { mtime: file.mtime, size: file.size });
     if (baselines.get(tab.id) === text) return;
     tab.eol = file.text.includes("\r\n") ? "\r\n" : "\n";
     tab.stale = false;
     states.set(tab.id, editor.newState(tab.path, text, tab.readOnly));
     baselines.set(tab.id, text);
+    setDirty(tab.id, false); // a reload is the buffer becoming the file again
+    indents.set(tab.id, detectIndent(text));
     renderTabs();
   }
 
@@ -3291,7 +3556,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
    *  "see the README" is the answer that sent people to the README. */
   async function offerAllowMultiple(url: string): Promise<void> {
     const root = loadRecents().find((r) => r.url === url)?.root;
-    const command = root ? `enc-tool-code-agent --allow-multiple --root "${root}"` : "enc-tool-code-agent --allow-multiple";
+    const command = root ? `code-agent --allow-multiple --root "${root}"` : "code-agent --allow-multiple";
     const ok = await modalConfirm({
       title: "That code-agent is already serving another tab",
       detail: `Close the other tab, or restart the code-agent so it accepts more than one:\n\n${command}`,
@@ -3336,7 +3601,9 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     }
   }
 
-  const folderName = (path: string): string => path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+  function folderName(path: string): string {
+    return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+  }
 
   /** The connect button opens this rather than the URL prompt: disconnecting,
    *  reopening a folder and pasting a fresh URL are three different intentions,
@@ -3348,7 +3615,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       items.push({
         label: `Disconnect from ${folderName(root)}`,
         run: () => {
-          codeAgent.disconnect();
+          codeAgent.disconnectByUser();
           report("code-agent", `disconnected from ${root || "the code-agent"}`);
         },
       });
@@ -3456,7 +3723,7 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
       password: true,
       hint: fromClipboard
         ? "Taken from your clipboard — the code-agent put it there when it started. It contains the code-agent's token, so it is hidden until you show it."
-        : "Run `enc-tool code-agent` in the folder you want to edit, then paste the URL it prints. It contains a token, so it is hidden until you show it.",
+        : "Run `code-agent` in the folder you want to edit, then paste the URL it prints. It contains a token, so it is hidden until you show it.",
       okLabel: "connect",
     });
     if (!url) return;
@@ -3474,14 +3741,16 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
   // nothing while a code-agent is connected, when a pasted URL is far more likely
   // to be content the user is editing, and nothing when the caret is in a field
   // or in the editor. Text that is not a code-agent URL is left alone regardless.
-  document.addEventListener("paste", (e) => {
+  const onPaste = (e: ClipboardEvent): void => {
     if (!host.classList.contains("active") || codeAgent.state === "online") return;
     if ((e.target as HTMLElement | null)?.closest("input, textarea, [contenteditable=true]")) return;
     const text = e.clipboardData?.getData("text")?.trim();
     if (!text || !isCodeAgentUrl(text)) return;
     e.preventDefault();
     void connectTo(text);
-  });
+  };
+  document.addEventListener("paste", onPaste);
+  teardown.push(() => document.removeEventListener("paste", onPaste));
 
   // ── wiring ──
   $(".js-connect").addEventListener("click", (e) => connectMenu(e as MouseEvent));
@@ -3522,5 +3791,10 @@ export function mountCodeTab(host: HTMLElement, ctx: CodeContext): CodeTab {
     connect,
     focus: () => editor.focus(),
     onCodeAgentState,
+    dispose: () => {
+      // Idempotent: the list is emptied as it is run, so a second call — or a
+      // call after a remount — cannot remove somebody else's listener.
+      for (const off of teardown.splice(0)) off();
+    },
   };
 }

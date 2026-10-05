@@ -138,11 +138,17 @@ type gitOperation struct {
 type gitStatus struct {
 	Branch *string `json:"branch"`
 	// null for a detached HEAD or an unborn branch.
-	Upstream *string       `json:"upstream"`
-	Ahead    int           `json:"ahead"`
-	Behind   int           `json:"behind"`
-	Oid      *string       `json:"oid"`
+	Upstream *string `json:"upstream"`
+	Ahead    int     `json:"ahead"`
+	Behind   int     `json:"behind"`
+	Oid      *string `json:"oid"`
 	Entries  []statusEntry `json:"entries"`
+	// How many entries the working tree really has. Larger than len(Entries)
+	// when the code-agent stopped collecting at its limit — half a million
+	// untracked files is a status nobody can read and a frame nobody can parse.
+	EntryCount int `json:"entryCount"`
+	// True when Entries is only the beginning of the list.
+	Truncated bool `json:"truncated"`
 	// Set while a merge/rebase/cherry-pick/revert is half-finished.
 	Operation *gitOperation `json:"operation"`
 	// The commit message git has already written for the next commit, comment
@@ -183,6 +189,14 @@ type branch struct {
 	Time int64 `json:"time"`
 }
 
+// The refs of a repository, and whether they are all of them. A bare array could
+// not say that: a mirror with fifty thousand refs would either cost a frame
+// nothing can parse or silently lose the tail.
+type branchList struct {
+	Refs      []branch `json:"refs"`
+	Truncated bool     `json:"truncated"`
+}
+
 // A pair of texts for @codemirror/merge. Before/After are null when the file
 // does not exist on that side (added / deleted).
 type diffPair struct {
@@ -213,6 +227,16 @@ type commitDetail struct {
 }
 
 // One line of `git blame`. Mirrors BlameRow in src/code-agent/protocol.ts.
+// One page of git blame. The browser mirror of blameRow is BlameLine in
+// code/blame.ts, which is where the gutter renders it.
+type blamePage struct {
+	Rows []blameRow `json:"rows"`
+	// 0-based line the page starts at.
+	Offset int `json:"offset"`
+	// True when the file goes on past this page.
+	More bool `json:"more"`
+}
+
 type blameRow struct {
 	Oid    string `json:"oid"`
 	Author string `json:"author"`
@@ -236,8 +260,17 @@ type searchHit struct {
 type searchSummary struct {
 	Files   int `json:"files"`
 	Matches int `json:"matches"`
-	// True when the scan stopped at the result cap.
+	// True when the scan stopped at the result cap, the deadline, or because a
+	// newer search superseded this one.
 	Truncated bool `json:"truncated"`
 	// "ripgrep" or "fallback".
 	Engine string `json:"engine"`
+	// Which of those stopped it: "matches", "time" or "cancelled". Null when the
+	// scan reached the end.
+	Reason *string `json:"reason"`
+	// How many files the scan opened, and how many there were to look at before
+	// the include and exclude patterns. Null with ripgrep, which walks the tree
+	// itself and reports neither.
+	Scanned    *int `json:"scanned"`
+	Candidates *int `json:"candidates"`
 }

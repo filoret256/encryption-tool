@@ -1,15 +1,15 @@
-/** "Get the code-agent" panel.
+/** "Get the agent" panel — for the code-agent and for the kafka-agent.
  *
- *  The code tab is the only part of the app that needs a process on the user's
- *  own machine, and the app itself usually runs in a container where no such
- *  process can exist. So the deployment ships cross-compiled code-agents and this
- *  panel hands the right one over: the archive for the detected platform, the
- *  exact command to run it against *this* origin, and the checksum — the code-agent
- *  gets filesystem access, so being able to verify what you downloaded is not
- *  a nicety.
+ *  Two tabs need a process on the user's own machine, and the app itself usually
+ *  runs in a container where no such process can exist. So the deployment ships
+ *  cross-compiled agents and this panel hands the right one over: the archive
+ *  for the detected platform, the exact command to run it against *this* origin,
+ *  and the checksum — an agent gets access to files or to a cluster, so being
+ *  able to verify what you downloaded is not a nicety.
  *
- *  Mounted in the header but revealed only on the code tab; the manifest is
- *  fetched the first time it is revealed, so the crypto tabs never ask for it.
+ *  Each agent's button sits in the tab strip beside its own tab — "code
+ *  ⤓ code-agent kafka" — and is revealed only while that tab is open; the manifest
+ *  is fetched the first time it is revealed, so the crypto tabs never ask for it.
  */
 import { esc } from "./ui.ts";
 
@@ -72,24 +72,59 @@ const mb = (n: number): string => `${(n / 1048576).toFixed(0)} MB`;
  *  so one downloaded binary serves every repository instead of being copied
  *  into each. Forward slashes throughout: PowerShell accepts them too, so one
  *  shape of path works on all three platforms. */
-function commands(b: Build, origin: string): string {
+/** What differs between the two agents' panels. */
+interface Spec {
+  name: "code-agent" | "kafka-agent";
+  /** The button in the tab strip: what it says, and what it does. */
+  label: string;
+  title: string;
+  /** Why this tab needs an agent at all. */
+  why: string;
+  /** What to run, after the archive is unpacked. */
+  run(b: Build, allow: string): string;
+  /** What to do with the URL it prints. */
+  next: string;
+  /** Without a published build: how to run it from a checkout. */
+  fromSource: string;
+}
+
+const CODE: Spec = {
+  name: "code-agent",
+  label: "⤓ code-agent",
+  title: "Download the local code-agent for your machine",
+  why: "The editor needs a small process next to your files — this page cannot open folders or run <code>git</code> on its own.",
+  run: (b, allow) => `./${b.exe} ${b.os === "windows" ? "C:/path/to/your/project" : "~/path/to/your/project"}${allow}`,
+  next: "Paste the <code>ws://127.0.0.1…</code> URL it prints into <b>connect…</b> above.",
+  fromSource: "Run <code>bun run code-agent</code> from a checkout instead.",
+};
+
+const KAFKA: Spec = {
+  name: "kafka-agent",
+  label: "⤓ kafka-agent",
+  title: "Download the local kafka-agent for your machine",
+  why: "The kafka tab talks to your clusters through a small process on your machine: connection settings — bootstrap servers, TLS stores, SCRAM logins — stay in its config file, and no key or password reaches this page.",
+  run: (b, allow) => `./${b.exe} --config ${b.os === "windows" ? "C:/path/to/kafka-agent.yaml" : "~/kafka-agent.yaml"}${allow}`,
+  next: "Describe your clusters in <code>kafka-agent.yaml</code> first, then paste the <code>ws://127.0.0.1…</code> URL it prints into the box on this tab.",
+  fromSource: "Run <code>bun run kafka-agent -- --config kafka-agent.yaml</code> from a checkout instead.",
+};
+
+function commands(spec: Spec, b: Build, origin: string): string {
   // Loopback origins are allowed unconditionally by the code-agent, so the flag
   // would be noise when the app is served from localhost.
   const local = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|$)/.test(origin);
   const allow = local ? "" : ` --allow-origin ${origin}`;
-  const folder = b.os === "windows" ? "C:/path/to/your/project" : "~/path/to/your/project";
   const unpack =
     b.os === "windows"
       ? `cd ~/Downloads; Expand-Archive ./${b.file} -DestinationPath . -Force`
       : `cd ~/Downloads && tar -xzf ${b.file}`;
-  return [unpack, `./${b.exe} ${folder}${allow}`].join("\n");
+  return [unpack, spec.run(b, allow)].join("\n");
 }
 
 /** Platform-specific friction, stated before it is met rather than after. */
-function caveat(b: Build): string {
+function caveat(spec: Spec, b: Build): string {
   switch (b.os) {
     case "macos":
-      return "Unpacking with <code>tar</code> in Terminal keeps macOS from quarantining the binary. Extract it in Finder instead and you will need <code>xattr -d com.apple.quarantine ./enc-tool-code-agent</code> first.";
+      return `Unpacking with <code>tar</code> in Terminal keeps macOS from quarantining the binary. Extract it in Finder instead and you will need <code>xattr -d com.apple.quarantine ./${spec.name}</code> first.`;
     case "windows":
       return "The binary is unsigned, so SmartScreen may warn on first run. Starting it from a terminal, as above, avoids the prompt.";
     default:
@@ -97,20 +132,25 @@ function caveat(b: Build): string {
   }
 }
 
-export interface CodeAgentDownload {
+export interface AgentDownload {
   /** Called on every tab switch; the manifest is fetched on the first reveal. */
   setVisible(visible: boolean): void;
-  /** Open the download popover from somewhere else — the code tab's first
-   *  screen, which is where someone without a code-agent actually is. */
+  /** Open the download popover from somewhere else — a tab's first screen,
+   *  which is where someone without its agent actually is. */
   open(): void;
 }
 
-export function mountCodeAgentDownload(host: HTMLElement): CodeAgentDownload {
+export type CodeAgentDownload = AgentDownload;
+
+export const mountCodeAgentDownload = (host: HTMLElement): AgentDownload => mountAgentDownload(host, CODE);
+export const mountKafkaAgentDownload = (host: HTMLElement): AgentDownload => mountAgentDownload(host, KAFKA);
+
+function mountAgentDownload(host: HTMLElement, spec: Spec): AgentDownload {
   host.className = "code-agent-dl";
   host.hidden = true;
   host.innerHTML = `
     <button class="code-agent-dl-chip" type="button" aria-haspopup="dialog" aria-expanded="false"
-            title="Download the local code-agent for your machine">⤓ get code-agent</button>
+            title="${esc(spec.title)}">${esc(spec.label)}</button>
     <div class="code-agent-dl-pop" hidden></div>`;
 
   const chip = host.querySelector<HTMLButtonElement>(".code-agent-dl-chip")!;
@@ -150,7 +190,7 @@ export function mountCodeAgentDownload(host: HTMLElement): CodeAgentDownload {
   function load(): Promise<void> {
     return (loading ??= (async () => {
       try {
-        const res = await fetch("/code-agent/downloads");
+        const res = await fetch(`/${spec.name}/downloads`);
         if (!res.ok) throw new Error(String(res.status));
         manifest = (await res.json()) as Manifest;
       } catch {
@@ -169,16 +209,15 @@ export function mountCodeAgentDownload(host: HTMLElement): CodeAgentDownload {
     const builds = manifest?.builds ?? [];
     const build = builds.find((b) => b.id === selected);
     if (!build) {
-      pop.innerHTML = `<div class="code-agent-dl-head">No prebuilt code-agents are published here.</div>
-        <p class="code-agent-dl-note">Run <code>bun run code-agent</code> from a checkout instead.</p>`;
+      pop.innerHTML = `<div class="code-agent-dl-head">No prebuilt ${spec.name}s are published here.</div>
+        <p class="code-agent-dl-note">${spec.fromSource}</p>`;
       return;
     }
 
     const others = builds.filter((b) => b.id !== build.id);
     pop.innerHTML = `
-      <div class="code-agent-dl-head">Run the code-agent on your machine</div>
-      <p class="code-agent-dl-note">The editor needs a small process next to your files — this page cannot
-        open folders or run <code>git</code> on its own.</p>
+      <div class="code-agent-dl-head">Run the ${spec.name} on your machine</div>
+      <p class="code-agent-dl-note">${spec.why}</p>
       <a class="t-btn t-btn-primary code-agent-dl-get" href="${esc(build.url)}">⤓ ${esc(build.label)}${
         build.size ? ` · ${mb(build.size)}` : ""
       }</a>
@@ -194,9 +233,9 @@ export function mountCodeAgentDownload(host: HTMLElement): CodeAgentDownload {
           <span>then, in a terminal</span>
           <button type="button" class="t-btn code-agent-dl-copy">copy</button>
         </div>
-        <pre>${esc(commands(build, location.origin))}</pre>
+        <pre>${esc(commands(spec, build, location.origin))}</pre>
       </div>
-      <p class="code-agent-dl-note">${caveat(build)}</p>
+      <p class="code-agent-dl-note">${caveat(spec, build)}</p>
       ${
         build.sha256
           ? `<div class="code-agent-dl-sum" title="${esc(build.sha256)}"><span>sha256</span>
@@ -204,8 +243,7 @@ export function mountCodeAgentDownload(host: HTMLElement): CodeAgentDownload {
              <button type="button" class="t-btn code-agent-dl-copy-sum">copy</button></div>`
           : ""
       }
-      <p class="code-agent-dl-note">Paste the <code>ws://127.0.0.1…</code> URL it prints into
-        <b>connect…</b> above.</p>`;
+      <p class="code-agent-dl-note">${spec.next}</p>`;
 
     for (const b of pop.querySelectorAll<HTMLButtonElement>(".code-agent-dl-others button")) {
       b.addEventListener("click", () => {
@@ -214,7 +252,7 @@ export function mountCodeAgentDownload(host: HTMLElement): CodeAgentDownload {
       });
     }
     pop.querySelector(".code-agent-dl-copy")?.addEventListener("click", (e) => {
-      void copy(commands(build, location.origin), e.currentTarget as HTMLElement);
+      void copy(commands(spec, build, location.origin), e.currentTarget as HTMLElement);
     });
     pop.querySelector(".code-agent-dl-copy-sum")?.addEventListener("click", (e) => {
       void copy(build.sha256 ?? "", e.currentTarget as HTMLElement);

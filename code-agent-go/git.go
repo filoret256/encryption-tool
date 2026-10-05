@@ -376,6 +376,14 @@ func gitStatusOf(ctx context.Context, cwd string) (*gitStatus, error) {
 			e = &statusEntry{Path: rec[2:], Index: ".", Work: ".", Ignored: true}
 		}
 		if e != nil {
+			// Counted whether or not it is kept: the panel says how many there
+			// are, and a repository with half a million untracked files should
+			// not put half a million objects in a frame.
+			st.EntryCount++
+			if len(st.Entries) >= maxStatusEntries {
+				st.Truncated = true
+				continue
+			}
 			st.Entries = append(st.Entries, *e)
 		}
 	}
@@ -445,6 +453,23 @@ type logOpts struct {
 // short list is what a smaller limit would have returned anyway.
 // src/code-agent/git.ts has the same number.
 const maxLogLimit = 20000
+
+// The most lines of blame one answer carries, the most status entries, and the
+// most refs.
+//
+// Blame is one row per line, and the rows are wide: a million-line file is about
+// 600,000 porcelain rows and some 250 MB of JSON in one frame, which the page
+// would then have to parse and nothing can read. Status and branches are lists a
+// person scans rather than reads: half a million untracked files, or a mirror
+// with fifty thousand refs, is a frame nothing can parse and a panel nobody can
+// use. What was left out is counted and said, so "I can see 5,000 changes" is
+// never mistaken for "there are 5,000 changes". The TypeScript code-agent has
+// the same numbers (src/code-agent/git.ts).
+const (
+	maxBlameLines    = 20000
+	maxStatusEntries = 5000
+	maxBranches      = 5000
+)
 
 func gitLog(ctx context.Context, cwd string, o logOpts) ([]commit, error) {
 	limit := o.limit
@@ -572,7 +597,7 @@ func gitReflog(ctx context.Context, cwd string, limit int) ([]reflogEntry, error
 	return entries, nil
 }
 
-func gitBranches(ctx context.Context, cwd string) ([]branch, error) {
+func gitBranches(ctx context.Context, cwd string) (*branchList, error) {
 	// upstream:track prints "[ahead 1, behind 2]", "[gone]" or nothing;
 	// creatordate rather than committerdate because it is also defined for
 	// annotated tag objects, which have no committer.
@@ -583,6 +608,7 @@ func gitBranches(ctx context.Context, cwd string) ([]branch, error) {
 		return nil, err
 	}
 	list := []branch{}
+	truncated := false
 	for _, line := range strings.Split(out, "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
@@ -591,6 +617,13 @@ func gitBranches(ctx context.Context, cwd string) ([]branch, error) {
 		ref := field(p, 0)
 		// refs/remotes/<name>/HEAD is a symbolic pointer, not a branch users pick.
 		if remoteHead.MatchString(ref) {
+			continue
+		}
+		// Past the limit the rest are still walked so the answer can say that
+		// there are more, and a mirror with fifty thousand refs does not put
+		// fifty thousand objects in one frame.
+		if len(list) >= maxBranches {
+			truncated = true
 			continue
 		}
 		name := ref
@@ -625,7 +658,7 @@ func gitBranches(ctx context.Context, cwd string) ([]branch, error) {
 			Time:     when,
 		})
 	}
-	return list, nil
+	return &branchList{Refs: list, Truncated: truncated}, nil
 }
 
 func gitCommitDetail(ctx context.Context, cwd, oid string, parent int) (*commitDetail, error) {
@@ -882,10 +915,29 @@ func gitDiffPair(ctx context.Context, cwd, path, kind string, readWorktree func(
 
 var blameHeader = regexp.MustCompile(`^([0-9a-f]{40}) \d+ (\d+)`)
 
-func gitBlame(ctx context.Context, cwd, path string) ([]blameRow, error) {
-	out, err := gitOut(ctx, cwd, "blame", "--line-porcelain", "--", path)
+func gitBlame(ctx context.Context, cwd, path string, offset, limit int) (*blamePage, error) {
+	if limit <= 0 || limit > maxBlameLines {
+		limit = maxBlameLines
+	}
+	start := offset + 1
+	if start < 1 {
+		start = 1
+	}
+	// Only the lines asked for, and one more than the page holds: `git blame -L`
+	// runs just that range, so a file with a million lines costs a page of blame
+	// instead of a million — and no longer dies at the 64 MB output limit before
+	// it can answer at all. The range's end is a count rather than a line number,
+	// so git clamps it at the end of the file instead of failing.
+	out, err := gitOut(ctx, cwd, "blame", "--line-porcelain", "-L",
+		fmt.Sprintf("%d,+%d", start, limit+1), "--", path)
 	if err != nil {
-		return nil, err
+		// The one failure that is not a failure: the range starts past the last
+		// line, which git reports as "has only N lines". There is no page there.
+		if strings.Contains(err.Error(), "has only") && strings.Contains(err.Error(), "lines") {
+			out = ""
+		} else {
+			return nil, err
+		}
 	}
 	rows := []blameRow{}
 	var cur *blameRow
@@ -912,7 +964,11 @@ func gitBlame(ctx context.Context, cwd, path string) ([]blameRow, error) {
 			cur = nil
 		}
 	}
-	return rows, nil
+	more := len(rows) > limit
+	if more {
+		rows = rows[:limit]
+	}
+	return &blamePage{Rows: rows, Offset: start - 1, More: more}, nil
 }
 
 func strPtr(s string) *string { return &s }

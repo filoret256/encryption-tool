@@ -32,7 +32,7 @@ export interface Caps {
 
 /** Safari/WebKit, excluding the Chromium and Gecko engines that also claim
  *  "Safari" in their UA string. */
-function isWebKit(): boolean {
+export function isWebKit(): boolean {
   const ua = navigator.userAgent;
   return /AppleWebKit/.test(ua) && !/Chrome|Chromium|Edg|OPR|Firefox/.test(ua);
 }
@@ -63,13 +63,13 @@ interface Row {
 }
 
 const ROWS: Row[] = [
-  { key: "codeAgent", label: "local code-agent", fix: "Run `enc-tool code-agent` in your project folder, then paste its URL here." },
+  { key: "codeAgent", label: "local code-agent", fix: "Run `code-agent` in your project folder, then paste its URL on the code tab." },
   {
     key: "codeAgentCurrent",
     label: "code-agent up to date",
     needsCodeAgent: true,
     fix: (codeAgent) =>
-      `The code-agent is ${codeAgent.info?.version ?? "an unknown version"}, this app is ${VERSION}. Download the current one from "get code-agent" on the code tab.`,
+      `The code-agent is ${codeAgent.info?.version ?? "an unknown version"}, this app is ${VERSION}. Download the current one from the "⤓ code-agent" button on the code tab.`,
   },
   // These three are properties of the machine the code-agent runs on, so with no
   // code-agent connected the honest answer is "we have not asked yet" — not "✗".
@@ -128,7 +128,7 @@ export function mountBadge(host: HTMLElement, codeAgent: CodeAgentClient, onConn
   host.className = "cap-badge";
   host.innerHTML = `
     <button class="cap-chip" type="button" aria-haspopup="dialog" aria-expanded="false">
-      <span class="cap-dot"></span><span class="cap-text">code-agent</span>
+      <span class="cap-dot"></span><span class="cap-text">not connected</span>
     </button>
     <div class="cap-pop" hidden></div>`;
 
@@ -163,7 +163,10 @@ export function mountBadge(host: HTMLElement, codeAgent: CodeAgentClient, onConn
 
     host.dataset.status = status;
     dot.textContent = { online: "●", connecting: "◐", error: "✕", offline: "◌", blocked: "✕" }[status];
-    text.textContent = status === "online" ? (codeAgent.info?.root.split(/[/\\]/).pop() ?? "code-agent") : "code-agent";
+    // With no code-agent: "not connected", as on the kafka tab — "code-agent" is what the
+    // download button beside the chip already says.
+    text.textContent =
+      status === "online" ? (codeAgent.info?.root.split(/[/\\]/).pop() ?? "code-agent") : status === "offline" ? "not connected" : "code-agent";
     chip.title =
       status === "online"
         ? `Connected — ${codeAgent.info?.root}`
@@ -172,7 +175,7 @@ export function mountBadge(host: HTMLElement, codeAgent: CodeAgentClient, onConn
           : codeAgent.lastError || "Code-agent not connected";
 
     pop.innerHTML = `
-      <div class="cap-head">${esc(headline(status, codeAgent.lastError))}</div>
+      <div class="cap-head">${esc(headline(status, codeAgent.lastError, !caps.codeAgentCurrent))}</div>
       <ul class="cap-list">${ROWS.map((r) => row(r, caps, codeAgent, !r.needsCodeAgent || caps.codeAgent)).join("")}</ul>
       ${status === "online" ? "" : `<button class="t-btn cap-connect" type="button">connect to code-agent…</button>`}
       ${pwa?.canInstall() ? `<button class="t-btn cap-install" type="button">install as an app</button>` : ""}`;
@@ -190,9 +193,11 @@ export function mountBadge(host: HTMLElement, codeAgent: CodeAgentClient, onConn
   };
 }
 
-function headline(status: string, error: string): string {
+function headline(status: string, error: string, outOfDate = false): string {
   switch (status) {
-    case "online": return "All local features available";
+    // A version that is not this app's is a row the list marks ✗; the heading above it may not say
+    // that everything is available (X-14).
+    case "online": return outOfDate ? "Connected, but the code-agent is out of date" : "All local features available";
     case "connecting": return "Connecting to the code-agent…";
     case "blocked": return "This browser cannot reach a local code-agent";
     case "error": return error || "Code-agent connection failed";

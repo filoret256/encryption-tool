@@ -20,9 +20,10 @@ import { probe } from "./proc.ts";
 import * as fsops from "./fs-ops.ts";
 import * as git from "./git.ts";
 import * as gw from "./git-write.ts";
+import { Slots } from "./slots.ts";
 import { search, type Signal } from "./search.ts";
 import { Watcher } from "./watch.ts";
-import type { CodeAgentInfo, Req, ServerFrame } from "./protocol.ts";
+import type { CodeAgentInfo, Req, SearchHit, ServerFrame } from "./protocol.ts";
 import { VERSION } from "../version.ts";
 import { CODE_AGENT_PORT_MAX, CODE_AGENT_PORT_MIN, CODE_AGENT_PORT_RANGE, codeAgentPortRange } from "../ports.ts";
 
@@ -165,12 +166,12 @@ function parseArgs(argv: string[]): Options {
 
 const HELP = `enc-tool code-agent — local filesystem + git bridge for the web editor
 
-  enc-tool-code-agent [folder] [options]
+  code-agent [folder] [options]
 
 The folder may be given as the first argument, so the binary can live anywhere
 and be pointed at a project instead of copied into one:
 
-  enc-tool-code-agent ~/work/my-project --allow-origin https://enc.example.com
+  code-agent ~/work/my-project --allow-origin https://enc.example.com
 
   --root <dir>            same thing as the positional folder
                           (default: current directory)
@@ -223,39 +224,19 @@ The code-agent listens on 127.0.0.1 only. Paste the URL below into the editor ta
  *  single slow scan blocks the panel a user is looking at. */
 const MAX_CONCURRENT_PROCS = 4;
 
-/** A counting semaphore, per connection.
+/** How many requests one connection may have started and not finished.
  *
- *  Queues rather than refuses: the client asked for work it is entitled to, and
- *  a request that waits its turn is an ordinary slow response, while one that
- *  fails is an error the UI has to explain. */
-class Slots {
-  private free: number;
-  private waiting: (() => void)[] = [];
-
-  constructor(limit: number) {
-    this.free = limit;
-  }
-
-  async acquire(): Promise<void> {
-    if (this.free > 0) {
-      this.free--;
-      return;
-    }
-    await new Promise<void>((resolve) => this.waiting.push(resolve));
-  }
-
-  release(): void {
-    const next = this.waiting.shift();
-    if (next) next();
-    else this.free++;
-  }
-
-  /** Let everyone through, for a connection that is going away: a waiter that
-   *  is never resolved is a promise that never settles. */
-  drain(): void {
-    for (const resolve of this.waiting.splice(0)) resolve();
-  }
-}
+ *  Every request runs on a promise of its own so that a slow one never holds up
+ *  the rest, and nothing bounded how many there could be: a client sending
+ *  `fs.read` as fast as the socket would carry it queued a 4 MB buffer per
+ *  request, with no ceiling but memory. A page that behaves stays a long way
+ *  below this — search-as-you-type cancels the request it replaces — so the
+ *  number is not a budget, it is where "a burst" becomes "something is wrong",
+ *  and past it a request is refused with EBUSY rather than queued. The Go
+ *  code-agent has the same number (code-agent-go/server.go): the two must fail
+ *  alike, and a test compares them through the same wire.
+ */
+const MAX_INFLIGHT_OPS = 128;
 
 /** Ops that start a child process, and so are worth counting. */
 const spawnsProcess = (op: string): boolean => op === "search" || op.startsWith("git.");
@@ -291,6 +272,22 @@ interface Ctx {
 const str = (v: unknown): string => String(v ?? "");
 const strs = (v: unknown): string[] => (Array.isArray(v) ? v.map(String) : []);
 const num = (v: unknown): number => (Number.isFinite(Number(v)) ? Number(v) : 0);
+
+/** How many search hits one frame carries, how heavy it may get, and how long a
+ *  partial one waits.
+ *
+ *  A scan used to send one frame per hit: one with the 5,000-hit cap was 5,000
+ *  frames, 5,000 JSON parses and 5,000 calls into the page's main thread, for a
+ *  list that repaints on a timer anyway. A batch goes out when it is full, when
+ *  it is heavy — a single line of minified JavaScript can be megabytes — or when
+ *  it has waited, and the timer is what keeps a slow scan showing what it has
+ *  found as it finds it, which is the whole reason hits are streamed at all.
+ *
+ *  The Go code-agent has the same three numbers (code-agent-go/server.go):
+ *  the two must behave alike, and a test compares them through the same wire. */
+const HIT_BATCH = 64;
+const HIT_BATCH_BYTES = 1 << 20;
+const HIT_BATCH_MS = 100;
 
 const OPS: Record<string, (ctx: Ctx, p: Req) => Promise<unknown>> = {
   "code-agent.info": async (c) => c.info,
@@ -331,7 +328,7 @@ const OPS: Record<string, (ctx: Ctx, p: Req) => Promise<unknown>> = {
   "git.reflog": (c, p) => git.reflog(c.cwd, num(p.limit) || 50),
   "git.commitDetail": (c, p) => git.commitDetail(c.cwd, str(p.oid), num(p.parent) || 1),
   "git.blob": (c, p) => git.blobAt(c.cwd, str(p.rev), str(p.path)),
-  "git.blame": (c, p) => git.blame(c.cwd, str(p.path)),
+  "git.blame": (c, p) => git.blame(c.cwd, str(p.path), num(p.offset), num(p.limit) || undefined),
   "git.diff": (c, p) =>
     git.diffPair(c.cwd, str(p.path), str(p.kind), async () => {
       const f = await fsops.readTextFile(c.jail, str(p.path)).catch(() => null);
@@ -418,13 +415,43 @@ const OPS: Record<string, (ctx: Ctx, p: Req) => Promise<unknown>> = {
       },
       c.info.ripgrep !== null,
       c.signal,
+      // How far the scan has got, while it runs: a large repository in the
+      // fallback engine is otherwise minutes of a page saying "searching…".
+      (progress) => c.send({ id: c.id, chunk: { progress } }),
     );
+    // Hits are collected and sent in batches; the reason for the numbers is
+    // where they are declared. `flush` is called from a timer as well as from
+    // here, so it is the only place the batch and the timer are touched.
+    let batch: SearchHit[] = [];
+    let bytes = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const flush = (): void => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (batch.length === 0) return;
+      c.send({ id: c.id, chunk: { hits: batch } });
+      batch = [];
+      bytes = 0;
+    };
     let next = await it.next();
-    while (!next.done) {
-      c.send({ id: c.id, chunk: { hit: next.value } });
-      next = await it.next();
+    try {
+      while (!next.done) {
+        const hit = next.value;
+        batch.push(hit);
+        bytes += hit.text.length + hit.path.length + 64;
+        if (batch.length >= HIT_BATCH || bytes >= HIT_BATCH_BYTES) flush();
+        else if (timer === null) timer = setTimeout(flush, HIT_BATCH_MS);
+        next = await it.next();
+      }
+      return next.value;
+    } finally {
+      // Whatever the batch holds goes out before the reply does, and the timer
+      // never outlives the request: a `flush` after this one would send a chunk
+      // for a request the page has already been answered about.
+      flush();
     }
-    return next.value;
   },
 
   /** Supersede a running request — search-as-you-type issues one per keystroke
@@ -747,6 +774,11 @@ export async function startCodeAgent(argv: string[]): Promise<void> {
 
         const conn = ws.data.conn;
         conn.send = send;
+        // `cancel` is exempt: it is how a client gets out of a full house, and
+        // it finishes at once.
+        if (req.op !== "cancel" && conn.inflight.size >= MAX_INFLIGHT_OPS) {
+          return send({ id: req.id, ok: false, error: "Too many requests in flight", code: "EBUSY" });
+        }
         const signal: Signal = { cancelled: false };
         conn.inflight.set(req.id, signal);
         const ctx: Ctx = { jail, cwd: jail.root, info, conn, send, id: req.id, signal, reroot };
@@ -760,7 +792,8 @@ export async function startCodeAgent(argv: string[]): Promise<void> {
         // input the validation was written to reject.
         void (async () => {
           if (!spawnsProcess(req.op)) return handler(ctx, req);
-          await conn.slots.acquire();
+          // False: the connection closed while this waited. Nothing is started, nothing is held.
+          if (!(await conn.slots.acquire())) throw Object.assign(new Error("The connection closed"), { code: "ECANCELED" });
           try {
             return await handler(ctx, req);
           } finally {

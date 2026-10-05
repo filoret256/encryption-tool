@@ -15,6 +15,8 @@
 # set is the default; pass an empty string to ship none and point
 # CODE_AGENT_DOWNLOAD_BASE at a mirror instead.
 ARG CODE_AGENT_TARGETS="windows-x64,darwin-arm64,darwin-x64,linux-x64,linux-arm64"
+# The same for the kafka-agent, which the kafka tab hands out the same way.
+ARG KAFKA_AGENT_TARGETS="windows-x64,darwin-arm64,darwin-x64,linux-x64,linux-arm64"
 
 # ── Stage 1: bundle the frontend and compile a standalone server binary ──
 FROM oven/bun:1@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS builder
@@ -66,11 +68,17 @@ ENV GO_BIN=/usr/local/go/bin/go \
 
 COPY src/version.ts ./src/
 COPY src/code-agent/targets.ts ./src/code-agent/
+# agent-kit-go is the front door the agents share (token, Origin, Host, the
+# WebSocket); code-agent-go reaches it through a `replace ../agent-kit-go`.
+COPY agent-kit-go/ ./agent-kit-go/
 COPY code-agent-go/ ./code-agent-go/
+COPY kafka-agent-go/ ./kafka-agent-go/
 COPY scripts/archive.ts scripts/build-code-agents.ts scripts/go-toolchain.ts ./scripts/
 
 ARG CODE_AGENT_TARGETS
-RUN bun scripts/build-code-agents.ts --targets "$CODE_AGENT_TARGETS" --out /code-agents
+ARG KAFKA_AGENT_TARGETS
+RUN bun scripts/build-code-agents.ts --targets "$CODE_AGENT_TARGETS" --out /code-agents \
+ && bun scripts/build-code-agents.ts --agent kafka --targets "$KAFKA_AGENT_TARGETS" --out /kafka-agents
 
 # ── Stage 3: minimal Debian runtime — just the compiled executable ──
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
@@ -85,6 +93,7 @@ RUN apt-get update \
 # Copied before the server binary on purpose: this is the slower-changing layer,
 # so a rebuild of the app alone leaves it cached on the nodes.
 COPY --from=code-agents /code-agents /usr/local/share/enc-tool/code-agents
+COPY --from=code-agents /kafka-agents /usr/local/share/enc-tool/kafka-agents
 COPY --from=builder /app/server /usr/local/bin/server
 
 USER appuser

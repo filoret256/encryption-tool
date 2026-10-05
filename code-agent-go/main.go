@@ -1,4 +1,4 @@
-// The local code-agent: `enc-tool-code-agent`.
+// The local code-agent: `code-agent`.
 //
 // Runs on the user's machine next to their repository and exposes the
 // filesystem, the system `git` and ripgrep to the browser tab over a loopback
@@ -14,8 +14,7 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
+	agentkit "enc-tool/agent-kit"
 	"fmt"
 	"net"
 	"net/http"
@@ -40,17 +39,20 @@ const (
 	codeAgentPortMax = 5010
 )
 
-// codeAgentPortRange is the "5001-5010" spelling, for help text and messages.
-var codeAgentPortRange = fmt.Sprintf("%d-%d", codeAgentPortMin, codeAgentPortMax)
+// codeAgentPorts is that range for agent-kit, which binds it; its String() is
+// the "5001-5010" spelling for help text and messages.
+var codeAgentPorts = agentkit.PortRange{Min: codeAgentPortMin, Max: codeAgentPortMax, Env: "CODE_AGENT_PORTS"}
+
+var codeAgentPortRange = codeAgentPorts.String()
 
 var helpText = fmt.Sprintf(`enc-tool code-agent — local filesystem + git bridge for the web editor
 
-  enc-tool-code-agent [folder] [options]
+  code-agent [folder] [options]
 
 The folder may be given as the first argument, so the binary can live anywhere
 and be pointed at a project instead of copied into one:
 
-  enc-tool-code-agent ~/work/my-project --allow-origin https://enc.example.com
+  code-agent ~/work/my-project --allow-origin https://enc.example.com
 
   --root <dir>            same thing as the positional folder
                           (default: current directory)
@@ -107,31 +109,13 @@ type options struct {
 	allowRoots []string
 }
 
-// envOrigins reads comma- or space-separated origins from the environment.
-//
-// The code-agent people run is downloaded from a UI that is usually not on
-// localhost, so it needs that origin allowed on every start. A variable can be
-// set once in a shell profile; a flag has to be retyped every time.
-func envOrigins() []string {
-	raw := os.Getenv("ENC_TOOL_ALLOW_ORIGIN")
-	out := []string{}
-	for _, o := range strings.FieldsFunc(raw, func(r rune) bool {
-		return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r'
-	}) {
-		if o != "" {
-			out = append(out, strings.TrimRight(o, "/"))
-		}
-	}
-	return out
-}
-
 func fail(message string) {
 	fmt.Fprintf(os.Stderr, "code-agent: %s\nTry --help.\n", message)
 	os.Exit(2)
 }
 
 func parseArgs(argv []string) options {
-	o := options{port: codeAgentPortMin, origins: envOrigins()}
+	o := options{port: codeAgentPortMin, origins: agentkit.EnvOrigins("ENC_TOOL_ALLOW_ORIGIN")}
 	rootFrom := ""
 
 	setRoot := func(dir, source string) {
@@ -227,6 +211,7 @@ func nodePlatform() string {
 }
 
 func main() {
+	agentkit.Name = "code-agent"
 	opts := parseArgs(os.Args[1:])
 
 	token := opts.token
@@ -234,12 +219,11 @@ func main() {
 		token = os.Getenv("ENC_TOOL_TOKEN")
 	}
 	if token == "" {
-		b := make([]byte, 16)
-		if _, err := rand.Read(b); err != nil {
+		var err error
+		if token, err = agentkit.NewToken(); err != nil {
 			fmt.Fprintln(os.Stderr, "code-agent: cannot generate a token")
 			os.Exit(1)
 		}
-		token = hex.EncodeToString(b)
 	}
 
 	j, err := openJail(opts.root)
@@ -302,19 +286,22 @@ func main() {
 	}
 
 	srv := &server{
-		token:         token,
-		origins:       opts.origins,
-		allowNoOrigin: opts.allowNoOrigin,
-		allowMultiple: opts.allowMultiple,
-		rerootBases:   rerootBases,
+		Guard: agentkit.Guard{
+			Token:         token,
+			Origins:       opts.origins,
+			AllowNoOrigin: opts.allowNoOrigin,
+			AllowMultiple: opts.allowMultiple,
+			Ping:          map[string]string{"codeAgent": "enc-tool", "version": version},
+		},
+		rerootBases: rerootBases,
 	}
 	srv.ws.Store(&workspace{jail: j, isRepo: top != "", info: info})
 
-	listener := listen(opts)
+	listener := agentkit.Listen(codeAgentPorts, opts.port, opts.portExplicit)
 	port := listener.Addr().(*net.TCPAddr).Port
 	// The Host check compares against the port this code-agent actually answers on,
 	// which is the one the listener reports.
-	srv.port = port
+	srv.Port = port
 
 	gitLine := "NOT FOUND — git operations are unavailable"
 	if info.GitVersion != nil {
@@ -330,7 +317,7 @@ func main() {
 	if info.Watch {
 		watchLine = "live"
 	}
-	originLine := strings.Join(append(append([]string{}, defaultOrigins...), opts.origins...), ", ")
+	originLine := strings.Join(append(append([]string{}, agentkit.DefaultOrigins...), opts.origins...), ", ")
 	noOriginLine := "refused"
 	if opts.allowNoOrigin {
 		noOriginLine = "accepted (--allow-no-origin)"
@@ -354,9 +341,9 @@ func main() {
 	// Copied for the user rather than left to their mouse: the token is new on
 	// every run, so this is the one line they would otherwise select by hand
 	// every single time. Only when someone is actually watching — see
-	// interactive() — and never when they have asked us not to.
+	// agentkit.Interactive — and never when they have asked us not to.
 	clipLine := ""
-	if !opts.noClipboard && interactive() && copyToClipboard(url) {
+	if !opts.noClipboard && agentkit.Interactive() && agentkit.CopyToClipboard(url) {
 		clipLine = "\n  ✓ copied to your clipboard"
 	}
 

@@ -19,7 +19,14 @@ import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { iter } from "../src/code-agent/proc.ts";
-import { CODE_AGENT_PORT_MAX, CODE_AGENT_PORT_MIN, CODE_AGENT_PORT_RANGE } from "../src/ports.ts";
+import {
+  CODE_AGENT_PORT_MAX,
+  CODE_AGENT_PORT_MIN,
+  CODE_AGENT_PORT_RANGE,
+  KAFKA_AGENT_PORT_MAX,
+  KAFKA_AGENT_PORT_MIN,
+  KAFKA_AGENT_PORT_RANGE,
+} from "../src/ports.ts";
 import { git, startCodeAgent, type Harness } from "./harness.ts";
 import { ansible, helm } from "../src/crypto/index.ts";
 import type { FileRead, SearchSummary } from "../src/code-agent/protocol.ts";
@@ -161,6 +168,21 @@ try {
     "the shell names those ports, so the tab can explain a refusal",
     listed.length > 0 && listed.every((p) => connectSrc.includes(`ws://127.0.0.1:${p}`)),
     listed.length ? `${listed.length} ports, every one of them in connect-src` : "no code-agent-ports meta in the shell",
+  );
+  // The kafka-agent's range, the same way: both ends, and the shell naming it.
+  const missingKafkaAgentPorts = [KAFKA_AGENT_PORT_MIN, KAFKA_AGENT_PORT_MAX].flatMap((p) =>
+    ["ws", "http"].map((s) => `${s}://127.0.0.1:${p}`).filter((src) => !connectSrc.includes(src)),
+  );
+  check(
+    "the policy permits the loopback kafka-agent, across its own port range",
+    missingKafkaAgentPorts.length === 0,
+    missingKafkaAgentPorts.length ? `missing ${missingKafkaAgentPorts.join(", ")}` : `ws:// and http:// on ${KAFKA_AGENT_PORT_RANGE}`,
+  );
+  const kafkaListed = (/<meta name="kafka-agent-ports" content="([^"]*)"/.exec(htmlShell)?.[1] ?? "").split(",").filter(Boolean);
+  check(
+    "the shell names the kafka-agent ports too",
+    kafkaListed.length > 0 && kafkaListed.every((p) => connectSrc.includes(`ws://127.0.0.1:${p}`)),
+    kafkaListed.length ? `${kafkaListed.length} ports, every one of them in connect-src` : "no kafka-agent-ports meta in the shell",
   );
   // The point of pinning it: injected script gets a channel to the code-agent, not
   // to every other thing the user happens to be running on loopback.
