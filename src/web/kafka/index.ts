@@ -15,7 +15,7 @@ import { OutputLog } from "../code/output.ts";
 import { Commands } from "../code/commands.ts";
 import { iconAcls, iconBrokers, iconClusters, iconGroups, iconSchemas, iconTopics } from "./icons.ts";
 import { iconRefresh } from "../code/icons.ts";
-import { KafkaModel, type ViewName } from "./model.ts";
+import { KafkaModel, type Selection, type ViewName } from "./model.ts";
 import { goToTopicOrGroup } from "./goto.ts";
 import { isKafkaAgentUrl, type KafkaAgentClient } from "./kafka-agent.ts";
 import { clampSideWidth, loadSide, saveSide } from "../side-width.ts";
@@ -236,8 +236,15 @@ export function mountKafkaTab(host: HTMLElement, ctx: KafkaContext): KafkaTab {
     return model.selection.kind === LIST_KIND[key] ? null : PICK_TEXT[key];
   }
 
+  /** What the main area is about. The clusters view has one thing to show — the open cluster — so
+   *  a topic or a group chosen on another view does not belong beside its list (I-03). The choice
+   *  itself is kept: the topics view shows it again. */
+  function shownSelection(): Selection {
+    return model.view === "clusters" ? { kind: "cluster" } : model.selection;
+  }
+
   function mainKey(): string {
-    const s = model.selection;
+    const s = shownSelection();
     if (pickText() !== null) return `${model.cluster}|pick|${model.view}`;
     // The ACLs are about the cluster and are not a thing to select: the view is
     // what shows them, whatever was selected before — a topic or a subject left
@@ -253,7 +260,7 @@ export function mountKafkaTab(host: HTMLElement, ctx: KafkaContext): KafkaTab {
   }
 
   function renderMain(): void {
-    const s = model.selection;
+    const s = shownSelection();
     // The cluster overview follows every change of the model; the others own
     // their requests and are rebuilt only when what they show changes — and the
     // ACL table follows the model itself, so a repaint must not cost the filter
