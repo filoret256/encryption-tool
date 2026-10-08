@@ -367,6 +367,13 @@ export class FileTree {
   private async expand(node: TreeNode, force = false): Promise<void> {
     if (node.loaded && !force) {
       node.expanded = true;
+      // Collapsing a compacted row closes every folder of its run (collapseRow),
+      // so opening it again has to open them all: otherwise "a/b/c" came back
+      // as "a", then "a/b", and took three clicks to show what one had hidden.
+      for (let n = node, i = 0; i < CHAIN_MAX && n.children.length === 1 && n.children[0].dir && n.children[0].loaded; i++) {
+        n = n.children[0];
+        n.expanded = true;
+      }
       return this.rebuild();
     }
     try {
