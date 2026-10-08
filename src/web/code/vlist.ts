@@ -99,7 +99,10 @@ export class RowPool {
     } else if (delta < 0 && -delta < rows.length) {
       const moved = rows.splice(rows.length + delta, -delta);
       rows.unshift(...moved);
-      for (const row of moved) this.layer.insertBefore(row, this.layer.firstChild);
+      // In one call: inserting them one by one before the first child put them
+      // in reverse, and the DOM no longer matched `rows` — a scroll up by more
+      // than one row left the list drawn upside down until it was cleared.
+      this.layer.prepend(...moved);
     } else if (delta !== 0) {
       // Too far to rotate: every row is about to be rebuilt anyway.
       all = true;
