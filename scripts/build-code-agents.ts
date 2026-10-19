@@ -13,6 +13,7 @@
  *
  *    bun scripts/build-code-agents.ts [--targets a,b,c] [--runtime go|bun]
  *                                [--out dir] [--keep-binaries] [--sign-key file]
+ *                                [--ripgrep dir]
  */
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createHash, createPrivateKey, sign } from "node:crypto";
@@ -33,10 +34,12 @@ interface Args {
   runtime: Runtime;
   /** Which agent to build: the code-agent (code-agent-go/) or the kafka-agent (kafka-agent-go/). */
   agent: AgentName;
+  /** Prebuilt ripgrep as <dir>/<target id>/rg[.exe], packed into a second archive. */
+  ripgrep: string | undefined;
 }
 
 function parse(argv: string[]): Args {
-  const a: Args = { targets: TARGETS, out: "", agent: "code-agent", keep: false, signKey: process.env.CODE_AGENT_SIGN_KEY || undefined, runtime: "go" };
+  const a: Args = { targets: TARGETS, out: "", agent: "code-agent", keep: false, signKey: process.env.CODE_AGENT_SIGN_KEY || undefined, runtime: "go", ripgrep: undefined };
   for (let i = 0; i < argv.length; i++) {
     const [flag, inline] = argv[i].split(/=(.*)/s);
     const value = (): string => inline ?? argv[++i] ?? "";
@@ -60,6 +63,7 @@ function parse(argv: string[]): Args {
         break;
       }
       case "--keep-binaries": a.keep = true; break;
+      case "--ripgrep": a.ripgrep = value(); break;
       case "--sign-key": a.signKey = value(); break;
       case "--runtime": {
         const r = value();
@@ -82,16 +86,21 @@ function parse(argv: string[]): Args {
   --sign-key <file>  sign SHA256SUMS with this Ed25519 private key (PEM) and write
                      SHA256SUMS.sig beside it. Also read from CODE_AGENT_SIGN_KEY.
                      Make a key with scripts/release-key.ts; the signature says
-                     who made the list of hashes, which the hashes alone cannot.`);
+                     who made the list of hashes, which the hashes alone cannot.
+  --ripgrep <dir>    also pack <dir>/<target>/rg[.exe] beside the code-agent into
+                     code-agent-<version>-<platform>-rg, offered as the optional
+                     download "with ripgrep". Targets without an rg there get none.`);
         process.exit(0);
     }
   }
+  if (a.agent === "kafka-agent" && a.ripgrep) throw new Error("--ripgrep is for the code-agent only");
   if (a.agent === "kafka-agent" && a.runtime !== "go") throw new Error("the kafka-agent has no Bun implementation; use --runtime go");
   a.out ||= `dist/${a.agent}s`;
   return a;
 }
 
 const mb = (n: number): string => `${(n / 1048576).toFixed(1)} MB`;
+const sha256 = (data: Uint8Array): string => createHash("sha256").update(data).digest("hex");
 
 const args = parse(process.argv.slice(2));
 await mkdir(args.out, { recursive: true });
@@ -115,6 +124,8 @@ interface Manifest {
     file: string;
     size: number;
     sha256: string;
+    /** The same code-agent with ripgrep beside it, when --ripgrep had one for this target. */
+    ripgrep?: { file: string; size: number; sha256: string };
   }[];
 }
 
@@ -176,6 +187,18 @@ for (const t of args.targets) {
   if (args.keep) await writeFile(join(args.out, `${t.id}-${exe}`), binary);
   await rm(outfile, { force: true });
 
+  let ripgrep: Manifest["builds"][number]["ripgrep"];
+  const rgExe = t.os === "windows" ? "rg.exe" : "rg";
+  const rg = args.ripgrep ? await readFile(join(args.ripgrep, t.id, rgExe)).catch(() => null) : null;
+  if (rg) {
+    const rgArchive = pack(t.kind, [{ name: exe, data: binary, mode: 0o755 }, { name: rgExe, data: rg, mode: 0o755 }]);
+    const rgFile = file.replace(`.${t.kind}`, `-rg.${t.kind}`);
+    await writeFile(join(args.out, rgFile), rgArchive);
+    ripgrep = { file: rgFile, size: rgArchive.length, sha256: sha256(rgArchive) };
+  } else if (args.ripgrep) {
+    console.log(`  ${t.id.padEnd(14)} no ${join(args.ripgrep, t.id, rgExe)}: no "with ripgrep" archive`);
+  }
+
   manifest.builds.push({
     id: t.id,
     os: t.os,
@@ -185,7 +208,8 @@ for (const t of args.targets) {
     kind: t.kind,
     file,
     size: archive.length,
-    sha256: createHash("sha256").update(archive).digest("hex"),
+    sha256: sha256(archive),
+    ...(ripgrep ? { ripgrep } : {}),
   });
   console.log(
     `  ${t.id.padEnd(14)} ${mb(binary.length).padStart(8)} -> ${mb(archive.length).padStart(8)}  ${file}  (${((Date.now() - started) / 1000).toFixed(1)}s)`,
@@ -198,7 +222,7 @@ await writeFile(join(args.out, manifestName(args.agent)), `${JSON.stringify(mani
 // the archives outside this app.
 await writeFile(
   join(args.out, "SHA256SUMS"),
-  manifest.builds.map((b) => `${b.sha256}  ${b.file}\n`).join(""),
+  manifest.builds.flatMap((b) => [b, ...(b.ripgrep ? [b.ripgrep] : [])]).map((b) => `${b.sha256}  ${b.file}\n`).join(""),
 );
 
 // The hashes say the files are the ones listed; a signature on the list says who
@@ -219,7 +243,7 @@ if (args.signKey) {
 // the manifest, and the server serves only what the manifest lists — so the
 // leftovers become invisible dead weight. Say so rather than let someone
 // wonder why four platforms vanished from the panel.
-const published = new Set(manifest.builds.map((b) => b.file));
+const published = new Set(manifest.builds.flatMap((b) => [b.file, ...(b.ripgrep ? [b.ripgrep.file] : [])]));
 const orphans = (await readdir(args.out)).filter(
   (f) => /\.(zip|tar\.gz)$/.test(f) && !published.has(f),
 );

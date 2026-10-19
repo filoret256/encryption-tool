@@ -267,7 +267,7 @@ func main() {
 		Repo:       repo,
 		GitVersion: gitVersion,
 		GitProblem: gitProblem,
-		Ripgrep:    probe(ctx, []string{"rg", "--version"}),
+		Ripgrep:    probe(ctx, []string{rgPath, "--version"}),
 		// Probed once so code-agent.info can tell the UI the truth up front.
 		Watch: watcherSupported(j.root),
 	}
@@ -312,6 +312,9 @@ func main() {
 	rgLine := "not found — using the slower built-in search"
 	if info.Ripgrep != nil {
 		rgLine = *info.Ripgrep
+		if rgPath != "rg" {
+			rgLine += " (" + rgPath + ")"
+		}
 	}
 	watchLine := "unavailable on this platform"
 	if info.Watch {

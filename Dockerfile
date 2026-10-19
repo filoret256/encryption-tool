@@ -17,6 +17,9 @@
 ARG CODE_AGENT_TARGETS="windows-x64,darwin-arm64,darwin-x64,linux-x64,linux-arm64"
 # The same for the kafka-agent, which the kafka tab hands out the same way.
 ARG KAFKA_AGENT_TARGETS="windows-x64,darwin-arm64,darwin-x64,linux-x64,linux-arm64"
+# Platforms that also get a "code-agent + ripgrep" archive, about 5 MB more each.
+# An empty string builds no ripgrep and ships the plain archives only.
+ARG RIPGREP_TARGETS="windows-x64,darwin-arm64,darwin-x64,linux-x64,linux-arm64"
 
 # ── Stage 1: bundle the frontend and compile a standalone server binary ──
 FROM oven/bun:1@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS builder
@@ -32,7 +35,45 @@ RUN bun run build \
  && bun build --compile --minify --sourcemap=none --target=bun-linux-x64 \
       --outfile server src/server.ts
 
-# ── Stage 2: cross-compile the local code-agent for the desktop platforms ──
+# ── Stage 2: cross-compile ripgrep for the same platforms ──
+#
+# The code-agent searches with ripgrep when it finds one and falls back to a slower
+# built-in scan otherwise. Few users have rg installed, so the image ships it in a
+# second code-agent archive, beside the executable, where the code-agent looks first.
+#
+# cargo-zigbuild links all five targets from this one Linux image: zig stands in
+# for the per-target C toolchain and the macOS SDK. The source is the crates.io
+# release, checked against the checksum crates.io publishes for it, and built
+# --locked from the Cargo.lock inside it.
+FROM messense/cargo-zigbuild:0.23.4@sha256:d8313491ec5798de0633fdc1c5753761bff79967bea69076020dc78121b2cca8 AS ripgrep
+ARG RIPGREP_VERSION=15.2.0
+ARG RIPGREP_SHA256=a30750b6d0743bfdd2656ebbaf4555aa278c43144b84bc389bcbfa399485ec71
+ARG RIPGREP_TARGETS
+WORKDIR /src
+RUN curl -fsSL -o rg.crate "https://static.crates.io/crates/ripgrep/ripgrep-${RIPGREP_VERSION}.crate" \
+ && echo "${RIPGREP_SHA256}  rg.crate" | sha256sum -c - \
+ && tar -xzf rg.crate --strip-components=1 \
+ && rm rg.crate
+# release-lto is the profile ripgrep's own releases use; strip drops the symbols.
+ENV CARGO_PROFILE_RELEASE_LTO_STRIP=symbols
+RUN set -eu; mkdir -p /ripgrep; \
+    for id in $(echo "$RIPGREP_TARGETS" | tr ',' ' '); do \
+      exe=rg; \
+      case "$id" in \
+        windows-x64)  triple=x86_64-pc-windows-gnu; exe=rg.exe ;; \
+        darwin-arm64) triple=aarch64-apple-darwin ;; \
+        darwin-x64)   triple=x86_64-apple-darwin ;; \
+        linux-x64)    triple=x86_64-unknown-linux-musl ;; \
+        linux-arm64)  triple=aarch64-unknown-linux-musl ;; \
+        *) echo "unknown ripgrep target: $id" >&2; exit 1 ;; \
+      esac; \
+      rustup target add "$triple"; \
+      cargo zigbuild --locked --profile release-lto --target "$triple"; \
+      mkdir -p "/ripgrep/$id"; \
+      cp "target/$triple/release-lto/$exe" "/ripgrep/$id/"; \
+    done
+
+# ── Stage 3: cross-compile the local code-agent for the desktop platforms ──
 #
 # The code tab needs a code-agent on the user's own machine; one running in this
 # container would expose the container. So the image carries the binaries and
@@ -74,13 +115,14 @@ COPY agent-kit-go/ ./agent-kit-go/
 COPY code-agent-go/ ./code-agent-go/
 COPY kafka-agent-go/ ./kafka-agent-go/
 COPY scripts/archive.ts scripts/build-code-agents.ts scripts/go-toolchain.ts ./scripts/
+COPY --from=ripgrep /ripgrep /ripgrep
 
 ARG CODE_AGENT_TARGETS
 ARG KAFKA_AGENT_TARGETS
-RUN bun scripts/build-code-agents.ts --targets "$CODE_AGENT_TARGETS" --out /code-agents \
+RUN bun scripts/build-code-agents.ts --targets "$CODE_AGENT_TARGETS" --ripgrep /ripgrep --out /code-agents \
  && bun scripts/build-code-agents.ts --agent kafka --targets "$KAFKA_AGENT_TARGETS" --out /kafka-agents
 
-# ── Stage 3: minimal Debian runtime — just the compiled executable ──
+# ── Stage 4: minimal Debian runtime — just the compiled executable ──
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251
 WORKDIR /app
 

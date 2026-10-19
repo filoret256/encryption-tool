@@ -24,6 +24,8 @@ interface Build {
   url: string;
   size?: number;
   sha256?: string;
+  /** The same archive with ripgrep beside the code-agent. */
+  ripgrep?: { file: string; url: string; size?: number; sha256?: string };
 }
 
 interface Manifest {
@@ -160,6 +162,8 @@ function mountAgentDownload(host: HTMLElement, spec: Spec): AgentDownload {
   let loading: Promise<void> | null = null;
   let selected = "";
   let wanted = false;
+  // The code-agent searches several times faster with ripgrep beside it, so that is the default.
+  let withRg = true;
 
   const close = (): void => {
     pop.hidden = true;
@@ -207,13 +211,15 @@ function mountAgentDownload(host: HTMLElement, spec: Spec): AgentDownload {
 
   function render(): void {
     const builds = manifest?.builds ?? [];
-    const build = builds.find((b) => b.id === selected);
-    if (!build) {
+    const found = builds.find((b) => b.id === selected);
+    if (!found) {
       pop.innerHTML = `<div class="code-agent-dl-head">No prebuilt ${spec.name}s are published here.</div>
         <p class="code-agent-dl-note">${spec.fromSource}</p>`;
       return;
     }
 
+    // The ripgrep archive differs only in its file, link, size and checksum.
+    const build = withRg && found.ripgrep ? { ...found, ...found.ripgrep } : found;
     const others = builds.filter((b) => b.id !== build.id);
     pop.innerHTML = `
       <div class="code-agent-dl-head">Run the ${spec.name} on your machine</div>
@@ -221,6 +227,12 @@ function mountAgentDownload(host: HTMLElement, spec: Spec): AgentDownload {
       <a class="t-btn t-btn-primary code-agent-dl-get" href="${esc(build.url)}">⤓ ${esc(build.label)}${
         build.size ? ` · ${mb(build.size)}` : ""
       }</a>
+      ${
+        found.ripgrep
+          ? `<label class="code-agent-dl-note code-agent-dl-rg"><input type="checkbox" class="js-rg"${withRg ? " checked" : ""} />
+             with ripgrep: faster search, unpacked beside the ${spec.name}</label>`
+          : ""
+      }
       ${
         others.length
           ? `<div class="code-agent-dl-others">${others
@@ -251,6 +263,10 @@ function mountAgentDownload(host: HTMLElement, spec: Spec): AgentDownload {
         render();
       });
     }
+    pop.querySelector<HTMLInputElement>(".js-rg")?.addEventListener("change", (e) => {
+      withRg = (e.currentTarget as HTMLInputElement).checked;
+      render();
+    });
     pop.querySelector(".code-agent-dl-copy")?.addEventListener("click", (e) => {
       void copy(commands(spec, build, location.origin), e.currentTarget as HTMLElement);
     });

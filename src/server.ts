@@ -399,9 +399,10 @@ async function serveStatic(req: Request, pathname: string, asset: { path: string
 //   CODE_AGENT_DOWNLOAD_BASE / KAFKA_AGENT_DOWNLOAD_BASE  serve them from a mirror
 //                              instead, so an air-gapped site can keep the image small
 
-interface ManifestBuild extends Omit<CodeAgentBuild, "url"> {
+interface ManifestBuild extends Omit<CodeAgentBuild, "url" | "ripgrep"> {
   size: number;
   sha256: string;
+  ripgrep?: { file: string; size: number; sha256: string };
 }
 
 /** One agent's downloads: what is on disk, and what the panel is told about. */
@@ -440,25 +441,31 @@ class AgentDownloads {
         console.warn(`${tag}: ${dir}/${manifestName(this.agent)} is not valid JSON — ignoring`);
         continue;
       }
-      for (const b of parsed.builds ?? []) {
-        const path = join(dir, b.file);
-        if (!(await Bun.file(path).exists())) {
-          if (this.base) {
-            // A manifest without its archives, and a mirror to fetch them from:
-            // the image ships the checksums and the mirror ships the files. The
-            // point of the split is where the checksum comes from — the build that
-            // made this image, not the host that serves the download — so a
-            // mirror that is swapped or compromised cannot vouch for itself. The
-            // link is the mirror's; there is nothing local to serve, so the
-            // download route (which only serves what is on disk) stays a 404.
-            this.builds.push({ ...b, url: `${this.base}/${b.file}` });
-            continue;
-          }
+      // The link for one archive in the manifest, or null when it can be fetched from nowhere.
+      const link = async (file: string): Promise<string | null> => {
+        const path = join(dir, file);
+        if (await Bun.file(path).exists()) {
+          this.files.set(file, path);
+          return this.base ? `${this.base}/${file}` : `/${this.agent}/download/${file}`;
+        }
+        // A manifest without its archives, and a mirror to fetch them from:
+        // the image ships the checksums and the mirror ships the files. The
+        // point of the split is where the checksum comes from — the build that
+        // made this image, not the host that serves the download — so a
+        // mirror that is swapped or compromised cannot vouch for itself. The
+        // link is the mirror's; there is nothing local to serve, so the
+        // download route (which only serves what is on disk) stays a 404.
+        return this.base ? `${this.base}/${file}` : null;
+      };
+      for (const { ripgrep, ...b } of parsed.builds ?? []) {
+        const url = await link(b.file);
+        if (!url) {
           console.warn(`${tag}: ${b.file} is in the manifest but missing on disk`);
           continue;
         }
-        this.files.set(b.file, path);
-        this.builds.push({ ...b, url: this.base ? `${this.base}/${b.file}` : `/${this.agent}/download/${b.file}` });
+        // The "with ripgrep" archive is optional: a missing one drops the choice, not the build.
+        const rgUrl = ripgrep ? await link(ripgrep.file) : null;
+        this.builds.push({ ...b, url, ...(ripgrep && rgUrl ? { ripgrep: { ...ripgrep, url: rgUrl } } : {}) });
       }
       if (this.builds.length) {
         console.log(`${tag}: serving ${this.builds.length} prebuilt ${this.agent}(s) from ${dir}`);

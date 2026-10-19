@@ -1055,6 +1055,7 @@ body {
   display: flex; margin-top: 10px; text-decoration: none;
   font-family: var(--mono); font-size: var(--fs-sm);
 }
+.code-agent-dl-rg { display: flex; align-items: center; gap: 6px; }
 .code-agent-dl-others { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .code-agent-dl-others button {
   cursor: pointer; padding: 2px 7px; font-family: var(--mono); font-size: var(--fs-xs);

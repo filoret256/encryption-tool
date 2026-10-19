@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -142,5 +143,31 @@ func TestProgressArrivesWhileTheScanRuns(t *testing.T) {
 		if n != (i+1)*10 {
 			t.Errorf("progress %d says %d files", i, n)
 		}
+	}
+}
+
+// An rg beside the executable wins over PATH; a folder of that name does not.
+func TestBesideExe(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "code-agent")
+	if got := besideExe(exe, "rg"); got != "" {
+		t.Fatalf("empty folder: got %q, want none", got)
+	}
+	name := "rg"
+	if runtime.GOOS == "windows" {
+		name = "rg.exe"
+	}
+	if err := os.Mkdir(filepath.Join(dir, name), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := besideExe(exe, "rg"); got != "" {
+		t.Fatalf("a folder named %s: got %q, want none", name, got)
+	}
+	other := filepath.Join(t.TempDir(), "code-agent")
+	if err := os.WriteFile(filepath.Join(filepath.Dir(other), name), nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := besideExe(other, "rg"), filepath.Join(filepath.Dir(other), name); got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }

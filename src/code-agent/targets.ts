@@ -114,4 +114,6 @@ export interface CodeAgentBuild {
   /** Absent when the archives are mirrored elsewhere and we only know the name. */
   size?: number;
   sha256?: string;
+  /** The optional archive with ripgrep beside the code-agent, when one was built. */
+  ripgrep?: { file: string; url: string; size?: number; sha256?: string };
 }

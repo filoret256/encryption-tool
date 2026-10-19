@@ -16,10 +16,40 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 )
+
+// rgPath is the ripgrep this code-agent runs: the one beside its own executable
+// when there is one (the "with ripgrep" download puts it there), else the one on
+// PATH. Not the working directory: that can be the repository being opened, and
+// an rg.exe committed to it would then run as the user.
+var rgPath = func() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "rg"
+	}
+	if p := besideExe(exe, "rg"); p != "" {
+		return p
+	}
+	return "rg"
+}()
+
+// besideExe is the path of a regular file named name (plus .exe on Windows) in
+// exe's folder, or "" when there is none.
+func besideExe(exe, name string) string {
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	p := filepath.Join(filepath.Dir(exe), name)
+	if st, err := os.Stat(p); err != nil || !st.Mode().IsRegular() {
+		return ""
+	}
+	return p
+}
 
 type searchOpts struct {
 	query      string
@@ -107,7 +137,7 @@ type rgMessage struct {
 }
 
 func rgSearch(ctx context.Context, root string, o searchOpts, limit int, emit func(searchHit)) searchSummary {
-	args := []string{"rg", "--json"}
+	args := []string{rgPath, "--json"}
 	if o.matchCase {
 		args = append(args, "-s")
 	} else {
