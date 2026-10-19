@@ -88,6 +88,8 @@ interface Spec {
   next: string;
   /** Without a published build: how to run it from a checkout. */
   fromSource: string;
+  /** A config file to start from, shown under the commands. */
+  sample?: { file: string; text: string };
 }
 
 const CODE: Spec = {
@@ -108,6 +110,34 @@ const KAFKA: Spec = {
   run: (b, allow) => `./${b.exe} --config ${b.os === "windows" ? "C:/path/to/kafka-agent.yaml" : "~/kafka-agent.yaml"}${allow}`,
   next: "Describe your clusters in <code>kafka-agent.yaml</code> first, then paste the <code>ws://127.0.0.1…</code> URL it prints into the box on this tab.",
   fromSource: "Run <code>bun run kafka-agent -- --config kafka-agent.yaml</code> from a checkout instead.",
+  // Kept in step with the README's "Configuring clusters"; the README has every key.
+  sample: {
+    file: "kafka-agent.yaml",
+    text: `clusters:
+  - name: dev
+    bootstrap: localhost:9092
+    readOnly: false        # allow writes
+  - name: prod
+    bootstrap: [kafka1:9093, kafka2:9093]
+    security:
+      protocol: SASL_SSL
+      tls:
+        ca: ./ca.pem
+        # or a JKS / PKCS12 store:
+        # truststore:
+        #   location: ./truststore.jks
+        #   password: "\${TS_PASS}"
+      sasl:
+        mechanism: SCRAM-SHA-512
+        username: app
+        password: "\${KAFKA_PASS}"
+    # optional Schema Registry:
+    # schemaRegistry:
+    #   url: https://registry:8081
+    #   username: app
+    #   password: "\${REGISTRY_PASS}"
+`,
+  },
 };
 
 function commands(spec: Spec, b: Build, origin: string): string {
@@ -247,6 +277,19 @@ function mountAgentDownload(host: HTMLElement, spec: Spec): AgentDownload {
         </div>
         <pre>${esc(commands(spec, build, location.origin))}</pre>
       </div>
+      ${
+        spec.sample
+          ? `<div class="code-agent-dl-steps">
+               <div class="code-agent-dl-steps-head">
+                 <span>sample ${esc(spec.sample.file)}</span>
+                 <button type="button" class="t-btn code-agent-dl-copy-sample">copy</button>
+               </div>
+               <pre>${esc(spec.sample.text)}</pre>
+             </div>
+             <p class="code-agent-dl-note"><code>\${NAME}</code> is an environment variable, <code>\${file:path}</code> a file's contents.
+               Paths are relative to the YAML file.</p>`
+          : ""
+      }
       <p class="code-agent-dl-note">${caveat(spec, build)}</p>
       ${
         build.sha256
@@ -269,6 +312,9 @@ function mountAgentDownload(host: HTMLElement, spec: Spec): AgentDownload {
     });
     pop.querySelector(".code-agent-dl-copy")?.addEventListener("click", (e) => {
       void copy(commands(spec, build, location.origin), e.currentTarget as HTMLElement);
+    });
+    pop.querySelector(".code-agent-dl-copy-sample")?.addEventListener("click", (e) => {
+      void copy(spec.sample?.text ?? "", e.currentTarget as HTMLElement);
     });
     pop.querySelector(".code-agent-dl-copy-sum")?.addEventListener("click", (e) => {
       void copy(build.sha256 ?? "", e.currentTarget as HTMLElement);
